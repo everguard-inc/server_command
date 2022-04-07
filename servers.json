@@ -1,0 +1,12 @@
+{
+    "lambda2":{
+        "ip":"10.12.63.40",
+        "port":"5502",
+        "eg_pipeline_path": "/home/eg/jimmy/system_monitor",
+        "sys_monitor_path": "/home/eg/jimmy/eg_pipeline",
+        "default_cfg": ["bkup_configs/irvine_2ppe.json","bkup_configs/irvine_bk.json"],
+        "default_path":"/home/eg/jimmy/eg_pipeline",
+        "running_server_num" : 2
+    }
+   
+}
