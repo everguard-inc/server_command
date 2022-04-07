@@ -7,9 +7,9 @@ def get_POST_data(args,dic):
     data = None
     
     if args.command == 'stream':
-        data = json.dumps({'run':{"type":"stream","json":dic["default_cfg"],"path":dic["default_path"]}})
+        data = json.dumps({'run':{"type":"stream","json":dic["default_cfg"],"path":dic["eg_pipeline_path"]}})
     elif args.command == 'watchdog':
-        data = json.dumps({'run':{"type":"watchdog","json":dic["default_cfg"],"path":dic["default_path"]}})
+        data = json.dumps({'run':{"type":"watchdog","json":dic["default_cfg"],"path":dic["eg_pipeline_path"]}})
     elif args.command == 'check':
         data = json.dumps({"check":True})
     elif args.command == 'update':
