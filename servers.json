@@ -2,8 +2,8 @@
     "205":{
         "ip":"10.230.1.205",
         "port":"5502",
-        "eg_pipeline_path": "/home/everguard/system_monitor",
-        "sys_monitor_path": "/home/everguard/eg_pipeline",
+        "eg_pipeline_path": "/home/everguard/eg-pipeline",
+        "sys_monitor_path": "/home/everguard/system_monitor",
         "default_cfg": ["SBC-cam6-8","SBC-cam9-14"],
         "running_server_num" : 2
     }

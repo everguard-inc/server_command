@@ -19,7 +19,7 @@ def command_recv():
     # update
     # ======================================================== #
     command = json.loads(request.data)
-    
+    print(command)    
     if "run" in command:
         res = run_pipeline(command["run"])
         return "Error" if not res else "Succeed"
