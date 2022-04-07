@@ -1,10 +1,10 @@
 {
-    "lambda2":{
-        "ip":"10.12.63.40",
+    "205":{
+        "ip":"10.230.1.205",
         "port":"5502",
-        "eg_pipeline_path": "/home/eg/jimmy/system_monitor",
-        "sys_monitor_path": "/home/eg/jimmy/eg_pipeline",
-        "default_cfg": ["bkup_configs/irvine_2ppe.json","bkup_configs/irvine_bk.json"],
+        "eg_pipeline_path": "/home/everguard/system_monitor",
+        "sys_monitor_path": "/home/everguard/eg_pipeline",
+        "default_cfg": ["SBC-cam6-8","SBC-cam9-14"],
         "running_server_num" : 2
     }
    
