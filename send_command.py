@@ -2,10 +2,10 @@ import json
 import requests
 import argparse
 import sys
+import multiprocessing
 
 def get_POST_data(args,dic):
     data = None
-    
     if args.command == 'stream':
         data = json.dumps({'run':{"type":"stream","json":dic["default_cfg"],"path":dic["eg_pipeline_path"]}})
     elif args.command == 'watchdog':
@@ -19,6 +19,21 @@ def get_POST_data(args,dic):
         
     return data
 
+def send_cmd(servername,servercfg,args,url,data):
+    response = requests.post(url, data = data)
+    print(url,data)
+    if args.command == 'check':
+        running = response.content.decode("utf-8")
+        print("In Server: ",servername)
+        print("# Should Run: ", len(servercfg["default_cfg"]))
+        print("# Current Running: ",running)
+            
+    if args.command == 'stream' or args.command == 'watchdog':
+        running = response.content.decode("utf-8")
+        print("In Server: ",servername)
+        print("Status: ", running)
+    
+
 
 def check_command(args):
     if args.command == None:
@@ -29,7 +44,7 @@ def check_command(args):
             print("Command Name Error, Must be stream, watchdog, update, stop, check")
             sys.exit(0)
 
-                
+           
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -44,6 +59,9 @@ if __name__ == "__main__":
          
     checking = {}    
     run_command_check = {}
+    manager = multiprocessing.Manager()
+    return_dic = manager.dict()
+    jobs = []
     
     check_command(args)
     print("Command Accepted")
@@ -55,13 +73,9 @@ if __name__ == "__main__":
             url = 'http://' + server["ip"] + ':' + server["port"] + '/command'
             print("Request send to:", server["ip"])
             print("Command:", args.command)
-            response = requests.post(url, data = data)
-            if args.command == 'check':
-                running = response.content.decode("utf-8")
-                checking[k] = [len(server["default_cfg"]),running]
-            if args.command == 'stream' or args.command == 'watchdog':
-                status = response.content.decode("utf-8")
-                run_command_check[k] = status
+            p = multiprocessing.Process(target=send_cmd, args=(k,server,args,url,data))
+            jobs.append(p)
+            p.start()
             
     else:
         for server_name in args.servers:
@@ -70,24 +84,13 @@ if __name__ == "__main__":
             url = 'http://' + server["ip"] + ':' + server["port"] + '/command'
             print("Request send to:", server["ip"])
             print("Command:", args.command)
-            response = requests.post(url, data = data)
-            if args.command == 'check':
-                running = response.content.decode("utf-8")
-                checking[server_name] = [len(server["default_cfg"]),running]
-            if args.command == 'stream' or args.command == 'watchdog':
-                status = response.content.decode("utf-8")
-                run_command_check[server_name] = status
+            p = multiprocessing.Process(target=send_cmd, args=(server_name,server,args,url,data))
+            jobs.append(p)
+            p.start()
     
-    if args.command == 'check':
-        for k in checking.keys():
-            print("In Server: ",k)
-            print("# Should Run: ", checking[k][0])
-            print("# Current Running: ",checking[k][1])
-            
-    if args.command == 'stream' or args.command == 'watchdog':
-        for k in run_command_check.keys():
-            print("In Server: ",k)
-            print("Status: ", run_command_check[k])
+    for proc in jobs:
+        proc.join()
+    
         
         
     
