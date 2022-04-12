@@ -65,7 +65,7 @@ def update_pipeline(command):
     time.sleep(30)
     subprocess.run(["git","submodule","update","--recursive","--remote"],cwd=sys_monitor_path)
     time.sleep(30)
-    subprocess.run(["./docker-build.sh","background"],cwd=sys_monitor_path)
+    subprocess.run(["./docker-build.sh","--opt","background"],cwd=sys_monitor_path)
     time.sleep(120)
     # eg_pipeline git pull, git submodule updat, docker build
     subprocess.run(["git","pull"],cwd=eg_pipeline_path)
