@@ -24,36 +24,26 @@ def command_recv():
         res = run_pipeline(command["run"])
         return "Error" if not res else "Succeed"
     elif "stop" in command:
-        stop_pipeline()
+        stop_pipeline(command["stop"])
     elif "update" in command:
         update_pipeline(command["update"])
     elif "check" in command:
-        result = check_pipeline()
+        print("Get command Check")
+        result = check_pipeline(command["check"])
         return str(result)
     return '200'
 
-def run_pipeline(command):
-    if "type" not in command.keys() or "path" not in command.keys():
+def run_pipeline(cfg):
+    if "type" not in cfg.keys() or "json" not in cfg.keys() or "path" not in cfg.keys():
         return False
-    if "json" not in command.keys():
-        for cfg in default_json:
-            subprocess.run(["./docker-run.sh",command["type"],cfg,"--opt","background"],cwd=command["path"])
-            time.sleep(30)
-    else:
-        for cfg in command["json"]:
-            #print(command["json"])
-            subprocess.run(["./docker-run.sh",command["type"],cfg,"--opt","background"],cwd=command["path"])
-            time.sleep(30)
+    for json in cfg["json"]:
+        print("should run",json," with ",cfg["type"]," at path ",cfg["path"])
+        subprocess.run(["./docker-run.sh",cfg["type"],json,"--opt","background"],cwd=cfg["path"])
+        time.sleep(30)
     return True
 
-def stop_pipeline():
-    # Current design stop all docker image in the server
-    # docker stop $(docker ps -q)
-    bytes = subprocess.run(["docker","ps","-q"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    str =bytes.stdout.decode("utf-8")
-    ids = str.split('\n')[:-1]
-    for id in ids:
-        subprocess.run(["docker","stop",id])
+def stop_pipeline(image_name):
+    subprocess.run(["docker","stop",image_name])
 
 def update_pipeline(command):
     
@@ -76,18 +66,20 @@ def update_pipeline(command):
     time.sleep(120)
     
 
-def check_pipeline():
+def check_pipeline(image_name):
+    target = image_name
     bytes = subprocess.run(["docker","ps"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     str =bytes.stdout.decode("utf-8")
     lines = str.split('\n')[1:-1]
-    running_image = 0
-    for line in lines:
-        field = line.split(' ')
-        for i in range(len(field)):
-            if field[i]== "eg/eg-pipeline":
-                running_image += 1
-    return running_image
-
+    all_running_image = []
+    for i in range(len(lines)):
+        all_running_image.append(lines[i].split(' ')[-1])
+    if target in all_running_image:
+        print("target image is running")
+        return True
+    else:
+        return False
+    
 
 if __name__ == '__main__':
     
