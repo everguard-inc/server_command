@@ -1,75 +1,16 @@
 {
-    "205":{
+    "SBC-cam6-8":{
         "ip":"10.230.1.205",
         "port":"5502",
         "eg_pipeline_path": "/home/everguard/eg_pipeline",
         "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam6-8","SBC-cam9-14"],
-        "running_server_num" : 2
+        "image_name":"a1accf68-0424-456e-9b16-52acb30d82b2"
     },
-    "206":{
-        "ip":"10.230.1.206",
+    "SBC-cam9-14":{
+        "ip":"10.230.1.205",
         "port":"5502",
         "eg_pipeline_path": "/home/everguard/eg_pipeline",
         "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam15-18","SBC-cam19_20_21_26","SBC-cam22-25"],
-        "running_server_num" : 3
-    },
-    "207":{
-        "ip":"10.230.1.207",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam30-33","SBC-cam34-37"],
-        "running_server_num" : 2
-    },
-    "208":{
-        "ip":"10.230.1.208",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam40-43","SBC-cam46-49"],
-        "running_server_num" : 2
-    },
-    "209":{
-        "ip":"10.230.1.209",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam55-58","SBC-cam59_60_61_64"],
-        "running_server_num" : 2
-    },
-    "210":{
-        "ip":"10.230.1.210",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam62_63_65_66","SBC-cam67-70"],
-        "running_server_num" : 2
-    },
-    "211":{
-        "ip":"10.230.1.211",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam2-5","SBC-cam38_39_44_45"],
-        "running_server_num" : 2
-    },
-    "212":{
-        "ip":"10.230.1.212",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["SBC-cam50-51","SBC-cam52-54","SBC-cam71-74"],
-        "running_server_num" : 3
-    },
-    "EAF2":{
-        "ip":"10.230.2.201",
-        "port":"5502",
-        "eg_pipeline_path": "/home/everguard/eg_pipeline",
-        "sys_monitor_path": "/home/everguard/system_monitor",
-        "default_cfg": ["EAF2"],
-        "running_server_num" : 1
+        "image_name":"0cd2f071-678c-48cb-af66-03d928ee6eac"
     }
-
 }
