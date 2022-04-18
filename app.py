@@ -14,8 +14,10 @@ def command_recv():
     # Command Key
     # run: 
     #   type: watchdog / stream
-    #   json: name of the json file
-    # stop
+    #   json: list of name of the json file
+    #   path: eg_pipeline path for the server
+    # stop: container
+    # check: container
     # update
     # ======================================================== #
     command = json.loads(request.data)
@@ -34,6 +36,8 @@ def command_recv():
     return '200'
 
 def run_pipeline(cfg):
+    # run with stream/watchdog in background
+    # should wait 30 secs for running another container
     if "type" not in cfg.keys() or "json" not in cfg.keys() or "path" not in cfg.keys():
         return False
     for json in cfg["json"]:
@@ -46,18 +50,16 @@ def stop_pipeline(image_name):
     subprocess.run(["docker","stop",image_name])
 
 def update_pipeline(command):
-    
+    # update the code in system_monitor and build
     sys_monitor_path = command["sys_monitor_path"]
     eg_pipeline_path = command["eg_pipeline_path"]
-    #print(sys_monitor_path,eg_pipeline_path)
-    # sys_monitor git pull, git submodule updat, docker build
     subprocess.run(["git","pull"],cwd=sys_monitor_path)
     time.sleep(30)
     subprocess.run(["git","submodule","update","--recursive","--remote"],cwd=sys_monitor_path)
     time.sleep(30)
     subprocess.run(["./docker-build.sh","--opt","background"],cwd=sys_monitor_path)
     time.sleep(120)
-    # eg_pipeline git pull, git submodule updat, docker build
+    # update the code in eg_pipeline and build
     subprocess.run(["git","pull"],cwd=eg_pipeline_path)
     time.sleep(30)
     subprocess.run(["git","submodule","update","--recursive","--remote"],cwd=eg_pipeline_path)
@@ -67,6 +69,7 @@ def update_pipeline(command):
     
 
 def check_pipeline(image_name):
+    # check if the container is currently running by its name
     target = image_name
     bytes = subprocess.run(["docker","ps"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     str =bytes.stdout.decode("utf-8")

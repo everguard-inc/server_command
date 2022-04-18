@@ -4,23 +4,15 @@ import argparse
 import sys
 import multiprocessing
 
-def get_POST_data(args,image_name,image_cfg):
-    data = None
-    
-    if args.command == 'check':
-        data = json.dumps({"check":image_cfg["image_name"]})
-    elif args.command == 'stop':
-        data = json.dumps({"stop":image_cfg["image_name"]})
-        
-    return data
-
-def send_cmd(image_name,image_cfg,args,url,data):
+def send_cmd(url,data):
+    # function to send command to each client 
     response = requests.post(url, data = data)
     print(url,data)
     result = response.content.decode("utf-8")
     print(result)
 
 def check_command(args):
+    # check if command is valid
     if args.command == None:
         print("No Command Found") 
         sys.exit(0)
@@ -44,23 +36,29 @@ if __name__ == "__main__":
     check_command(args)
     print("Command Accepted")
     
-    # run pipeline and update code command should be run with a server manner
+    
     if args.command in ['stream','watchdog','update']:
+        # run pipeline and update code command should be run with a server manner
+        # because there should be come wait time between two containers that run on the same server 
+        
         server_image_dic = {}
+        # first, group each container with its assigned server
         if args.docker == None:
+            # run all docker container in the cfg file
             for image_name in cfg.keys():
                 if cfg[image_name]["ip"] in server_image_dic.keys():
                     server_image_dic[cfg[image_name]["ip"]].append(image_name)
                 else:
                     server_image_dic[cfg[image_name]["ip"]] = [image_name]
         else:
+            # run specific container given by the imput command
             for image_name in list(args.docker):
                 if cfg[image_name]["ip"] in server_image_dic.keys():
                     server_image_dic[cfg[image_name]["ip"]].append(image_name)
                 else:
                     server_image_dic[cfg[image_name]["ip"]] = [image_name]
 
-
+        # for each server send the command that contains which container(s) to run 
         for server in server_image_dic.keys():
             url = 'http://' + server + ':' + cfg[server_image_dic[server][0]]["port"] + '/command'
             if args.command == 'stream' or args.command == 'watchdog':
@@ -68,18 +66,24 @@ if __name__ == "__main__":
             else:
                 data = json.dumps({"update":{"eg_pipeline_path":cfg[server_image_dic[server][0]]["eg_pipeline_path"],"sys_monitor_path":cfg[server_image_dic[server][0]]["sys_monitor_path"]}})
             print(data)
-            p = multiprocessing.Process(target=send_cmd, args=(None,None,args,url,data))
+            p = multiprocessing.Process(target=send_cmd, args=(url,data))
             jobs.append(p)
             p.start()
 
         for job in jobs:
             p.join()
-    # chekc and stop command
+            
+    # check and stop command
     else:
         if args.docker == None:
+            # run all docker container in the cfg file
             for image_name in cfg.keys():
                 image = cfg[image_name]
-                data = get_POST_data(args,image_name,image)
+                if args.command == 'check':
+                    data = json.dumps({"check":image["image_name"]})
+                elif args.command == 'stop':
+                    data = json.dumps({"stop":image["image_name"]})
+                
                 url = 'http://' + image["ip"] + ':' + image["port"] + '/command'
                 print("Request send to:", image["ip"])
                 if args.command != 'update':
@@ -87,17 +91,22 @@ if __name__ == "__main__":
                 print("Command:", args.command)
                 print("Data: ",data) 
                 print()
-                p = multiprocessing.Process(target=send_cmd, args=(image_name,image,args,url,data))
+                p = multiprocessing.Process(target=send_cmd, args=(url,data))
                 jobs.append(p)
                 p.start()
         else:
+            # check/stop specific container given by the imput command
             for image_name in args.docker:
                 image = cfg[image_name]
-                data = get_POST_data(args,image_name,image)
+                if args.command == 'check':
+                    data = json.dumps({"check":image["image_name"]})
+                elif args.command == 'stop':
+                    data = json.dumps({"stop":image["image_name"]})
+                    
                 url = 'http://' + image["ip"] + ':' + image["port"] + '/command'
                 print("Request send to:", image["ip"])
                 print("Command:", args.command)                    
-                p = multiprocessing.Process(target=send_cmd, args=(image_name,image,args,url,data))
+                p = multiprocessing.Process(target=send_cmd, args=(url,data))
                 jobs.append(p)
                 p.start()
             for proc in jobs:
