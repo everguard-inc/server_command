@@ -12,5 +12,12 @@
         "eg_pipeline_path": "/home/everguard/eg_pipeline",
         "sys_monitor_path": "/home/everguard/system_monitor",
         "image_name":"0cd2f071-678c-48cb-af66-03d928ee6eac"
-    }
+    },
+    "tst_container":{
+        "ip":"10.230.1.205",
+        "port":"5502",
+        "eg_pipeline_path":"/home/everguard/swt_Ukraine/tst_container",
+        "sys_monitor_path":"/home/everguard/swt_Ukraine/tst_container",
+        "image_name":"dazzling_payne"
+      }
 }

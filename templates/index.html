@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+	<meta charset="UTF-8"/>
+    <title>Servers monitor</title>
+	<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css') }}"/>
+
+	<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
+  	<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+  	<script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/js/bootstrap.min.js"></script>
+  </head>
+
+	<body>
+	<div class="container">
+		<h3>Docker Image Manager</h3>
+		
+		<div class ="col" style="color:rgb(0, 110, 255); text-align:right;">
+			<p> The last status update for docker images
+				<p id="lst_update"/>
+			</p>
+		</div>
+
+		<div class="row">	
+		{% for server_name, status in data.items() %}
+
+		<div class="col-lg-2 col-lg-offset-2">
+				<p>{{ server_name }}
+				{% if status == 'True' %}
+				<canvas id="circle_green" width="20" height="20"></canvas>
+				{% elif status == 'False' %}
+				<canvas id="circle_red" width="20" height="20"></canvas>
+				{% else %}
+				<i>{{ status }}</i>
+				{% endif %}
+				</p>
+			</div>
+		{% endfor %}
+		</div>
+
+		<button type="button" onclick="reverse_status()" class="btn btn-primary btn-md">Reverse all status</button>
+		<button type="button" onclick="auto_reload()" class="btn btn-primary btn-md">Reload</button>
+		<br/><br/><br/>
+
+		<h3>Send command</h3>
+		<button onclick="dropdown_menu()">Command dropdown list
+			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-down-square-fill" viewBox="0 0 16 16">
+				<path d="M2 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2zm6.5 4.5v5.793l2.146-2.147a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 1 1 .708-.708L7.5 10.293V4.5a.5.5 0 0 1 1 0z"/>
+			</svg>
+		</button>
+		<br>
+		<div class="row" style="display: none;", id="command_menu">
+			<select  onchange='btn_clickable(true)' id="slc_command" class="form-select" aria-label="Default select example">
+				<option value="" selected disabled hidden>Choose here</option>
+				<option value="watchdog">run (watchdog)</option>
+				<option value="stream">run (stream)</option>
+				<option value="stop">stop</option>
+				<option value="update">update</option>
+			</select>
+
+			<button type="button" id="snd_button" onclick="snd_request()" class="btn btn-primary btn-md">Send</button>
+			<br/><br/><br/><br/>
+
+
+			<p>Target: 
+				<label class="container">All
+					<input type="checkbox" onclick="toggle(this);">
+					<span class="all_imahes"></span>
+				</label>
+			</p>
+
+			<div class="row">	
+				{% for server_name, status in data.items() %}
+					<div class="col-lg-2 col-lg-offset-2">	
+						<label class="container">{{ server_name }}
+							<input id={{server_name}} type="checkbox">
+							<!-- <span class="image_{{ server_name }}"></span> -->
+						</label>
+					</div>
+				{% endfor %}
+			</div>
+		</div>
+	</div>
+
+	<script>
+
+		var time_now = new Date().toTimeString()
+		const equals = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+		const btn_clickable = (able) => document.getElementById("snd_button").disabled = !able
+
+		function sortObjectByKeys(o) {
+			return Object.keys(o).sort().reduce((r, k) => (r[k] = o[k], r), {});
+		}
+		
+
+		function auto_reload(){
+			/**
+			* function that get update status from backend.
+			*/
+			let request = new XMLHttpRequest();
+        	request.open("GET", "{{ url_for('get_status') }}");
+			let cur_data = sortObjectByKeys({{ data|safe }})
+			request.send(null);
+			request.onload = function() {
+				let resp = sortObjectByKeys(JSON.parse(request.response))
+				if (!(equals(resp,cur_data))) {
+					let d = new Date()
+					document.location.reload();
+					time_now = d.toTimeString()
+				}
+			};			
+		}
+
+		document.getElementById('lst_update').innerHTML = time_now;
+		
+		/** call auto_reload function every 5 seconds*/
+		var myInterval = setInterval(auto_reload, 5000)
+
+		function snd_request(){
+			/** 
+			* Function that get all selected values from client. Formulate the json variable data and send to backend.
+			*/
+
+			let docker_images = []
+			let checkboxes = document.querySelectorAll('input[type="checkbox"]');
+			for (let i = 1; i < checkboxes.length; i++) {
+				if (checkboxes[i].checked)
+					docker_images.push(checkboxes[i])		
+			}
+			let command = document.getElementById("slc_command").value;
+		
+			let request = new XMLHttpRequest();
+			request.open("POST", "{{ url_for('manage_docker') }}");
+			request.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
+			let lst_images = []
+			for(let i=0; i < docker_images.length; i++) {
+				lst_images[i] = docker_images[i].id
+			}
+			let data = {
+				"command": command,
+				"lst_images": lst_images
+			}
+			request.send(JSON.stringify(data));
+			document.location.reload();
+			console.log('Send', command, docker_images);
+		}
+
+		function reverse_status(){ 
+			/**Test function that change run to stop and stop to run.
+			* TODO: DELETE this function and button in prod*/
+
+			let request = new XMLHttpRequest();
+        	request.open("GET", "{{ url_for('reverse_status') }}");
+			request.send(null)
+			document.location.reload();
+		}
+
+		function toggle(source) {
+			/** function to select all targets.*/
+
+			let checkboxes = document.querySelectorAll('input[type="checkbox"]');
+			for (let i = 0; i < checkboxes.length; i++) {
+				if (checkboxes[i] != source)
+					checkboxes[i].checked = source.checked;
+			}
+		}
+
+		function dropdown_menu() {
+			/**Dropdown menu - dropdown the div to select that target and send command.*/
+
+			let x = document.getElementById("command_menu");
+		  	if (x.style.display === "none") {
+				x.style.display = "block";
+				btn_clickable(false)
+			} else {
+				x.style.display = "none";
+		  	}
+		}
+
+	</script>
+  </body>
+</html>

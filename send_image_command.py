@@ -24,12 +24,12 @@ def check_command(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('-d','--docker', type=str, nargs='+')
-    p.add_argument('-c','--command', type=str, default='check')
+    p.add_argument('-d','--docker', type=str, default=['SBC-cam9-14'], nargs='+')
+    p.add_argument('-c','--command', type=str, default='stream')
     
     # read the command and the cfg file
     args = p.parse_args()
-    with open("images.json","r") as f:
+    with open("servers.json","r") as f:
         cfg = json.load(f)
     
     jobs = []
