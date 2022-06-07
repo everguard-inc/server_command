@@ -19,5 +19,12 @@
         "eg_pipeline_path":"/home/everguard/swt_Ukraine/tst_container",
         "sys_monitor_path":"/home/everguard/swt_Ukraine/tst_container",
         "image_name":"dazzling_payne"
+    },
+    "tarping":{
+        "ip":"10.230.1.205",
+        "port":"5502",
+        "eg_pipeline_path":"/home/everguard/swt_Ukraine/tarping_pipeline",
+        "sys_monitor_path":"/home/everguard/swt_Ukraine/tarping_pipeline",
+        "image_name":"dazzling_payne"
       }
 }
