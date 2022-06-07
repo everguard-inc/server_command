@@ -37,8 +37,6 @@
 		{% endfor %}
 		</div>
 
-		<button type="button" onclick="reverse_status()" class="btn btn-primary btn-md">Reverse all status</button>
-		<button type="button" onclick="auto_reload()" class="btn btn-primary btn-md">Reload</button>
 		<br/><br/><br/>
 
 		<h3>Send command</h3>
@@ -59,7 +57,6 @@
 
 			<button type="button" id="snd_button" onclick="snd_request()" class="btn btn-primary btn-md">Send</button>
 			<br/><br/><br/><br/>
-
 
 			<p>Target: 
 				<label class="container">All
@@ -142,16 +139,6 @@
 			request.send(JSON.stringify(data));
 			document.location.reload();
 			console.log('Send', command, docker_images);
-		}
-
-		function reverse_status(){ 
-			/**Test function that change run to stop and stop to run.
-			* TODO: DELETE this function and button in prod*/
-
-			let request = new XMLHttpRequest();
-        	request.open("GET", "{{ url_for('reverse_status') }}");
-			request.send(null)
-			document.location.reload();
 		}
 
 		function toggle(source) {
