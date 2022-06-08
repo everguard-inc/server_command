@@ -63,22 +63,25 @@ async def get_status(command='check'):
             }
     '''
 
-    global img_n_status
+    tasks_stop = []
     for image_name in cfg.keys():
         image_cfg = cfg[image_name]
-        data = json.dumps({command:image_cfg["image_name"]})
+        data = json.dumps({command:image_cfg["image_name"]})    
         url = 'http://' + image_cfg["ip"] + ':' + image_cfg["port"] + '/command'
         print("Request send to:", image_cfg["ip"])
         print("Target Image: ", image_name)
         print("Command:", command)
         print("Data: ",data)
-        img_n_status[image_name] = await send_command(url, data)
+        tasks_stop.append(asyncio.create_task(send_command(url, data)))
+
+    res = await asyncio.gather(*tasks_stop)
+    img_n_status = {image_name : status for status, image_name in zip(res, cfg.keys())}
 
     return img_n_status
 
 async def stop_container(command, docker_images):
     ''' Method to formulate json and url to stop docker container
-    
+
     Example:
 
         url = 'http://10.230.1.205:5502/command'
@@ -88,7 +91,7 @@ async def stop_container(command, docker_images):
 
     '''
 
-    global img_n_status
+    tasks_stop = []
     for image_name in docker_images:
         image_cfg = cfg[image_name]
         data = json.dumps({command:image_cfg["image_name"]})    
@@ -97,8 +100,9 @@ async def stop_container(command, docker_images):
         print("Target Image: ", image_name)
         print("Command:", command)
         print("Data: ",data)
-        await send_command(url, data)
-    return Response('', 200)
+        tasks_stop.append(asyncio.create_task(send_command(url, data)))
+
+    await asyncio.gather(*tasks_stop)
 
 async def run_n_update(docker_command, docker_images):
     ''' Method to run or update docker container 
@@ -131,6 +135,8 @@ async def run_n_update(docker_command, docker_images):
         else:
             server_image_dic[cfg[image_name]["ip"]] = [image_name]
 
+    tasks_run_n_update = []
+
     for server in server_image_dic.keys():
             img_cfg = cfg[server_image_dic[server][0]]
             url = 'http://' + server + ':' + img_cfg["port"] + '/command'
@@ -149,8 +155,10 @@ async def run_n_update(docker_command, docker_images):
                         "sys_monitor_path":img_cfg["sys_monitor_path"]
                         }
                 })
-
-            await send_command(url, data)
+            tasks_run_n_update.append(asyncio.create_task(send_command(url, data)))
+    
+    res = await asyncio.gather(*tasks_run_n_update)
+            
 
 async def send_command(url, data):
     async with httpx.AsyncClient() as client:
