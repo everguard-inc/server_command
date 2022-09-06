@@ -19,6 +19,9 @@ def index():
 
     return render_template('index.html', data=img_n_status)
 
+@app.route('/update', methods=['GET'])
+def update():
+    return render_template('index.html', data=img_n_status)
 
 @app.route('/manage_docker', methods=['GET', 'POST'])
 async def manage_docker():
@@ -68,15 +71,18 @@ async def get_status(command='check'):
         image_cfg = cfg[image_name]
         data = json.dumps({command:image_cfg["image_name"]})    
         url = 'http://' + image_cfg["ip"] + ':' + image_cfg["port"] + '/command'
-        print("Request send to:", image_cfg["ip"])
-        print("Target Image: ", image_name)
-        print("Command:", command)
-        print("Data: ",data)
+        #print("Request send to:", image_cfg["ip"])
+        #print("Target Image: ", image_name)
+        #print("Command:", command)
+        #print("Data: ",data)
         tasks_stop.append(asyncio.create_task(send_command(url, data)))
 
     res = await asyncio.gather(*tasks_stop)
     img_n_status = {image_name : status for status, image_name in zip(res, cfg.keys())}
-
+    print("===============")
+    print("check_status:")
+    print(img_n_status)
+    print("===========")
     return img_n_status
 
 async def stop_container(command, docker_images):
@@ -156,12 +162,11 @@ async def run_n_update(docker_command, docker_images):
                         }
                 })
             tasks_run_n_update.append(asyncio.create_task(send_command(url, data)))
-    
     res = await asyncio.gather(*tasks_run_n_update)
-            
 
 async def send_command(url, data):
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(connect=30, read=None, write=None, pool=10)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, data=data)
         res = response.content.decode("utf-8")
     return res

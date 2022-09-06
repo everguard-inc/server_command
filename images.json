@@ -1,0 +1,16 @@
+{
+    "SBC-cam6-8":{
+        "ip":"10.230.1.205",
+        "port":"5502",
+        "eg_pipeline_path": "/home/everguard/eg_pipeline",
+        "sys_monitor_path": "/home/everguard/system_monitor",
+        "image_name":"a1accf68-0424-456e-9b16-52acb30d82b2"
+    },
+    "SBC-cam9-14":{
+        "ip":"10.230.1.205",
+        "port":"5502",
+        "eg_pipeline_path": "/home/everguard/eg_pipeline",
+        "sys_monitor_path": "/home/everguard/system_monitor",
+        "image_name":"0cd2f071-678c-48cb-af66-03d928ee6eac"
+    }    
+}

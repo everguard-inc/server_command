@@ -37,13 +37,12 @@ def command_recv():
 
 def run_pipeline(cfg):
     # run with stream/watchdog in background
-    # should wait 30 secs for running another container
     if "type" not in cfg.keys() or "json" not in cfg.keys() or "path" not in cfg.keys():
         return False
     for json in cfg["json"]:
         print("should run",json," with ",cfg["type"]," at path ",cfg["path"])
         subprocess.run(["./docker-run.sh",cfg["type"],json,"--opt","background"],cwd=cfg["path"])
-        time.sleep(30)
+        time.sleep(5)
     return True
 
 def stop_pipeline(image_name):

@@ -13,34 +13,33 @@
 	<body>
 	<div class="container">
 		<h3>Docker Image Manager</h3>
-		
-		<div class ="col" style="color:rgb(0, 110, 255); text-align:right;">
-			<p> The last status update for docker images
-				<p id="lst_update"/>
-			</p>
-		</div>
+		    <div class ="col" style="color:rgb(0, 110, 255); text-align:right;">
+			    <p> The last status update for docker images
+				    <p id="lst_update"/>
+			    </p>    
+	    	</div>
+        <div id ='refresh'>
+		    <div class="row">	
+		    {% for server_name, _status in data.items() %}
 
-		<div class="row">	
-		{% for server_name, status in data.items() %}
-
-		<div class="col-lg-2 col-lg-offset-2">
-				<p>{{ server_name }}
-				{% if status == 'True' %}
-				<canvas id="circle_green" width="20" height="20"></canvas>
-				{% elif status == 'False' %}
-				<canvas id="circle_red" width="20" height="20"></canvas>
-				{% else %}
-				<i>{{ status }}</i>
-				{% endif %}
-				</p>
-			</div>
-		{% endfor %}
-		</div>
-
+                <div class="col-lg-2 col-lg-offset-2">
+			    	<p>{{ server_name }}
+				        {% if _status == 'True' %}
+				        <canvas id="circle_green" width="20" height="20"></canvas>
+				        {% elif _status == 'False' %}
+				        <canvas id="circle_red" width="20" height="20"></canvas>
+				        {% else %}
+			    	    <i>{{ _status }}</i>
+		    		    {% endif %}
+			   	    </p>
+		    	</div>
+	    	{% endfor %}
+		    </div>
+        </div>
 		<br/><br/><br/>
 
 		<h3>Send command</h3>
-		<button onclick="dropdown_menu()">Command dropdown list
+		<button id="btn_dropdwon" onclick="dropdown_menu()">Command dropdown list
 			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-down-square-fill" viewBox="0 0 16 16">
 				<path d="M2 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2zm6.5 4.5v5.793l2.146-2.147a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 1 1 .708-.708L7.5 10.293V4.5a.5.5 0 0 1 1 0z"/>
 			</svg>
@@ -87,7 +86,33 @@
 		function sortObjectByKeys(o) {
 			return Object.keys(o).sort().reduce((r, k) => (r[k] = o[k], r), {});
 		}
-		
+
+        function refresh_server_status(resp){
+            var h = document.createElement('div');
+            h.className = "row";
+            for( const [server_name,_status] of Object.entries(resp)){
+                var newDiv = document.createElement('div');
+                var newp = document.createElement('p');
+                var text = document.createTextNode(server_name);
+                var canvas = document.createElement('canvas');
+                canvas.width = 20;
+                canvas.height = 20;
+                if (_status == "True"){
+                    canvas.id = "circle_green";
+                }else{
+                    canvas.id = "circle_red";
+                }
+                newp.appendChild(text);
+                newDiv.className = "col-lg-2 col-lg-offset-2";
+                newDiv.appendChild(newp);
+                newDiv.appendChild(canvas);
+                h.appendChild(newDiv);
+            }
+            for (let i = 0; i < 3; i++){
+                h.appendChild(document.createElement('br')) ;
+            }
+            return h;
+        }
 
 		function auto_reload(){
 			/**
@@ -99,11 +124,12 @@
 			request.send(null);
 			request.onload = function() {
 				let resp = sortObjectByKeys(JSON.parse(request.response))
-				if (!(equals(resp,cur_data))) {
+				//if (!(equals(resp,cur_data))) {
 					let d = new Date()
-					document.location.reload();
-					time_now = d.toTimeString()
-				}
+                    time_now = d.toTimeString()
+                    document.getElementById('lst_update').innerHTML = time_now;
+                    document.querySelector("#refresh").innerHTML = refresh_server_status(resp).innerHTML;
+				//}
 			};			
 		}
 
@@ -137,7 +163,8 @@
 				"lst_images": lst_images
 			}
 			request.send(JSON.stringify(data));
-			document.location.reload();
+            document.getElementById('btn_dropdwon').click();
+			//document.location.reload();
 			console.log('Send', command, docker_images);
 		}
 
