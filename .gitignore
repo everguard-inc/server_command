@@ -152,6 +152,10 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Site-local (not tracked in git)
+servers.json
+nohup.out
+
 # Cython debug symbols
 cython_debug/
 

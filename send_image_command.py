@@ -1,116 +1,68 @@
-import json
-import requests
+#!/usr/bin/env python3
+"""CLI to send host-grouped or per-pipeline commands to edge agents."""
+
 import argparse
 import sys
-import multiprocessing
 
-def send_cmd(url,data):
-    # function to send command to each client 
-    response = requests.post(url, data = data)
-    print(url,data)
-    result = response.content.decode("utf-8")
-    print(result)
+from send_command import build_payload, join_processes, send_cmd, start_process
+from servers_cfg import (
+  edge_command_url,
+  edge_host_command_payload,
+  ensure_cli_command,
+  group_by_server_ip,
+  load_servers_cfg,
+  post_edge_command,
+  resolve_cli_pipelines,
+)
 
-def check_command(args):
-    # check if command is valid
-    if args.command == None:
-        print("No Command Found") 
-        sys.exit(0)
-    else:
-        if args.command not in ['stream','check','watchdog','update','stop']:
-            print("Command Name Error, Must be stream, watchdog, update, stop, check")
-            sys.exit(0)
+HOST_COMMANDS = ("stream", "watchdog", "update")
+PIPELINE_COMMANDS = ("check", "stop")
+ALLOWED_COMMANDS = (*HOST_COMMANDS, *PIPELINE_COMMANDS)
+
+
+def launch_host_command(server_ip, names, args, cfg):
+  first = cfg[names[0]]
+  url = edge_command_url(first, host_ip=server_ip)
+  data = edge_host_command_payload(args.command, names, cfg)
+  return start_process(send_cmd, (names[0], args, url, data))
+
+
+def launch_pipeline_command(pipeline_name, args, cfg):
+  server = cfg[pipeline_name]
+  data = build_payload(args.command, pipeline_name, server, cfg)
+  if data is None:
+    return None
+
+  url = edge_command_url(server)
+  print("Request send to:", server.get("server_ip"))
+  print("Target Image:", pipeline_name)
+  print("Command:", args.command)
+  return start_process(send_cmd, (pipeline_name, args, url, data))
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument('-d','--docker', type=str, default=['SBC-cam9-14'], nargs='+')
-    p.add_argument('-c','--command', type=str, default='stream')
-    
-    # read the command and the cfg file
-    args = p.parse_args()
-    with open("servers.json","r") as f:
-        cfg = json.load(f)
-    
-    jobs = []
-    check_command(args)
-    print("Command Accepted")
-    
-    
-    if args.command in ['stream','watchdog','update']:
-        # run pipeline and update code command should be run with a server manner
-        # because there should be come wait time between two containers that run on the same server 
-        
-        server_image_dic = {}
-        # first, group each container with its assigned server
-        if args.docker == None:
-            # run all docker container in the cfg file
-            for image_name in cfg.keys():
-                if cfg[image_name]["ip"] in server_image_dic.keys():
-                    server_image_dic[cfg[image_name]["ip"]].append(image_name)
-                else:
-                    server_image_dic[cfg[image_name]["ip"]] = [image_name]
-        else:
-            # run specific container given by the imput command
-            for image_name in list(args.docker):
-                if cfg[image_name]["ip"] in server_image_dic.keys():
-                    server_image_dic[cfg[image_name]["ip"]].append(image_name)
-                else:
-                    server_image_dic[cfg[image_name]["ip"]] = [image_name]
+  parser = argparse.ArgumentParser()
+  parser.add_argument("-s", "--servers", type=str, nargs="+", default=None)
+  parser.add_argument("-d", "--docker", type=str, nargs="+", default=None,
+                      help=argparse.SUPPRESS)
+  parser.add_argument("-c", "--command", type=str, default="stream")
+  args = parser.parse_args()
 
-        # for each server send the command that contains which container(s) to run 
-        for server in server_image_dic.keys():
-            url = 'http://' + server + ':' + cfg[server_image_dic[server][0]]["port"] + '/command'
-            if args.command == 'stream' or args.command == 'watchdog':
-                data = json.dumps({"run":{"type":args.command,"json":server_image_dic[server],"path":cfg[server_image_dic[server][0]]["eg_pipeline_path"]}})
-            else:
-                data = json.dumps({"update":{"eg_pipeline_path":cfg[server_image_dic[server][0]]["eg_pipeline_path"],"sys_monitor_path":cfg[server_image_dic[server][0]]["sys_monitor_path"]}})
-            print(data)
-            p = multiprocessing.Process(target=send_cmd, args=(url,data))
-            jobs.append(p)
-            p.start()
+  cfg = load_servers_cfg()
+  ensure_cli_command(args.command, ALLOWED_COMMANDS)
+  print("Command Accepted")
 
-        for job in jobs:
-            p.join()
-            
-    # check and stop command
-    else:
-        if args.docker == None:
-            # run all docker container in the cfg file
-            for image_name in cfg.keys():
-                image = cfg[image_name]
-                if args.command == 'check':
-                    data = json.dumps({"check":image["image_name"]})
-                elif args.command == 'stop':
-                    data = json.dumps({"stop":image["image_name"]})
-                
-                url = 'http://' + image["ip"] + ':' + image["port"] + '/command'
-                print("Request send to:", image["ip"])
-                if args.command != 'update':
-                    print("Target Image: ", image_name)
-                print("Command:", args.command)
-                print("Data: ",data) 
-                print()
-                p = multiprocessing.Process(target=send_cmd, args=(url,data))
-                jobs.append(p)
-                p.start()
-        else:
-            # check/stop specific container given by the imput command
-            for image_name in args.docker:
-                image = cfg[image_name]
-                if args.command == 'check':
-                    data = json.dumps({"check":image["image_name"]})
-                elif args.command == 'stop':
-                    data = json.dumps({"stop":image["image_name"]})
-                    
-                url = 'http://' + image["ip"] + ':' + image["port"] + '/command'
-                print("Request send to:", image["ip"])
-                print("Command:", args.command)                    
-                p = multiprocessing.Process(target=send_cmd, args=(url,data))
-                jobs.append(p)
-                p.start()
-            for proc in jobs:
-                proc.join()
-     
-        
-    
+  only = args.servers if args.servers is not None else args.docker
+  targets = resolve_cli_pipelines(cfg, only)
+  jobs = []
+
+  if args.command in HOST_COMMANDS:
+    for server_ip, names in group_by_server_ip(targets, cfg).items():
+      jobs.append(launch_host_command(server_ip, names, args, cfg))
+  else:
+    for pipeline_name in targets:
+      proc = launch_pipeline_command(pipeline_name, args, cfg)
+      if proc:
+        jobs.append(proc)
+
+  join_processes(jobs)

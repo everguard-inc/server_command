@@ -1,195 +1,204 @@
+{% macro pipeline_view_controls() %}
+{% set view_filters = [
+	("group", "Group", "All groups"),
+	("server", "Server", "All servers"),
+	("type", "Type", "All types"),
+] %}
+<div class="view-controls">
+	{% for kind, label, default_value in view_filters %}
+	<div class="view-filter">
+		<span class="view-filter__label">{{ label }}</span>
+		<div class="view-ms view-ms--{{ kind }}" id="status_{{ kind }}_filter" data-filter="{{ kind }}">
+			<button type="button" class="view-ms__trigger" aria-haspopup="listbox" aria-expanded="false">
+				<span class="view-ms__value">{{ default_value }}</span>
+			</button>
+			<div class="view-ms__menu" hidden>
+				<div class="view-ms__options" role="listbox" aria-multiselectable="true"></div>
+			</div>
+		</div>
+	</div>
+	{% endfor %}
+</div>
+{% endmacro %}
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-	<meta charset="UTF-8"/>
-    <title>Servers monitor</title>
-	<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css') }}"/>
 
-	<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
-  	<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
-  	<script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/js/bootstrap.min.js"></script>
-  </head>
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="color-scheme" content="dark" />
+	<title>Docker Image Manager</title>
+	<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css') }}" />
+</head>
 
-	<body>
-	<div class="container">
-		<h3>Docker Image Manager</h3>
-		    <div class ="col" style="color:rgb(0, 110, 255); text-align:right;">
-			    <p> The last status update for docker images
-				    <p id="lst_update"/>
-			    </p>    
-	    	</div>
-        <div id ='refresh'>
-		    <div class="row">	
-		    {% for server_name, _status in data.items() %}
-
-                <div class="col-lg-2 col-lg-offset-2">
-			    	<p>{{ server_name }}
-				        {% if _status == 'True' %}
-				        <canvas id="circle_green" width="20" height="20"></canvas>
-				        {% elif _status == 'False' %}
-				        <canvas id="circle_red" width="20" height="20"></canvas>
-				        {% else %}
-			    	    <i>{{ _status }}</i>
-		    		    {% endif %}
-			   	    </p>
-		    	</div>
-	    	{% endfor %}
-		    </div>
-        </div>
-		<br/><br/><br/>
-
-		<h3>Send command</h3>
-		<button id="btn_dropdwon" onclick="dropdown_menu()">Command dropdown list
-			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-down-square-fill" viewBox="0 0 16 16">
-				<path d="M2 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2zm6.5 4.5v5.793l2.146-2.147a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 1 1 .708-.708L7.5 10.293V4.5a.5.5 0 0 1 1 0z"/>
-			</svg>
-		</button>
-		<br>
-		<div class="row" style="display: none;", id="command_menu">
-			<select  onchange='btn_clickable(true)' id="slc_command" class="form-select" aria-label="Default select example">
-				<option value="" selected disabled hidden>Choose here</option>
-				<option value="watchdog">run (watchdog)</option>
-				<option value="stream">run (stream)</option>
-				<option value="stop">stop</option>
-				<option value="update">update</option>
-			</select>
-
-			<button type="button" id="snd_button" onclick="snd_request()" class="btn btn-primary btn-md">Send</button>
-			<br/><br/><br/><br/>
-
-			<p>Target: 
-				<label class="container">All
-					<input type="checkbox" onclick="toggle(this);">
-					<span class="all_imahes"></span>
-				</label>
-			</p>
-
-			<div class="row">	
-				{% for server_name, status in data.items() %}
-					<div class="col-lg-2 col-lg-offset-2">	
-						<label class="container">{{ server_name }}
-							<input id={{server_name}} type="checkbox">
-							<!-- <span class="image_{{ server_name }}"></span> -->
-						</label>
-					</div>
+<body>
+	<div class="page">
+		<div class="sticky-toolbar">
+			<div class="sticky-toolbar__top">
+				<div class="page-title-block">
+					<h1 class="page-title">Docker Image Manager</h1>
+					<div class="meta page-title-meta">Last update: <span id="lst_update">-</span></div>
+				</div>
+				<div class="view-controls-bar">
+					{{ pipeline_view_controls() }}
+				</div>
+			</div>
+			<div class="card-grid-4 status-summary-bar" id="status_summary">
+				{% for filter_key, tone, label, sum_id in [
+					('OK', 'ok', 'OK', 'sum_ok'),
+					('WARN', 'warn', 'WARN', 'sum_warn'),
+					('ERR', 'err', 'ERR', 'sum_err'),
+				] %}
+				<button type="button" class="card-tab card-stat-tab {{ tone }} filter-pill" data-filter="{{ filter_key }}">
+					<span class="card-stat-value" id="{{ sum_id }}">0</span>
+					<span class="card-tab-label">{{ label }}</span>
+				</button>
 				{% endfor %}
+				<button type="button" class="card-tab card-stat-tab filter-pill active" id="total_pill" data-filter="all">
+					<span class="card-stat-value" id="sum_total">0</span>
+					<span class="card-tab-label">Total</span>
+				</button>
+			</div>
+		</div>
+
+		<div class="card card--collapsible is-expanded" id="section_pipeline_status">
+			<div class="card-section-head">
+				<div class="card-section-title-row card-section-title-row--compact">
+					<div class="card-section-heading">
+						<button type="button" class="card-collapse-btn" aria-expanded="true" aria-controls="section_pipeline_status_panel" aria-label="Toggle Pipeline Status">
+							<span class="card-collapse-chevron" aria-hidden="true"></span>
+						</button>
+						<h2 class="card-section-title">Pipeline Status</h2>
+					</div>
+				</div>
+			</div>
+			<div class="card-collapsible-panel" id="section_pipeline_status_panel">
+				<div class="card-section-body">
+					<div id="status_body"></div>
+				</div>
+			</div>
+		</div>
+
+		<div class="card card--collapsible is-expanded" id="section_service_control">
+			<div class="card-section-head">
+				<div class="card-section-title-row card-section-title-row--compact">
+					<div class="card-section-heading">
+						<button type="button" class="card-collapse-btn" aria-expanded="true" aria-controls="section_service_control_panel" aria-label="Toggle Service Control">
+							<span class="card-collapse-chevron" aria-hidden="true"></span>
+						</button>
+						<h2 class="card-section-title">Service Control</h2>
+					</div>
+				</div>
+				<div class="command-toolbar">
+					<div class="command-toolbar-slot command-toolbar-slot--meta">
+						<label class="command-toolbar-select check-label">
+							<input type="checkbox" id="select_all">
+							Select all
+						</label>
+						<span class="command-toolbar-count" id="selection_hint">0 selected</span>
+					</div>
+					<div class="command-toolbar-slot command-toolbar-slot--actions">
+						<button type="button" class="btn btn-start command-action-btn" id="btn_start" data-command="service:start">Start</button>
+						<button type="button" class="btn btn-stop command-action-btn" id="btn_stop" data-command="service:stop">Stop</button>
+						<button type="button" class="btn btn-restart command-action-btn" id="btn_restart" data-command="service:restart">Restart</button>
+						<button type="button" class="btn btn-status command-action-btn" id="btn_status" data-command="service:status">Status</button>
+						<button type="button" class="btn btn-update command-action-btn" id="btn_update" data-command="update">Update</button>
+					</div>
+				</div>
+			</div>
+			<div class="card-collapsible-panel" id="section_service_control_panel">
+				<div class="card-section-body">
+					<div id="target_groups"></div>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="camera_live_modal" class="overlay hidden" aria-hidden="true">
+		<div class="overlay__backdrop"></div>
+		<div class="overlay__dialog overlay__dialog--wide" role="dialog" aria-modal="true" aria-labelledby="camera_live_title">
+			<div class="overlay__header">
+				<span id="camera_live_title">Camera</span>
+				<button type="button" class="overlay__close" id="camera_live_close" aria-label="Close">&times;</button>
+			</div>
+			<div class="overlay__body overlay__body--media">
+				<img id="camera_live_img" class="is-hidden" alt="" />
+				<div id="camera_live_status" class="overlay__caption">Connecting…</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="ping_modal" class="overlay hidden" aria-hidden="true">
+		<div class="overlay__backdrop"></div>
+		<div class="overlay__dialog overlay__dialog--ping" role="dialog" aria-modal="true" aria-labelledby="ping_modal_title">
+			<div class="overlay__header">
+				<span id="ping_modal_title">Ping Test</span>
+				<button type="button" class="overlay__close" id="ping_modal_close" aria-label="Close">&times;</button>
+			</div>
+			<div class="overlay__body overlay__body--center">
+				<div id="ping_modal_badge" class="ping-badge ping-badge--pending">Testing…</div>
+				<div id="ping_modal_host" class="ping-host"></div>
+				<div id="ping_modal_detail" class="ping-detail"></div>
+				<button type="button" id="ping_modal_open" class="ping-open-btn hidden">Open in new window</button>
+			</div>
+		</div>
+	</div>
+
+	<div id="command_modal" class="overlay overlay--app hidden" aria-hidden="true">
+		<div class="overlay__backdrop"></div>
+		<div class="overlay__dialog overlay__dialog--command" role="dialog" aria-modal="true" aria-labelledby="command_modal_title">
+			<div class="overlay__header command-modal-header">
+				<div class="command-modal-head">
+					<span id="command_modal_title">Service control</span>
+					<span id="command_modal_hint" class="modal-hint"></span>
+				</div>
+				<button type="button" class="overlay__close" id="command_modal_close" aria-label="Close">&times;</button>
+			</div>
+			<div class="overlay__body">
+				<div id="command_modal_overall" class="command-overall-progress hidden" aria-live="polite"></div>
+				<div id="command_modal_list" class="command-result-list"></div>
+			</div>
+			<div class="overlay__footer">
+				<button type="button" class="btn overlay__btn overlay__btn--ok" id="command_modal_ok">OK</button>
+			</div>
+		</div>
+	</div>
+
+	<div id="app_modal" class="overlay overlay--app hidden" aria-hidden="true">
+		<div class="overlay__backdrop"></div>
+		<div class="overlay__dialog" role="dialog" aria-modal="true" aria-labelledby="app_modal_title">
+			<div class="overlay__header">
+				<span id="app_modal_title">Notice</span>
+				<button type="button" class="overlay__close" id="app_modal_close" aria-label="Close">&times;</button>
+			</div>
+			<div class="overlay__body">
+				<div id="app_modal_message" class="overlay__message"></div>
+			</div>
+			<div class="overlay__footer">
+				<button type="button" class="btn overlay__btn overlay__btn--cancel" id="app_modal_cancel">Cancel</button>
+				<button type="button" class="btn overlay__btn overlay__btn--ok" id="app_modal_ok">OK</button>
 			</div>
 		</div>
 	</div>
 
 	<script>
-
-		var time_now = new Date().toTimeString()
-		const equals = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-		const btn_clickable = (able) => document.getElementById("snd_button").disabled = !able
-
-		function sortObjectByKeys(o) {
-			return Object.keys(o).sort().reduce((r, k) => (r[k] = o[k], r), {});
-		}
-
-        function refresh_server_status(resp){
-            var h = document.createElement('div');
-            h.className = "row";
-            for( const [server_name,_status] of Object.entries(resp)){
-                var newDiv = document.createElement('div');
-                var newp = document.createElement('p');
-                var text = document.createTextNode(server_name);
-                var canvas = document.createElement('canvas');
-                canvas.width = 20;
-                canvas.height = 20;
-                if (_status == "True"){
-                    canvas.id = "circle_green";
-                }else{
-                    canvas.id = "circle_red";
-                }
-                newp.appendChild(text);
-                newDiv.className = "col-lg-2 col-lg-offset-2";
-                newDiv.appendChild(newp);
-                newDiv.appendChild(canvas);
-                h.appendChild(newDiv);
-            }
-            for (let i = 0; i < 3; i++){
-                h.appendChild(document.createElement('br')) ;
-            }
-            return h;
-        }
-
-		function auto_reload(){
-			/**
-			* function that get update status from backend.
-			*/
-			let request = new XMLHttpRequest();
-        	request.open("GET", "{{ url_for('get_status') }}");
-			let cur_data = sortObjectByKeys({{ data|safe }})
-			request.send(null);
-			request.onload = function() {
-				let resp = sortObjectByKeys(JSON.parse(request.response))
-				//if (!(equals(resp,cur_data))) {
-					let d = new Date()
-                    time_now = d.toTimeString()
-                    document.getElementById('lst_update').innerHTML = time_now;
-                    document.querySelector("#refresh").innerHTML = refresh_server_status(resp).innerHTML;
-				//}
-			};			
-		}
-
-		document.getElementById('lst_update').innerHTML = time_now;
-		
-		/** call auto_reload function every 5 seconds*/
-		var myInterval = setInterval(auto_reload, 5000)
-
-		function snd_request(){
-			/** 
-			* Function that get all selected values from client. Formulate the json variable data and send to backend.
-			*/
-
-			let docker_images = []
-			let checkboxes = document.querySelectorAll('input[type="checkbox"]');
-			for (let i = 1; i < checkboxes.length; i++) {
-				if (checkboxes[i].checked)
-					docker_images.push(checkboxes[i])		
-			}
-			let command = document.getElementById("slc_command").value;
-		
-			let request = new XMLHttpRequest();
-			request.open("POST", "{{ url_for('manage_docker') }}");
-			request.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
-			let lst_images = []
-			for(let i=0; i < docker_images.length; i++) {
-				lst_images[i] = docker_images[i].id
-			}
-			let data = {
-				"command": command,
-				"lst_images": lst_images
-			}
-			request.send(JSON.stringify(data));
-            document.getElementById('btn_dropdwon').click();
-			//document.location.reload();
-			console.log('Send', command, docker_images);
-		}
-
-		function toggle(source) {
-			/** function to select all targets.*/
-
-			let checkboxes = document.querySelectorAll('input[type="checkbox"]');
-			for (let i = 0; i < checkboxes.length; i++) {
-				if (checkboxes[i] != source)
-					checkboxes[i].checked = source.checked;
-			}
-		}
-
-		function dropdown_menu() {
-			/**Dropdown menu - dropdown the div to select that target and send command.*/
-
-			let x = document.getElementById("command_menu");
-		  	if (x.style.display === "none") {
-				x.style.display = "block";
-				btn_clickable(false)
-			} else {
-				x.style.display = "none";
-		  	}
-		}
-
+		window.APP_CONFIG = {
+			pipelineOrder: {{ pipeline_order | tojson }},
+			pipelineGroups: {{ pipeline_groups | tojson }},
+			pipelineStatic: {{ pipeline_static | tojson }},
+			statusDisplay: {{ status_display | tojson }},
+			urls: {
+				cameraFeed: {{ url_for('camera_feed') | tojson }},
+				getUpdateStatus: {{ url_for('get_update_status') | tojson }},
+				pingDevice: {{ url_for('ping_device') | tojson }},
+				updateServerIp: {{ url_for('update_server_ip') | tojson }},
+				getStatus: {{ url_for('get_status') | tojson }},
+				serviceCommandStatus: {{ url_for('service_command_status') | tojson }},
+				manageDocker: {{ url_for('manage_docker') | tojson }},
+			},
+		};
 	</script>
-  </body>
+	<script src="{{ url_for('static', filename='index.js') }}"></script>
+</body>
+
 </html>

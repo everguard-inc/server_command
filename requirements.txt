@@ -1,2 +1,4 @@
 httpx
 flask[async]
+requests
+urllib3<2

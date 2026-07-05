@@ -1,0 +1,34 @@
+{
+    "xSiteId": "7a4307ca-7d00-49a3-bb79-394eb2682a9b",
+    "edge_probe": {
+        "stream_probe_interval_sec": 10,
+        "stream_probe_workers": 4,
+        "docker_stats_interval_sec": 10
+    },
+    "status_display": {
+        "mem_warn_percent": 80
+    },
+    "servers": {
+        "RND-SYSTEM": {
+            "server_ip": "10.230.0.100",
+            "server_id": "264f8a1f-fd4e-4760-99ee-c436a6c74cd4",
+            "service_name": "eg_monitor",
+            "sys_monitor_path": "/home/everguard/system_monitor"
+        },
+        "RND-RTLS": {
+            "server_ip": "10.230.0.100",
+            "server_id": "5ceeba00-1d44-49e4-829f-d3c981d8fa59",
+            "service_name": "eg_rtls",
+            "eg_pipeline_path": "/home/everguard/rtls_server",
+            "sys_monitor_path": "/home/everguard/system_monitor"
+        },
+        "RND-3090": {
+            "server_ip": "10.230.0.100",
+            "monitor_host_ip": "10.230.0.100",
+            "server_id": "cd620adc-a133-4299-a8be-9e16491208ff",
+            "service_name": "eg_cd620adc-a133-4299-a8be-9e16491208ff",
+            "eg_pipeline_path": "/home/everguard/eg_pipeline",
+            "sys_monitor_path": "/home/everguard/system_monitor"
+        }
+    }
+}
