@@ -1,6 +1,7 @@
 """Central proxy UI and status collector for Docker Image Manager."""
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -9,41 +10,52 @@ import threading
 import time
 import uuid
 from os.path import dirname, join, realpath
-from urllib.parse import urlparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import httpx
 from flask import Flask, Response, jsonify, make_response, render_template, request, stream_with_context
 
-from git_versions import GIT_VERSION_TIMEOUT, git_run, git_commit_date, git_latest_remote, git_latest_remote_url, is_git_repo_dir
+from git_versions import (
+  DEFAULT_GIT_VERSION_TIMEOUT,
+  git_run,
+  is_git_repo_dir,
+  read_repo_latest,
+)
 from pipeline_ip import resolve_server_ip, resolve_sys_monitor_ip
 from servers_cfg import (
-  EG_PIPELINE_PATH,
-  EDGE_STATUS_MERGE_KEYS,
   SERVERS_PATH,
-  SYS_MONITOR_PATH,
   apply_sys_monitor_host_status,
   edge_command_url,
   edge_host_command_payload,
+  edge_host_power_payload,
   edge_port,
   edge_probe_config,
   edge_service_payload,
+  empty_camera_drift_metrics,
+  empty_plc_tag_metrics,
+  fetch_plc_tag_metrics,
+  fetch_camera_drift_metrics,
   finalize_pipeline_status,
   group_by_server_ip,
-  is_rtls_pipeline,
+  drift_service_root_url,
+  drift_service_url_for,
+  is_camera_drift_pipeline,
+  is_kafka_pipeline,
   is_sys_monitor_entry,
   is_usable_edge_host,
-  is_usable_stream_host,
-  merge_edge_status_data,
+  merge_edge_status_fields,
   pipeline_kind_flags,
   pipeline_git_url,
-  pipeline_path_for,
   pipeline_service_name,
+  plc_status_url_for,
   read_servers_file,
+  repo_path_for_pipeline,
+  server_cfg_for_ip,
   split_servers_raw,
   status_display_config,
-  stream_feed_path_for,
+  ensure_servers_meta,
   stream_feed_paths_for,
-  tcp_reachable_optional,
+  tcp_reachable,
   write_servers_file,
 )
 
@@ -60,7 +72,6 @@ REFRESH_INTERVAL = 10
 VIEWER_IDLE_SEC = 45
 HOST_FETCH_TIMEOUT = 50
 HOST_FETCH_RETRY_TIMEOUT = 25
-EDGE_STATUS_KEYS = EDGE_STATUS_MERGE_KEYS
 _refreshing = False
 _collect_reset = False
 _pending_reset = False
@@ -78,6 +89,12 @@ _VERSION_KEYS = (
   "version_latest", "version_latest_date",
 )
 _fetch_versions_next = False
+_central_latest_cache = {}
+CENTRAL_VERSION_TTL_SEC = 300
+RTSP_SNAPSHOT_TIMEOUT = 5
+RTSP_POLL_INTERVAL_SEC = 0.35
+SSE_WARMUP_MAX_LINES = 30
+SSE_WARMUP_MAX_LINES_PARTIAL = 8
 
 
 def _ok_count(status_map):
@@ -85,15 +102,35 @@ def _ok_count(status_map):
 
 
 def pipeline_url(image_cfg, entry=None):
-  host = (entry or {}).get("streaming_ip")
-  if not is_usable_stream_host(host):
+  entry = entry or {}
+  if is_kafka_pipeline(cfg=image_cfg) or entry.get("is_kafka"):
+    return (
+      entry.get("plc_status_url")
+      or plc_status_url_for(image_cfg, host_ip=image_cfg.get("server_ip"))
+      or ""
+    )
+  if is_camera_drift_pipeline(cfg=image_cfg) or entry.get("is_camera_drift"):
+    return (
+      entry.get("drift_service_url")
+      or drift_service_url_for(image_cfg, host_ip=image_cfg.get("server_ip"))
+      or ""
+    )
+  host = entry.get("streaming_ip")
+  if not is_usable_edge_host(host):
     host = image_cfg.get("server_ip")
   port = image_cfg.get("streaming_port")
-  if entry and entry.get("streaming_port") is not None:
+  if entry.get("streaming_port") is not None:
     port = entry.get("streaming_port")
   if host and port is not None:
     return f"http://{host}:{port}"
   return ""
+
+
+def _resolved_drift_service_url(image_cfg, host_ip=None):
+  return drift_service_url_for(
+    image_cfg,
+    host_ip=host_ip if host_ip is not None else (image_cfg or {}).get("server_ip"),
+  ) or ""
 
 
 def stream_url_for_pipeline(pipeline_name):
@@ -106,13 +143,252 @@ def stream_url_for_pipeline(pipeline_name):
   return pipeline_url(image_cfg, entry)
 
 
-def _camera_frame_from_payload(payload, cam_idx):
+def _config_cameras_from_payload(payload):
+  cameras = (payload.get("config") or {}).get("camera")
+  return cameras if isinstance(cameras, list) else []
+
+
+def _camera_count_hint(payload, pipeline_name=None):
+  """Best-effort camera count when SSE has no config.camera (e.g. PLC /stream)."""
+  cameras = _config_cameras_from_payload(payload)
+  if cameras:
+    return len(cameras)
   jpeg = payload.get("jpeg")
   if isinstance(jpeg, list):
-    if 0 <= cam_idx < len(jpeg):
-      return jpeg[cam_idx] or ""
+    return len(jpeg)
+  if pipeline_name:
+    entry = img_n_status.get(pipeline_name) or {}
+    for key in ("cameras_now", "cameras_set"):
+      n = entry.get(key)
+      if isinstance(n, int) and n > 0:
+        return n
+    links = entry.get("camera_links") or []
+    if links:
+      return len(links)
+  return None
+
+
+def _camera_stream_slot(payload, cam_idx, *, pipeline_name=None):
+  """Map config camera index (C1=0) to active jpeg slot in SSE payload."""
+  if cam_idx < 0:
+    return None
+
+  cameras = _config_cameras_from_payload(payload)
+  jpeg = payload.get("jpeg")
+
+  # PLC /stream: one jpeg blob, often without config.camera — serve mosaic for any cam.
+  if isinstance(jpeg, str) and jpeg:
+    count = _camera_count_hint(payload, pipeline_name)
+    if count is None or cam_idx < count:
+      return 0
+    return None
+
+  if not cameras or cam_idx >= len(cameras):
+    # No config cameras: map by jpeg list index when possible.
+    if isinstance(jpeg, list) and cam_idx < len(jpeg):
+      return cam_idx
+    return None
+
+  cam = cameras[cam_idx] if isinstance(cameras[cam_idx], dict) else {}
+  uid = cam.get("uid")
+
+  camera_ids = payload.get("camera_ids")
+  if isinstance(camera_ids, list) and camera_ids and uid:
+    try:
+      return camera_ids.index(uid)
+    except ValueError:
+      return None
+
+  index_map = payload.get("index_map")
+  if isinstance(index_map, list):
+    try:
+      return index_map.index(cam_idx)
+    except ValueError:
+      return None
+
+  if isinstance(jpeg, list):
+    if len(jpeg) == len(cameras):
+      return cam_idx
+    # Partial stream (e.g. cobble): slots 0..N-1 map to config indices 0..N-1.
+    if (
+      not camera_ids
+      and not index_map
+      and cam_idx < len(jpeg) < len(cameras)
+    ):
+      return cam_idx
+    if pipeline_name and not camera_ids and not index_map:
+      slot = _active_camera_stream_slot(pipeline_name, payload, cam_idx)
+      if slot is not None:
+        return slot
+  return None
+
+
+def _active_camera_stream_slot(pipeline_name, payload, cam_idx):
+  """Map by active camera order when stream has fewer slots than config cameras."""
+  cameras = _config_cameras_from_payload(payload)
+  jpeg = payload.get("jpeg")
+  if not isinstance(jpeg, list) or len(jpeg) >= len(cameras):
+    return None
+  entry = img_n_status.get(pipeline_name) or {}
+  statuses = entry.get("camera_status") or []
+  if len(statuses) != len(cameras):
+    return None
+  active = [i for i, status in enumerate(statuses) if status == "ok"]
+  if cam_idx not in active or len(active) != len(jpeg):
+    return None
+  return active.index(cam_idx)
+
+
+def _sse_can_map_camera(payload, cam_idx, *, pipeline_name=None):
+  """Return False when SSE cannot ever serve this camera index."""
+  if cam_idx < 0:
+    return False
+  cameras = _config_cameras_from_payload(payload)
+  jpeg = payload.get("jpeg")
+
+  # PLC mosaic jpeg (string) without config.camera.
+  if isinstance(jpeg, str) and jpeg:
+    count = _camera_count_hint(payload, pipeline_name)
+    return count is None or cam_idx < count
+
+  if not cameras:
+    return isinstance(jpeg, list) and cam_idx < len(jpeg)
+
+  if cam_idx >= len(cameras):
+    return False
+  if payload.get("camera_ids") or payload.get("index_map"):
+    return _camera_stream_slot(payload, cam_idx, pipeline_name=pipeline_name) is not None
+  if not isinstance(jpeg, list):
+    return True
+  if len(jpeg) >= len(cameras):
+    return True
+  if cam_idx < len(jpeg):
+    return True
+  if pipeline_name:
+    return _active_camera_stream_slot(pipeline_name, payload, cam_idx) is not None
+  return False
+
+
+def _sse_warmup_limit(payload, cam_idx, *, pipeline_name=None):
+  if _sse_can_map_camera(payload, cam_idx, pipeline_name=pipeline_name):
+    return SSE_WARMUP_MAX_LINES_PARTIAL
+  return 0
+
+
+def _camera_rtsp_url_from_payload(payload, cam_idx):
+  cameras = _config_cameras_from_payload(payload)
+  if cam_idx < 0 or cam_idx >= len(cameras):
+    return None
+  cam = cameras[cam_idx]
+  if not isinstance(cam, dict):
+    return None
+  url = cam.get("url")
+  return url if url and str(url).lower().startswith("rtsp") else None
+
+
+def _camera_rtsp_from_status(pipeline_name, cam_idx):
+  entry = img_n_status.get(pipeline_name) or {}
+  links = entry.get("camera_links") or []
+  if cam_idx < 0 or cam_idx >= len(links):
+    return None
+  link = links[cam_idx]
+  url = (link or {}).get("url") or ""
+  if url.lower().startswith("rtsp"):
+    return url
+  host = (link or {}).get("label")
+  if host:
+    return f"rtsp://{host}:554/"
+  return None
+
+
+def _rtsp_parts_from_url(rtsp_url):
+  if not rtsp_url:
+    return None
+  parsed = urlparse(rtsp_url if "://" in rtsp_url else f"rtsp://{rtsp_url}")
+  if not parsed.hostname:
+    return None
+  host = parsed.hostname
+  port = parsed.port or 554
+  path = parsed.path or "/"
+  safe_url = urlunparse(("rtsp", f"{host}:{port}", path, "", "", ""))
+  return {
+    "safe_url": safe_url,
+    "user": parsed.username or "",
+    "password": parsed.password or "",
+  }
+
+
+def _rtsp_input_url(parts):
+  safe_url = parts["safe_url"]
+  user, password = parts["user"], parts["password"]
+  if not user:
+    return safe_url
+  parsed = urlparse(safe_url)
+  netloc = f"{quote(user, safe='')}:{quote(password, safe='')}@{parsed.hostname}"
+  if parsed.port:
+    netloc += f":{parsed.port}"
+  return urlunparse(("rtsp", netloc, parsed.path or "/", "", "", ""))
+
+
+def _rtsp_snapshot_b64(rtsp_url, *, timeout=RTSP_SNAPSHOT_TIMEOUT):
+  parts = _rtsp_parts_from_url(rtsp_url)
+  if not parts:
+    return None
+  input_url = _rtsp_input_url(parts)
+  try:
+    result = subprocess.run(
+      [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-rtsp_transport", "tcp",
+        "-stimeout", "3000000",
+        "-probesize", "32768",
+        "-analyzeduration", "100000",
+        "-i", input_url,
+        "-frames:v", "1",
+        "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+      ],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      timeout=timeout,
+    )
+  except (subprocess.TimeoutExpired, OSError):
+    return None
+  if result.returncode != 0 or not result.stdout:
+    return None
+  return base64.b64encode(result.stdout).decode("ascii")
+
+
+def _resolve_rtsp_targets(pipeline_name, cam_idx, payload=None):
+  targets = []
+  cred_url = _camera_rtsp_url_from_payload(payload, cam_idx) if payload else None
+  status_url = _camera_rtsp_from_status(pipeline_name, cam_idx)
+  cred_parts = _rtsp_parts_from_url(cred_url) if cred_url else None
+  if cred_parts and cred_parts["user"]:
+    targets.append(cred_url)
+  if status_url and status_url not in targets:
+    targets.append(status_url)
+  if cred_url and cred_url not in targets:
+    targets.append(cred_url)
+  return targets
+
+
+def _stream_feed_paths_for_pipeline(pipeline_name):
+  pipeline_cfg = cfg.get(pipeline_name) or {}
+  primary, secondary = stream_feed_paths_for(name=pipeline_name, cfg=pipeline_cfg)
+  return list(dict.fromkeys(path for path in (primary, secondary) if path))
+
+
+def _camera_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
+  jpeg = payload.get("jpeg")
+  slot = _camera_stream_slot(payload, cam_idx, pipeline_name=pipeline_name)
+  if slot is None:
+    return None
+  if isinstance(jpeg, list):
+    if 0 <= slot < len(jpeg):
+      frame = jpeg[slot]
+      return frame if isinstance(frame, str) else ""
     return ""
-  if isinstance(jpeg, str) and cam_idx == 0:
+  if isinstance(jpeg, str) and slot == 0:
     return jpeg
   return ""
 
@@ -120,6 +396,7 @@ def _camera_frame_from_payload(payload, cam_idx):
 def load_cfg():
   global meta, cfg
   meta, pipelines = split_servers_raw(read_servers_file(SERVERS_PATH))
+  meta = ensure_servers_meta(meta)
   cfg.clear()
   cfg.update({
     name: image_cfg for name, image_cfg in pipelines.items()
@@ -129,6 +406,7 @@ def load_cfg():
 
 def _base_status_entry(name, image_cfg):
   is_sys = is_sys_monitor_entry(name=name, cfg=image_cfg)
+  flags = pipeline_kind_flags(name=name, cfg=image_cfg)
   return {
     "running": False,
     "cameras_set": image_cfg.get("cameras_set"),
@@ -136,7 +414,9 @@ def _base_status_entry(name, image_cfg):
     "speaker_set": image_cfg.get("speaker_set"),
     "qlight_now": None,
     "speaker_now": None,
-    "is_rtls": False if is_sys else is_rtls_pipeline(image_cfg),
+    "is_rtls": False if is_sys else flags["is_rtls"],
+    "is_kafka": False if is_sys else flags["is_kafka"],
+    "is_camera_drift": False if is_sys else flags["is_camera_drift"],
     "is_sys_monitor": is_sys,
     "cameras_now": None,
     "streaming_port": image_cfg.get("streaming_port"),
@@ -166,7 +446,7 @@ def build_status_entry(raw, image_cfg, pipeline_name):
   if not isinstance(data, dict):
     return entry
 
-  merge_edge_status_data(entry, data, keys=EDGE_STATUS_KEYS)
+  merge_edge_status_fields(entry, data)
   entry["url"] = pipeline_url(image_cfg, entry)
   return entry
 
@@ -233,6 +513,16 @@ def request_force_refresh(*, fetch_versions=False):
   _collect_wake.set()
 
 
+def _versions_missing(status_map=None):
+  status_map = status_map if status_map is not None else img_n_status
+  for name, entry in (status_map or {}).items():
+    if name not in cfg:
+      continue
+    if not entry.get("version_current"):
+      return True
+  return False
+
+
 def start_collector():
   global _collector_thread
 
@@ -287,17 +577,24 @@ def start_collector():
 def pipeline_static():
   result = {}
   for name, image_cfg in cfg.items():
+    flags = pipeline_kind_flags(name=name, cfg=image_cfg)
     result[name] = {
       "url": pipeline_url(image_cfg),
       "server_id": image_cfg.get("server_id"),
       "service_name": pipeline_service_name(image_cfg, name=name),
       "server_ip": image_cfg.get("server_ip") or "",
       "monitor_host_ip": image_cfg.get("monitor_host_ip") or "",
+      "eg_pipeline_path": image_cfg.get("eg_pipeline_path") or "",
+      "sys_monitor_path": image_cfg.get("sys_monitor_path") or "",
       "cameras_set": image_cfg.get("cameras_set"),
       "qlight_set": image_cfg.get("qlight_set"),
       "speaker_set": image_cfg.get("speaker_set"),
-      **pipeline_kind_flags(name=name, cfg=image_cfg),
+      **flags,
     }
+    if flags["is_kafka"]:
+      result[name]["plc_status_url"] = plc_status_url_for(image_cfg) or ""
+    if flags["is_camera_drift"]:
+      result[name]["drift_service_url"] = _resolved_drift_service_url(image_cfg)
   return result
 
 
@@ -338,21 +635,29 @@ def index():
 
 SERVICE_COMMANDS = {"service:start", "service:stop", "service:restart", "service:status"}
 MANAGE_COMMANDS = SERVICE_COMMANDS | {"update"}
+SERVER_POWER_COMMANDS = {
+  "server:reboot": "reboot",
+  "server:shutdown": "shutdown",
+}
 
 
-@app.route("/manage_docker", methods=["GET", "POST"])
+@app.route("/manage_docker", methods=["POST"])
 async def manage_docker():
-  req_json = request.get_json()
-  docker_command = req_json["command"]
-  docker_images = req_json["lst_images"]
-  print("Client res", docker_command, docker_images)
+  req_json = request.get_json(silent=True) or {}
+  docker_command = req_json.get("command")
+  docker_images = req_json.get("lst_images")
+  if not docker_command:
+    return jsonify({"ok": False, "error": "command required"}), 400
+  if not isinstance(docker_images, list):
+    return jsonify({"ok": False, "error": "lst_images required"}), 400
 
   if docker_command not in MANAGE_COMMANDS:
     return Response("Command not allowed", 400)
 
   if docker_command == "update":
+    git_refs = req_json.get("git_refs") if isinstance(req_json.get("git_refs"), dict) else {}
     by_ip = group_by_server_ip(docker_images, cfg)
-    results = await run_n_update(docker_command, docker_images, by_ip=by_ip)
+    results = await run_n_update(docker_command, docker_images, by_ip=by_ip, git_refs=git_refs)
     started, busy, errors = _summarize_update_results(results)
     if started or busy:
       _register_update_watch([*started, *busy], by_ip)
@@ -374,6 +679,53 @@ async def manage_docker():
     "command": docker_command,
     "pipelines": docker_images,
   }), 202
+
+
+@app.route("/manage_servers", methods=["POST"])
+async def manage_servers():
+  req_json = request.get_json(silent=True) or {}
+  command = req_json.get("command")
+  servers = req_json.get("servers")
+  action = SERVER_POWER_COMMANDS.get(command)
+  if not action:
+    return jsonify({"ok": False, "error": "command required"}), 400
+  if not isinstance(servers, list) or not servers:
+    return jsonify({"ok": False, "error": "servers required"}), 400
+
+  unique_servers = list(dict.fromkeys(
+    str(ip).strip() for ip in servers if str(ip or "").strip()
+  ))
+  results = await asyncio.gather(*[
+    _run_host_power(server_ip, action) for server_ip in unique_servers
+  ])
+  ok = all(entry.get("ok") for entry in results)
+  return jsonify({"ok": ok, "results": results}), 200 if ok else 409
+
+
+async def _run_host_power(server_ip, action):
+  image_cfg = server_cfg_for_ip(server_ip, cfg)
+  if not image_cfg or not is_usable_edge_host(server_ip):
+    return {
+      "server_ip": server_ip,
+      "ok": False,
+      "response": "server not found",
+    }
+  url = edge_command_url(image_cfg, host_ip=server_ip)
+  data = edge_host_power_payload(action)
+  try:
+    text = await post_edge_command_async(url, data, read_timeout=15)
+    label = (text or "").strip()
+    return {
+      "server_ip": server_ip,
+      "ok": label == "Scheduled",
+      "response": label or "empty response",
+    }
+  except Exception as exc:
+    return {
+      "server_ip": server_ip,
+      "ok": False,
+      "response": str(exc),
+    }
 
 
 def _summarize_update_results(results):
@@ -498,16 +850,35 @@ def _status_request_item(name, image_cfg):
   if is_sys:
     item["sys_monitor_path"] = image_cfg.get("sys_monitor_path")
     item["server_ip"] = image_cfg.get("server_ip")
-  else:
-    primary, secondary = stream_feed_paths_for(name=name, cfg=image_cfg)
-    item.update({
-      "streaming_port": image_cfg.get("streaming_port"),
-      "cameras_set": image_cfg.get("cameras_set"),
-      "eg_pipeline_path": image_cfg.get("eg_pipeline_path"),
-      "is_rtls": is_rtls_pipeline(image_cfg),
-      "monitor_host_ip": image_cfg.get("monitor_host_ip"),
-      "stream_feed_paths": [primary, secondary],
-    })
+    return item
+
+  flags = pipeline_kind_flags(name=name, cfg=image_cfg)
+  item.update({
+    "eg_pipeline_path": image_cfg.get("eg_pipeline_path"),
+    "is_rtls": flags["is_rtls"],
+    "is_kafka": flags["is_kafka"],
+    "is_camera_drift": flags["is_camera_drift"],
+    "monitor_host_ip": image_cfg.get("monitor_host_ip"),
+    "server_ip": image_cfg.get("server_ip"),
+  })
+  if flags["is_kafka"]:
+    # Edge probes via localhost; proxy enrich uses host_ip / explicit URL.
+    item["plc_status_url"] = image_cfg.get("plc_status_url") or ""
+    item["plc_status_port"] = image_cfg.get("plc_status_port")
+    item["plc_status_path"] = image_cfg.get("plc_status_path")
+    return item
+  if flags["is_camera_drift"]:
+    item["drift_service_url"] = image_cfg.get("drift_service_url") or ""
+    item["drift_service_port"] = image_cfg.get("drift_service_port")
+    item["drift_service_path"] = image_cfg.get("drift_service_path")
+    return item
+
+  primary, secondary = stream_feed_paths_for(name=name, cfg=image_cfg)
+  item.update({
+    "streaming_port": image_cfg.get("streaming_port"),
+    "cameras_set": image_cfg.get("cameras_set"),
+    "stream_feed_paths": [primary, secondary],
+  })
   return item
 
 
@@ -553,61 +924,89 @@ def _preserve_version_fields(entry, name):
       entry[key] = old[key]
 
 
-def _repo_path_for_pipeline(name, image_cfg):
-  if is_sys_monitor_entry(name=name, cfg=image_cfg):
-    return image_cfg.get("sys_monitor_path") or SYS_MONITOR_PATH
-  return image_cfg.get("eg_pipeline_path") or pipeline_path_for(name)
+_DRIFT_METRIC_KEYS = tuple(empty_camera_drift_metrics())
+_PLC_METRIC_KEYS = tuple(empty_plc_tag_metrics())
+
+
+def _preserve_probe_metrics(entry, name):
+  """Keep last good drift/PLC chips when a refresh probe fails mid-cycle."""
+  old = img_n_status.get(name) or {}
+  if not old:
+    return
+  if entry.get("is_camera_drift") and _drift_metrics_incomplete(entry):
+    if not _drift_metrics_incomplete(old):
+      for key in _DRIFT_METRIC_KEYS:
+        if key in old:
+          entry[key] = old[key]
+  if entry.get("is_kafka") and _kafka_metrics_incomplete(entry):
+    if not _kafka_metrics_incomplete(old):
+      for key in _PLC_METRIC_KEYS:
+        if key in old:
+          entry[key] = old[key]
+
+
+def _central_git_cmd(repo_path, *args, timeout=None):
+  return git_run(
+    repo_path, *args,
+    timeout=timeout or DEFAULT_GIT_VERSION_TIMEOUT,
+    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+  )
 
 
 def _read_central_repo_latest(repo_path, *, name=None, image_cfg=None):
-  if is_git_repo_dir(repo_path):
-    full_sha, latest = git_latest_remote(repo_path, timeout=GIT_VERSION_TIMEOUT)
-    if not full_sha:
-      return None, None
-    latest_date = git_commit_date(repo_path, full_sha)
-    if not latest_date:
-      git_run(
-        repo_path, "fetch", "origin", full_sha, "--depth=1", "--quiet",
-        timeout=GIT_VERSION_TIMEOUT,
-      )
-      latest_date = git_commit_date(repo_path, full_sha)
-    return latest, latest_date
+  remote_url = None
+  if not is_git_repo_dir(repo_path):
+    remote_url = pipeline_git_url(name=name, cfg=image_cfg, repo_path=repo_path)
+  return read_repo_latest(
+    repo_path,
+    git_cmd=_central_git_cmd,
+    remote_url=remote_url,
+    timeout=DEFAULT_GIT_VERSION_TIMEOUT,
+  )
 
-  remote_url = pipeline_git_url(name=name, cfg=image_cfg, repo_path=repo_path)
-  full_sha, latest = git_latest_remote_url(remote_url, timeout=GIT_VERSION_TIMEOUT)
-  if not latest:
-    return None, None
-  return latest, None
+
+def _cached_central_repo_latest(repo_path, *, name=None, image_cfg=None):
+  """Return (latest, latest_date) with a short TTL to avoid repeat ls-remote."""
+  path_key = repo_path or f"url:{pipeline_git_url(name=name, cfg=image_cfg, repo_path=repo_path)}"
+  now = time.time()
+  cached = _central_latest_cache.get(path_key)
+  if cached and (now - cached[0]) < CENTRAL_VERSION_TTL_SEC:
+    return cached[1], cached[2]
+  latest, latest_date = _read_central_repo_latest(
+    repo_path, name=name, image_cfg=image_cfg,
+  )
+  if latest:
+    _central_latest_cache[path_key] = (now, latest, latest_date)
+  return latest, latest_date
 
 
 def _fill_central_latest_versions():
-  """Backfill version_latest when edge hosts cannot reach GitHub."""
-  missing_by_path = {}
+  """Fill version_latest from central checkouts (edges only report HEAD)."""
+  by_path = {}
   for name, entry in img_n_status.items():
-    if entry.get("version_latest"):
-      continue
     image_cfg = cfg.get(name)
     if not image_cfg:
       continue
-    path = _repo_path_for_pipeline(name, image_cfg)
-    missing_by_path.setdefault(path, []).append(name)
+    path = repo_path_for_pipeline(name=name, cfg=image_cfg)
+    by_path.setdefault(path, []).append(name)
 
-  for path, names in missing_by_path.items():
+  for path, names in by_path.items():
     sample = names[0]
     image_cfg = cfg.get(sample)
-    latest, latest_date = _read_central_repo_latest(
+    latest, latest_date = _cached_central_repo_latest(
       path, name=sample, image_cfg=image_cfg,
     )
     if not latest:
       continue
-    print(f"central version fill: {path} -> {latest} ({len(names)} pipeline(s))")
     for name in names:
       entry = img_n_status.get(name)
-      if not entry or entry.get("version_latest"):
+      if not entry:
         continue
       entry["version_latest"] = latest
       if latest_date:
         entry["version_latest_date"] = latest_date
+      else:
+        entry["version_latest_date"] = None
       current = entry.get("version_current")
       if current and current == latest and entry.get("version_current_date"):
         entry["version_latest_date"] = entry["version_current_date"]
@@ -620,8 +1019,19 @@ def _apply_host_status(ip, host_result):
     if name not in cfg:
       continue
     image_cfg = cfg[name]
-    entry["url"] = pipeline_url(image_cfg, entry)
     entry["pipeline"] = name
+    flags = pipeline_kind_flags(name=name, cfg=image_cfg)
+    entry["is_rtls"] = flags["is_rtls"]
+    entry["is_kafka"] = flags["is_kafka"]
+    entry["is_camera_drift"] = flags["is_camera_drift"]
+    entry["is_sys_monitor"] = flags["is_sys_monitor"]
+    if flags["is_kafka"] and not entry.get("plc_status_url"):
+      entry["plc_status_url"] = plc_status_url_for(image_cfg, host_ip=ip) or ""
+    if flags["is_camera_drift"] and not entry.get("drift_service_url"):
+      entry["drift_service_url"] = _resolved_drift_service_url(image_cfg, host_ip=ip)
+    entry["url"] = pipeline_url(image_cfg, entry)
+    _preserve_probe_metrics(entry, name)
+    finalize_pipeline_status(entry)
     _preserve_version_fields(entry, name)
     img_n_status[name] = entry
 
@@ -672,6 +1082,117 @@ def _parse_host_status_response(text, ip=None):
   return None
 
 
+async def _probe_edge_service_active(url, service, probe_timeout):
+  """Return True when edge reports systemd unit active."""
+  if not service:
+    return False
+  try:
+    text = await post_edge_command_async(
+      url,
+      data=json.dumps({"service:status": service}),
+      read_timeout=probe_timeout,
+    )
+    return (text or "").strip().lower() == "active"
+  except Exception as exc:
+    print(f"service status probe {url} {service}: {exc}")
+    return False
+
+
+async def _enrich_systemd_running(ip, host_info, host_result, read_timeout):
+  """Backfill running=True for systemd-only units older edges miss."""
+  if not isinstance(host_result, dict):
+    return
+  url = edge_command_url({"port": host_info["port"]}, host_ip=ip)
+  probe_timeout = min(max(read_timeout, 1), 10)
+  for item in host_info.get("items") or []:
+    name = item.get("name")
+    entry = host_result.get(name) if name else None
+    if not entry or entry.get("running"):
+      continue
+    service = (item.get("service_name") or "").strip()
+    if not service:
+      continue
+    if await _probe_edge_service_active(url, service, probe_timeout):
+      entry["running"] = True
+      finalize_pipeline_status(entry)
+
+
+def _kafka_metrics_incomplete(entry):
+  """True when the edge did not return usable Kafka /plc metrics."""
+  return entry.get("plc_tags_set") is None
+
+
+def _drift_metrics_incomplete(entry):
+  """True when the edge did not return usable Camera-Drift metrics."""
+  return not (
+    entry.get("drift_api_ok") is True and entry.get("drift_cameras_set") is not None
+  )
+
+
+async def _enrich_kafka_status(ip, host_info, host_result):
+  """Fill /plc URL; probe tags only if the edge left metrics empty."""
+  if not isinstance(host_result, dict):
+    return
+  loop = asyncio.get_event_loop()
+  for item in host_info.get("items") or []:
+    if not item.get("is_kafka"):
+      continue
+    name = item.get("name")
+    entry = host_result.get(name) if name else None
+    if not entry:
+      continue
+
+    image_cfg = cfg.get(name) or {}
+    plc_url = (
+      image_cfg.get("plc_status_url")
+      or plc_status_url_for(image_cfg, host_ip=ip)
+    )
+    if plc_url:
+      entry["plc_status_url"] = plc_url
+      entry["url"] = plc_url
+
+    if plc_url and _kafka_metrics_incomplete(entry):
+      try:
+        metrics = await loop.run_in_executor(
+          None, lambda u=plc_url: fetch_plc_tag_metrics(u, timeout=5.0),
+        )
+        entry.update(metrics)
+      except Exception as exc:
+        print(f"kafka plc tags probe {ip}: {exc}")
+
+    finalize_pipeline_status(entry)
+
+
+async def _enrich_camera_drift_status(ip, host_info, host_result):
+  """Fill drift URL; probe /get_drift only if the edge left metrics empty."""
+  if not isinstance(host_result, dict):
+    return
+  loop = asyncio.get_event_loop()
+  for item in host_info.get("items") or []:
+    if not item.get("is_camera_drift"):
+      continue
+    name = item.get("name")
+    entry = host_result.get(name) if name else None
+    if not entry:
+      continue
+
+    image_cfg = cfg.get(name) or {}
+    drift_url = _resolved_drift_service_url(image_cfg, host_ip=ip)
+    if drift_url:
+      entry["drift_service_url"] = drift_url
+      entry["url"] = drift_url
+      if _drift_metrics_incomplete(entry):
+        try:
+          metrics = await loop.run_in_executor(
+            None, lambda u=drift_url: fetch_camera_drift_metrics(u, timeout=10.0),
+          )
+          entry.update(metrics)
+        except Exception as exc:
+          print(f"camera drift probe {ip}: {exc}")
+
+    finalize_pipeline_status(entry)
+
+
 async def _fetch_host_status(ip, host_info, read_timeout, *, fetch_versions=False):
   url = edge_command_url({"port": host_info["port"]}, host_ip=ip)
   payload = {
@@ -681,7 +1202,12 @@ async def _fetch_host_status(ip, host_info, read_timeout, *, fetch_versions=Fals
   if fetch_versions:
     payload["fetch_versions"] = True
   text = await post_edge_command_async(url, data=json.dumps(payload), read_timeout=read_timeout)
-  return _parse_host_status_response(text, ip)
+  host_result = _parse_host_status_response(text, ip)
+  if host_result:
+    await _enrich_systemd_running(ip, host_info, host_result, read_timeout)
+    await _enrich_camera_drift_status(ip, host_info, host_result)
+    await _enrich_kafka_status(ip, host_info, host_result)
+  return host_result
 
 
 async def _collect_host_ips(
@@ -725,7 +1251,7 @@ async def _collect_host_ips(
 
 
 async def collect_status_via_edge(collect_gen):
-  global img_n_status, _fetch_versions_next
+  global img_n_status, _fetch_versions_next, _rerun_after
   if not img_n_status:
     img_n_status = preview_from_cfg()
 
@@ -755,13 +1281,22 @@ async def collect_status_via_edge(collect_gen):
   if _collect_was_cancelled(collect_gen):
     return True
 
-  if fetch_versions:
-    _fill_central_latest_versions()
+  # Edges report local HEAD only; latest comes from central checkouts (cached).
+  _fill_central_latest_versions()
 
   apply_sys_monitor_host_status(img_n_status, cfg)
 
+  # If current tips are still missing, one background pass reads local HEAD on edges.
+  with _collect_lock:
+    if (not fetch_versions) and _versions_missing():
+      _fetch_versions_next = True
+      _rerun_after = True
+
   ok = _ok_count(img_n_status)
-  print(f"check_status: {len(img_n_status)} pipelines, {ok} OK (via edge)")
+  print(
+    f"check_status: {len(img_n_status)} pipelines, {ok} OK (via edge)"
+    f"{' +versions' if fetch_versions else ''}"
+  )
   return False
 
 
@@ -808,7 +1343,7 @@ def update_server_ip():
   body = request.get_json(silent=True) or {}
   pipeline_name = body.get("pipeline")
   if not pipeline_name or pipeline_name not in cfg:
-    return jsonify({"ok": False, "error": "pipeline not found"}), 404
+    return jsonify({"ok": False, "error": "service not found"}), 404
 
   image_cfg = cfg[pipeline_name]
   server_id = image_cfg.get("server_id")
@@ -853,10 +1388,6 @@ def _parse_ping_target(raw):
   return host, port, None
 
 
-def _tcp_reachable(host, port, *, timeout=PING_TIMEOUT_SEC):
-  return tcp_reachable_optional(host, port, timeout=timeout)
-
-
 def ping_host(host):
   host_input = (host or "").strip()
   parsed_host, port, parse_err = _parse_ping_target(host_input)
@@ -864,7 +1395,7 @@ def ping_host(host):
     return {"ok": False, "host": host_input, "error": parse_err, "rtt_ms": None, "output": ""}
 
   display = f"{parsed_host}:{port}" if port else parsed_host
-  tcp_ok = _tcp_reachable(parsed_host, port) if port else None
+  tcp_ok = tcp_reachable(parsed_host, port, timeout=PING_TIMEOUT_SEC) if port else None
 
   try:
     result = subprocess.run(
@@ -926,6 +1457,225 @@ def ping_device():
   return jsonify(ping_host(host))
 
 
+@app.route("/camera_drift_reset", methods=["POST"])
+async def camera_drift_reset():
+  """Proxy POST /camera/{cam_uid}/reset to the Camera-Drift service."""
+  note_viewer_activity()
+  body = request.get_json(silent=True) or {}
+  cam_uid = str(body.get("cam_uid") or "").strip()
+  pipeline_name = str(body.get("pipeline") or "").strip()
+  if not cam_uid:
+    return jsonify({"ok": False, "error": "cam_uid required"}), 400
+
+  pipeline_name, _image_cfg, root, err, code = _resolve_camera_drift_target(pipeline_name)
+  if err:
+    return jsonify({"ok": False, "error": err}), code
+  reset_url = f"{root}/camera/{quote(cam_uid, safe='')}/reset"
+
+  try:
+    timeout = httpx.Timeout(connect=5, read=20, write=10, pool=5)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+      resp = await client.post(reset_url)
+    text = (resp.text or "").strip()
+    if resp.status_code >= 400:
+      return jsonify({
+        "ok": False,
+        "error": text or f"HTTP {resp.status_code}",
+        "status_code": resp.status_code,
+        "url": reset_url,
+      }), 502
+    return jsonify({
+      "ok": True,
+      "pipeline": pipeline_name,
+      "cam_uid": cam_uid,
+      "url": reset_url,
+      "response": text[:500],
+    })
+  except Exception as exc:
+    return jsonify({
+      "ok": False,
+      "error": str(exc),
+      "url": reset_url,
+    }), 502
+
+
+def _resolve_camera_drift_target(pipeline_name=""):
+  """Return (pipeline_name, image_cfg, root_url, error, http_status)."""
+  name = str(pipeline_name or "").strip()
+  image_cfg = cfg.get(name) if name else None
+  if not image_cfg:
+    for candidate_name, candidate in cfg.items():
+      if is_camera_drift_pipeline(cfg=candidate, name=candidate_name):
+        image_cfg = candidate
+        name = candidate_name
+        break
+  if not image_cfg or not is_camera_drift_pipeline(cfg=image_cfg, name=name):
+    return name, None, None, "camera drift service not found", 404
+
+  drift_url = _resolved_drift_service_url(image_cfg)
+  if not drift_url:
+    return name, image_cfg, None, "drift service url missing", 400
+  root = drift_service_root_url(drift_url)
+  if not root:
+    return name, image_cfg, None, "drift service url missing", 400
+  return name, image_cfg, root, None, 200
+
+
+def _rewrite_drift_image_side(side_info, *, pipeline_name, cam_uid, side, lang=""):
+  if not isinstance(side_info, dict):
+    return side_info
+  out = dict(side_info)
+  if not out.get("available"):
+    out["url"] = None
+    return out
+  params = {
+    "pipeline": pipeline_name or "",
+    "cam_uid": cam_uid,
+  }
+  if lang:
+    params["lang"] = lang
+  out["url"] = f"/camera_drift_images/{side}?{urlencode(params)}"
+  return out
+
+
+def _drift_edge_images_url(root, cam_uid, side_name=None, lang=""):
+  edge_url = f"{root}/camera/{quote(cam_uid, safe='')}/drift_images"
+  if side_name:
+    edge_url = f"{edge_url}/{side_name}"
+  if lang:
+    edge_url = f"{edge_url}?{urlencode({'lang': lang})}"
+  return edge_url
+
+
+@app.route("/camera_drift_images", methods=["GET"])
+async def camera_drift_images():
+  """Proxy Camera-Drift image metadata.
+
+  Meta: GET /camera_drift_images?pipeline=&cam_uid=
+  """
+  note_viewer_activity()
+  cam_uid = str(request.args.get("cam_uid") or "").strip()
+  pipeline_name = str(request.args.get("pipeline") or "").strip()
+  if not cam_uid:
+    return jsonify({"ok": False, "error": "cam_uid required"}), 400
+
+  pipeline_name, _image_cfg, root, err, code = _resolve_camera_drift_target(pipeline_name)
+  if err:
+    return jsonify({"ok": False, "error": err}), code
+
+  lang = str(request.args.get("lang") or request.headers.get("Accept-Language") or "").strip()
+  edge_url = _drift_edge_images_url(root, cam_uid, lang=lang)
+
+  try:
+    timeout = httpx.Timeout(connect=5, read=30, write=10, pool=5)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+      resp = await client.get(edge_url)
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc), "url": edge_url}), 502
+
+  try:
+    payload = resp.json()
+  except ValueError:
+    return jsonify({
+      "ok": False,
+      "error": (resp.text or "").strip()[:500] or f"HTTP {resp.status_code}",
+      "status_code": resp.status_code,
+      "url": edge_url,
+    }), 502
+
+  if not isinstance(payload, dict):
+    return jsonify({"ok": False, "error": "invalid drift images payload"}), 502
+
+  out = dict(payload)
+  out["pipeline"] = pipeline_name
+  out["cam_uid"] = cam_uid
+  rewrite_kw = {
+    "pipeline_name": pipeline_name,
+    "cam_uid": cam_uid,
+    "lang": lang,
+  }
+  out["before"] = _rewrite_drift_image_side(out.get("before"), side="before", **rewrite_kw)
+  out["after"] = _rewrite_drift_image_side(out.get("after"), side="after", **rewrite_kw)
+  out["overlay"] = _rewrite_drift_image_side(out.get("overlay"), side="overlay", **rewrite_kw)
+  status = 200 if out.get("ok") is not False and resp.status_code < 400 else (
+    resp.status_code if resp.status_code >= 400 else 404
+  )
+  return jsonify(out), status
+
+
+@app.route("/camera_drift_images/<side>", methods=["GET"])
+def camera_drift_images_side(side):
+  """Proxy image bytes via a sync view (safe streaming under Flask async).
+
+  Image: GET /camera_drift_images/{before|after|overlay}?pipeline=&cam_uid=
+  """
+  note_viewer_activity()
+  cam_uid = str(request.args.get("cam_uid") or "").strip()
+  pipeline_name = str(request.args.get("pipeline") or "").strip()
+  if not cam_uid:
+    return jsonify({"ok": False, "error": "cam_uid required"}), 400
+
+  side_name = str(side or "").strip().lower()
+  if side_name not in ("before", "after", "overlay"):
+    return jsonify({"ok": False, "error": "side must be before, after, or overlay"}), 400
+
+  pipeline_name, _image_cfg, root, err, code = _resolve_camera_drift_target(pipeline_name)
+  if err:
+    return jsonify({"ok": False, "error": err}), code
+
+  lang = str(request.args.get("lang") or request.headers.get("Accept-Language") or "").strip()
+  edge_url = _drift_edge_images_url(root, cam_uid, side_name=side_name, lang=lang)
+  return _proxy_drift_image_stream(edge_url)
+
+
+def _proxy_drift_image_stream(edge_url):
+  """Stream edge image bytes without buffering the full body (sync views only)."""
+  timeout = httpx.Timeout(connect=5, read=60, write=10, pool=5)
+  client = httpx.Client(timeout=timeout)
+  try:
+    req = client.build_request("GET", edge_url)
+    resp = client.send(req, stream=True)
+  except Exception as exc:
+    client.close()
+    return jsonify({"ok": False, "error": str(exc), "url": edge_url}), 502
+
+  if resp.status_code >= 400:
+    try:
+      err_text = (resp.read() or b"").decode("utf-8", errors="replace")[:500]
+    except Exception:
+      err_text = ""
+    resp.close()
+    client.close()
+    return jsonify({
+      "ok": False,
+      "error": err_text or f"HTTP {resp.status_code}",
+      "status_code": resp.status_code,
+      "url": edge_url,
+    }), 502
+
+  content_type = resp.headers.get("content-type") or (
+    "image/jpeg" if "/overlay" in edge_url else "image/png"
+  )
+
+  def generate():
+    try:
+      for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+        if chunk:
+          yield chunk
+    finally:
+      resp.close()
+      client.close()
+
+  return Response(
+    generate(),
+    mimetype=content_type,
+    headers={
+      "Cache-Control": "private, no-cache",
+      "X-Accel-Buffering": "no",
+    },
+  )
+
+
 @app.route("/camera_feed")
 def camera_feed():
   note_viewer_activity()
@@ -935,37 +1685,89 @@ def camera_feed():
   except (TypeError, ValueError):
     return "invalid cam", 400
   if pipeline_name not in cfg:
-    return "pipeline not found", 404
+    return "service not found", 404
   if cam_idx < 0:
     return "invalid cam", 400
 
+  if is_kafka_pipeline(cfg=cfg.get(pipeline_name), name=pipeline_name):
+    return "kafka services have no camera stream", 404
   stream_url = stream_url_for_pipeline(pipeline_name)
   if not stream_url:
     return "stream url unavailable", 404
-  feed_path = stream_feed_path_for(name=pipeline_name, cfg=cfg.get(pipeline_name))
+  feed_paths = _stream_feed_paths_for_pipeline(pipeline_name)
+  if not feed_paths:
+    return "stream feed unavailable", 404
 
   @stream_with_context
   def generate():
     timeout = httpx.Timeout(connect=5, read=None, write=5, pool=5)
+    last_payload = None
+    unresolved_lines = 0
+    got_stream_frame = False
+    warmup_limit = SSE_WARMUP_MAX_LINES
     try:
       with httpx.Client(timeout=timeout) as client:
-        with client.stream(
-          "GET",
-          f"{stream_url}{feed_path}",
-          headers={"Accept": "text/event-stream"},
-        ) as resp:
-          if resp.status_code != 200:
-            yield f"data: {json.dumps({'error': 'stream unavailable'})}\n\n"
-            return
-          for line in resp.iter_lines():
-            if not line or not line.startswith("data:"):
-              continue
-            try:
-              payload = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-              continue
-            frame = _camera_frame_from_payload(payload, cam_idx)
-            yield f"data: {json.dumps({'jpeg': frame, 'fps': payload.get('fps')})}\n\n"
+        for feed_path in feed_paths:
+          if got_stream_frame:
+            break
+          unresolved_lines = 0
+          try:
+            with client.stream(
+              "GET",
+              f"{stream_url}{feed_path}",
+              headers={"Accept": "text/event-stream"},
+            ) as resp:
+              if resp.status_code != 200:
+                continue
+              for line in resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                  continue
+                try:
+                  payload = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                  continue
+                last_payload = payload
+                warmup_limit = _sse_warmup_limit(
+                  payload, cam_idx, pipeline_name=pipeline_name,
+                )
+                if warmup_limit == 0:
+                  break
+                slot = _camera_stream_slot(
+                  payload, cam_idx, pipeline_name=pipeline_name,
+                )
+                if slot is None:
+                  unresolved_lines += 1
+                  if unresolved_lines >= warmup_limit:
+                    break
+                  continue
+                unresolved_lines = 0
+                frame = _camera_frame_from_payload(
+                  payload, cam_idx, pipeline_name=pipeline_name,
+                )
+                if frame:
+                  got_stream_frame = True
+                  yield f"data: {json.dumps({'jpeg': frame, 'fps': payload.get('fps')})}\n\n"
+          except httpx.HTTPError:
+            continue
+          if warmup_limit == 0 and not got_stream_frame:
+            break
+      if got_stream_frame:
+        return
+
+      rtsp_targets = _resolve_rtsp_targets(pipeline_name, cam_idx, last_payload)
+      if not rtsp_targets:
+        yield f"data: {json.dumps({'error': 'Camera stream URL unavailable'})}\n\n"
+        return
+
+      target_idx = 0
+      while True:
+        frame = _rtsp_snapshot_b64(rtsp_targets[target_idx])
+        if not frame and target_idx + 1 < len(rtsp_targets):
+          target_idx += 1
+          continue
+        if frame:
+          yield f"data: {json.dumps({'jpeg': frame, 'fps': 'RTSP'})}\n\n"
+        time.sleep(RTSP_POLL_INTERVAL_SEC)
     except httpx.HTTPError as exc:
       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
@@ -993,8 +1795,33 @@ async def get_update_status():
 SERVICE_OK_RESPONSES = frozenset({"Succeed", "200", "Started"})
 SERVICE_INFO_RESPONSES = frozenset({"Already running", "Already stopped"})
 SERVICE_COMMAND_TIMEOUT = 200
+_SERVICE_JOB_TTL_SEC = 3600
+_SERVICE_JOB_MAX = 200
 _service_jobs = {}
 _service_jobs_lock = threading.Lock()
+
+
+def _prune_service_jobs_unlocked(now=None):
+  now = now or time.time()
+  stale = [
+    job_id for job_id, job in _service_jobs.items()
+    if not job.get("active") and now - job.get("updated_at", 0) > _SERVICE_JOB_TTL_SEC
+  ]
+  for job_id in stale:
+    del _service_jobs[job_id]
+  if len(_service_jobs) <= _SERVICE_JOB_MAX:
+    return
+  finished = sorted(
+    (
+      (job_id, job.get("updated_at", 0))
+      for job_id, job in _service_jobs.items()
+      if not job.get("active")
+    ),
+    key=lambda item: item[1],
+  )
+  overflow = len(_service_jobs) - _SERVICE_JOB_MAX
+  for job_id, _updated_at in finished[:overflow]:
+    _service_jobs.pop(job_id, None)
 
 
 def _pipeline_service_ref(pipeline_name):
@@ -1031,6 +1858,7 @@ def _start_service_job(command, pipeline_names):
   }
   with _service_jobs_lock:
     _service_jobs[job_id] = job
+    _prune_service_jobs_unlocked()
   return job_id
 
 
@@ -1072,6 +1900,7 @@ def _finalize_service_job(job_id, pipeline_names):
       job["results"][pipeline_name] = failed
     job["active"] = False
     job["updated_at"] = time.time()
+    _prune_service_jobs_unlocked()
 
 
 def _service_job_snapshot(job_id):
@@ -1194,15 +2023,15 @@ async def service_command_status():
   return _no_store_json(snapshot)
 
 
-async def run_n_update(docker_command, docker_images, by_ip=None):
+async def run_n_update(docker_command, docker_images, by_ip=None, git_refs=None):
   by_ip = by_ip or group_by_server_ip(docker_images, cfg)
   tasks = {}
 
   for server_ip, names in by_ip.items():
     img_cfg = cfg[names[0]]
     url = edge_command_url(img_cfg, host_ip=server_ip)
-    data = edge_host_command_payload(docker_command, names, cfg)
-    print("Update request:", server_ip, names)
+    data = edge_host_command_payload(docker_command, names, cfg, git_refs=git_refs)
+    print("Update request:", server_ip, names, f"git_refs={git_refs or {}}")
     tasks[server_ip] = asyncio.create_task(post_edge_command_async(url, data, read_timeout=60))
 
   results = {}
@@ -1221,8 +2050,9 @@ async def post_edge_command_async(url, data, read_timeout=20):
     timeout = None
   else:
     timeout = httpx.Timeout(connect=10, read=read_timeout, write=10, pool=10)
+  headers = {"Content-Type": "application/json"}
   async with httpx.AsyncClient(timeout=timeout) as client:
-    response = await client.post(url, data=data)
+    response = await client.post(url, content=data, headers=headers)
     return response.content.decode("utf-8")
 
 

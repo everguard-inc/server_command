@@ -1,5 +1,5 @@
 {
-    "xSiteId": "7a4307ca-7d00-49a3-bb79-394eb2682a9b",
+    "xSiteId": "00000000-0000-0000-0000-000000000000",
     "edge_probe": {
         "stream_probe_interval_sec": 10,
         "stream_probe_workers": 4,
@@ -9,25 +9,33 @@
         "mem_warn_percent": 80
     },
     "servers": {
-        "RND-SYSTEM": {
-            "server_ip": "10.230.0.100",
-            "server_id": "264f8a1f-fd4e-4760-99ee-c436a6c74cd4",
+        "SITE-SYSTEM": {
+            "server_ip": "10.0.0.10",
+            "server_id": "00000000-0000-0000-0000-000000000001",
             "service_name": "eg_monitor",
             "sys_monitor_path": "/home/everguard/system_monitor"
         },
-        "RND-RTLS": {
-            "server_ip": "10.230.0.100",
-            "server_id": "5ceeba00-1d44-49e4-829f-d3c981d8fa59",
-            "service_name": "eg_rtls",
-            "eg_pipeline_path": "/home/everguard/rtls_server",
+        "SITE-cam1": {
+            "server_ip": "10.0.0.10",
+            "monitor_host_ip": "10.0.0.10",
+            "server_id": "00000000-0000-0000-0000-000000000002",
+            "service_name": "eg_00000000-0000-0000-0000-000000000002",
+            "eg_pipeline_path": "/home/everguard/eg_pipeline",
             "sys_monitor_path": "/home/everguard/system_monitor"
         },
-        "RND-3090": {
-            "server_ip": "10.230.0.100",
-            "monitor_host_ip": "10.230.0.100",
-            "server_id": "cd620adc-a133-4299-a8be-9e16491208ff",
-            "service_name": "eg_cd620adc-a133-4299-a8be-9e16491208ff",
-            "eg_pipeline_path": "/home/everguard/eg_pipeline",
+        "SITE-PLC-Kafka": {
+            "server_ip": "10.0.0.11",
+            "monitor_host_ip": "10.0.0.10",
+            "server_id": "00000000-0000-0000-0000-000000000003",
+            "service_name": "kafka-consumer",
+            "eg_pipeline_path": "/home/everguard/plc-engine-kafka"
+        },
+        "SITE-Camera-Drift": {
+            "server_ip": "10.0.0.12",
+            "monitor_host_ip": "10.0.0.10",
+            "server_id": "00000000-0000-0000-0000-000000000004",
+            "service_name": "eg_camera_drift",
+            "eg_pipeline_path": "/home/everguard/camera_drift",
             "sys_monitor_path": "/home/everguard/system_monitor"
         }
     }

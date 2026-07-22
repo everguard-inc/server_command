@@ -19,7 +19,6 @@ import random
 import re
 import shlex
 import shutil
-import socket
 import struct
 import subprocess
 import threading
@@ -34,13 +33,22 @@ from servers_cfg import (
     ALT_STREAM_FEED_PATH,
     DEFAULT_STREAM_FEED_PATH,
     SKIP_STREAM_HOSTS,
-    SYS_MONITOR_PATH,
     SYS_MONITOR_SERVICE,
     apply_sys_monitor_peer_status,
+    empty_plc_tag_metrics,
+    fetch_plc_tag_metrics,
+    empty_camera_drift_metrics,
+    fetch_camera_drift_metrics,
     finalize_pipeline_status,
+    is_sys_monitored_peer,
     normalize_edge_probe,
+    plc_status_url_for,
+    drift_service_url_for,
+    repo_path_for_pipeline,
     stream_feed_paths_for,
+    tcp_reachable,
 )
+from git_versions import DEFAULT_GIT_VERSION_TIMEOUT, read_local_repo_versions
 
 app = Flask(__name__)
 
@@ -56,8 +64,10 @@ PROBE_TIMEOUT = 5
 SPEAKER_PROBE_TIMEOUT = httpx.Timeout(connect=1.5, read=6.0, write=1.0, pool=1.0)
 STREAM_HEALTH_TIMEOUT = 3
 STREAM_SSE_TIMEOUT = 8
+CAMERA_PROBE_TIMEOUT = 2.0
+CAMERA_PROBE_CACHE_SEC = 15
 SPEAKER_STATUS_PATH = "media.cgi?msubmenu=speakerstatus&action=view"
-PROBE_SSE_MAX_LINES = 40
+PROBE_SSE_MAX_LINES = 10
 QLIGHT_TYPE_MARKERS = ("qlight", "patlite")
 SPEAKER_TYPE_MARKERS = ("simpleurlalarm", "simplerestalarm")
 
@@ -65,13 +75,30 @@ SPEAKER_TYPE_MARKERS = ("simpleurlalarm", "simplerestalarm")
 DOCKER_CMD_TIMEOUT = 10
 SERVICE_CONTROL_TIMEOUT = 180
 SERVICE_CONTROL_POLL = 2.0
+RESTART_CONTAINER_STOP_TIMEOUT = 15
+_SYS_MONITOR_BUILD_IMAGES = ("eg/basics:latest", "eg/sys:latest")
+
+_GIT_PULL_RECOVERABLE = (
+    "refusing to merge unrelated histories",
+    "have diverged",
+    "cannot lock ref",
+    "not possible to fast-forward",
+    "non-fast-forward",
+)
+
+_GIT_PULL_NO_UPSTREAM = (
+    "no tracking information",
+    "please specify which branch you want to merge with",
+)
+
+_GIT_PULL_BRANCH_FALLBACKS = ("forklift_proximity", "master", "main")
 
 # Status collection
 EDGE_PROBE_WORKERS = 10
 RTLS_DEVICE_PROBE_WORKERS = 8
 HOST_STATUS_DEADLINE = 45
 VERSION_FETCH_WORKERS = 4
-GIT_VERSION_TIMEOUT = 12
+GIT_VERSION_TIMEOUT = DEFAULT_GIT_VERSION_TIMEOUT
 
 MEMORY_UNIT_BYTES = {
     "B": 1,
@@ -87,9 +114,11 @@ ZERO_IV_HEX = "00" * AES_BLOCK_SIZE
 
 _probe_cache_lock = threading.Lock()
 _stream_probe_cache = {}
+_camera_probe_cache = {}
 _docker_stats_cache = {"at": 0.0, "map": {}}
 
 _update_lock = threading.Lock()
+_update_pruning = False
 _update_state = {
     "running": False,
     "step": "idle",
@@ -259,11 +288,6 @@ def _url_host_port(url):
     return host, port
 
 
-def _tcp_reachable(host, port, *, timeout=None):
-    from servers_cfg import tcp_reachable
-    return tcp_reachable(host, port, timeout=timeout if timeout is not None else PROBE_TIMEOUT)
-
-
 def _camera_links_from_cfg(cfg):
     cameras = cfg.get("camera")
     if not isinstance(cameras, list):
@@ -380,6 +404,8 @@ def _find_container_config_path(server_id, is_rtls, running_names):
 
 
 def load_runtime_meta(item, running_names):
+    if item.get("is_kafka"):
+        return dict(item)
     server_id = item.get("server_id")
     is_rtls = item.get("is_rtls", False)
     if not server_id:
@@ -399,8 +425,6 @@ def load_runtime_meta(item, running_names):
 
     if is_rtls:
         ql_set, sp_set, ql_probes, sp_probes = _collect_rtls_devices(cfg)
-        if not cfg.get("environment_alert") or (ql_set is None and sp_set is None):
-            merged["rtls_config_missing"] = True
         merged.update({
             "qlight_set": ql_set,
             "speaker_set": sp_set,
@@ -408,6 +432,8 @@ def load_runtime_meta(item, running_names):
             "speaker_probes": sp_probes,
             "passkey": _config_passkey(cfg, config_dir=config_dir) or item.get("passkey"),
         })
+        if ql_set is None and sp_set is None:
+            merged["rtls_devices_missing"] = True
     else:
         merged.update(_extract_camera_meta(cfg))
 
@@ -508,6 +534,21 @@ def _camera_count_from_sse(line):
     jpeg = payload.get("jpeg")
     if isinstance(jpeg, list):
         return len(jpeg)
+    # PLC /stream often sends one jpeg blob plus CamN labels in states.
+    states = payload.get("states")
+    if isinstance(states, dict) and states:
+        cams = set()
+        for value in states.values():
+            label = ""
+            if isinstance(value, (list, tuple)) and value:
+                label = str(value[0] or "")
+            elif isinstance(value, str):
+                label = value
+            match = re.match(r"Cam\s*(\d+)", label, re.I)
+            if match:
+                cams.add(match.group(1))
+        if cams:
+            return len(cams)
     if isinstance(jpeg, str) and jpeg:
         return 1
     return None
@@ -534,14 +575,8 @@ def _stream_probe_hosts(item):
 
 
 def _probe_stream_at_host(host, port, feed_paths=None):
+    """Probe SSE feed paths. /health is optional (PLC has feed without /health)."""
     base = f"http://{host}:{port}"
-    try:
-        resp = httpx.get(f"{base}/health", timeout=STREAM_HEALTH_TIMEOUT)
-        if resp.status_code != 200:
-            return False, None
-    except httpx.HTTPError:
-        return False, None
-
     paths = feed_paths or (DEFAULT_STREAM_FEED_PATH, ALT_STREAM_FEED_PATH)
     for path in paths:
         try:
@@ -564,6 +599,13 @@ def _probe_stream_at_host(host, port, feed_paths=None):
             return True, None
         except (httpx.HTTPError, json.JSONDecodeError, ValueError, TypeError):
             continue
+
+    try:
+        resp = httpx.get(f"{base}/health", timeout=STREAM_HEALTH_TIMEOUT)
+        if resp.status_code == 200:
+            return True, None
+    except httpx.HTTPError:
+        pass
     return False, None
 
 
@@ -583,7 +625,7 @@ def probe_qlight(url):
     if not host:
         return False
 
-    if not _tcp_reachable(host, port):
+    if not tcp_reachable(host, port, timeout=PROBE_TIMEOUT):
         return False
 
     try:
@@ -657,18 +699,48 @@ def _rtls_device_links(qlight_probes, speaker_probes):
     return qlight_links, speaker_links
 
 
-def _camera_device_status(camera_links, cameras_now, cameras_set, running):
-    count = len(camera_links)
-    if not count:
-        return []
-    if not running:
-        return ["idle"] * count
-    if cameras_now is None:
-        return ["unknown"] * count
-    target = cameras_set if cameras_set is not None else count
-    if cameras_now >= target:
-        return ["ok"] * count
-    return ["ok" if idx < cameras_now else "err" for idx in range(count)]
+def _camera_link_port(url, default=554):
+    if not url:
+        return default
+    parsed = urlparse(url if "://" in url else f"rtsp://{url}")
+    return parsed.port or default
+
+
+def _probe_one_camera_link(link, *, timeout=CAMERA_PROBE_TIMEOUT):
+    host = link.get("label") or _url_hostname(link.get("url", ""))
+    if not host:
+        return False
+    port = _camera_link_port(link.get("url", ""))
+    key = (host, port)
+    now = time.time()
+    with _probe_cache_lock:
+        cached = _camera_probe_cache.get(key)
+        if cached and now - cached[0] < CAMERA_PROBE_CACHE_SEC:
+            return cached[1]
+    ok = tcp_reachable(host, port, timeout=timeout)
+    with _probe_cache_lock:
+        _camera_probe_cache[key] = (now, ok)
+    return ok
+
+
+def _probe_camera_links(camera_links, *, timeout=CAMERA_PROBE_TIMEOUT):
+    if not camera_links:
+        return [], 0
+    statuses = ["err"] * len(camera_links)
+    workers = min(len(camera_links), 4)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_probe_one_camera_link, link, timeout=timeout): idx
+            for idx, link in enumerate(camera_links)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                statuses[idx] = "ok" if future.result() else "err"
+            except Exception:
+                statuses[idx] = "err"
+    cameras_now = sum(1 for status in statuses if status == "ok")
+    return statuses, cameras_now
 
 
 def probe_rtls_devices(qlight_probes, speaker_probes, passkey=None):
@@ -785,15 +857,17 @@ def _cached_probe_local_stream(item, interval_sec):
 
 
 def _container_name_for_item(item, running_names):
-    server_id = item.get("server_id")
-    if not server_id:
+    if item.get("is_kafka"):
         return None
+    server_id = item.get("server_id")
     if item.get("is_sys_monitor"):
         return _matching_container_name(server_id, "sys", running_names)
     if item.get("is_rtls"):
         return _matching_container_name(
             server_id, "rtls", running_names, loose_match=True,
         )
+    if not server_id:
+        return None
     return server_id if server_id in running_names else None
 
 
@@ -827,11 +901,151 @@ def _mem_usage_percent(usage):
     return min(100.0, (used / total) * 100.0)
 
 
+def _format_bytes_iec(num_bytes):
+    try:
+        value = float(num_bytes)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    for unit, factor in (
+        ("TiB", 1024 ** 4),
+        ("GiB", 1024 ** 3),
+        ("MiB", 1024 ** 2),
+        ("KiB", 1024),
+        ("B", 1),
+    ):
+        if value >= factor or unit == "B":
+            if unit == "B":
+                return f"{int(value)}B"
+            scaled = value / factor
+            if scaled >= 100:
+                return f"{scaled:.1f}{unit}"
+            return f"{scaled:.2f}{unit}"
+    return f"{int(value)}B"
+
+
+def _host_mem_total_bytes():
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    return int(parts[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _proc_rss_bytes(pid):
+    try:
+        with open(f"/proc/{int(pid)}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _systemd_show_props(service_name, *props):
+    if not service_name or not props:
+        return {}
+    # Use "-p Name" (not "-p=Name"): some systemd builds return empty stdout for equals form.
+    args = ["show", service_name]
+    for prop in props:
+        args.extend(["-p", prop])
+    result = _run_systemctl(*args)
+    out = {}
+    for line in (result.stdout or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    # Read-only show often works without sudo when passwordless sudo is limited.
+    if not out:
+        result = subprocess.run(
+            ["systemctl", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for line in (result.stdout or "").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def _systemd_memory_current_bytes(service_name):
+    """Best-effort RSS/cgroup for systemd services (e.g. kafka-consumer)."""
+    if not service_name:
+        return None
+    props = _systemd_show_props(service_name, "MemoryCurrent", "MainPID")
+    raw = props.get("MemoryCurrent") or ""
+    if raw.isdigit():
+        current = int(raw)
+        # unset / unlimited is often reported as max uint64
+        if 0 < current < (2 ** 63):
+            return current
+
+    unit = service_name if service_name.endswith(".service") else f"{service_name}.service"
+    for path in (
+        f"/sys/fs/cgroup/system.slice/{unit}/memory.current",
+        f"/sys/fs/cgroup/system.slice/{unit}/memory.usage_in_bytes",
+    ):
+        try:
+            with open(path, encoding="utf-8") as f:
+                current = int(f.read().strip())
+            if current > 0:
+                return current
+        except (OSError, ValueError):
+            continue
+
+    pid = props.get("MainPID") or ""
+    if pid.isdigit() and int(pid) > 0:
+        return _proc_rss_bytes(pid)
+    return None
+
+
+def _systemd_memory_usage(service_name):
+    current = _systemd_memory_current_bytes(service_name)
+    if not current:
+        return None
+    used = _format_bytes_iec(current)
+    if not used:
+        return None
+    total_bytes = _host_mem_total_bytes()
+    if not total_bytes:
+        return used
+    total = _format_bytes_iec(total_bytes)
+    if not total:
+        return used
+    return f"{used} / {total}"
+
+
 def _apply_container_memory(entry, item, mem_map):
+    if item.get("is_kafka"):
+        # Host MemTotal makes % misleading for WARN; show usage string only.
+        usage = _systemd_memory_usage(_pipeline_service_name(item))
+        entry["mem_usage"] = usage
+        entry["mem_usage_percent"] = None
+        return
     container = _container_name_for_item(item, set(mem_map))
     usage = mem_map.get(container) if container else None
-    entry["mem_usage"] = usage
-    entry["mem_usage_percent"] = _mem_usage_percent(usage)
+    if usage:
+        entry["mem_usage"] = usage
+        entry["mem_usage_percent"] = _mem_usage_percent(usage)
+        return
+    # systemd-only pipelines (e.g. Camera-Drift / eg_camera_drift).
+    service = _pipeline_service_name(item)
+    if service and _is_service_active(service):
+        entry["mem_usage"] = _systemd_memory_usage(service)
+        entry["mem_usage_percent"] = None
+        return
+    entry["mem_usage"] = None
+    entry["mem_usage_percent"] = None
 
 
 def _is_service_active(service_name):
@@ -884,16 +1098,32 @@ def _pipeline_service_name(item):
     return item.get("service_name") or ""
 
 
+def _kafka_unit_running(service_name, server_id=None, running_names=None):
+    """Kafka runs as a systemd unit (optional docker name fallback)."""
+    if service_name and _is_service_active(service_name):
+        return True
+    names = running_names if running_names is not None else set()
+    if service_name and service_name in names:
+        return True
+    return bool(server_id and server_id in names)
+
+
 def _is_pipeline_running(item, running_names):
     server_id = item.get("server_id")
+    service_name = _pipeline_service_name(item)
     if item.get("is_sys_monitor") or item.get("is_rtls"):
-        return _is_service_active(_pipeline_service_name(item)) or _container_running_for_kind(
+        return _is_service_active(service_name) or _container_running_for_kind(
             server_id,
             running_names,
             is_rtls=bool(item.get("is_rtls")),
             is_sys_monitor=bool(item.get("is_sys_monitor")),
         )
-    return server_id in running_names
+    if item.get("is_kafka"):
+        return _kafka_unit_running(service_name, server_id, running_names)
+    if server_id and server_id in running_names:
+        return True
+    # Non-Docker pipelines (Camera-Drift etc.): honor systemd unit.
+    return bool(service_name and _is_service_active(service_name))
 
 
 # --- pipeline control ---
@@ -932,6 +1162,30 @@ def _is_pipeline_container_running(server_id, is_rtls=False, is_sys_monitor=Fals
     return _container_running_for_kind(
         server_id, _running_container_names(), is_rtls=is_rtls, is_sys_monitor=is_sys_monitor,
     )
+
+
+def _pipeline_container_name(server_id, *, is_rtls=False, is_sys_monitor=False):
+    if not server_id:
+        return None
+    running_names = _running_container_names()
+    if is_sys_monitor:
+        return _matching_container_name(server_id, "sys", running_names)
+    if is_rtls:
+        return _matching_container_name(server_id, "rtls", running_names, loose_match=True)
+    if server_id in running_names:
+        return server_id
+    return None
+
+
+def _force_remove_pipeline_container(server_id, *, is_rtls=False, is_sys_monitor=False):
+    name = _pipeline_container_name(server_id, is_rtls=is_rtls, is_sys_monitor=is_sys_monitor)
+    if not name:
+        return
+    result = _docker_cmd("rm", "-f", name, text=True)
+    if result.returncode != 0:
+        detail = _cmd_detail(result)
+        if detail:
+            print(f"docker rm -f {name}: {detail}")
 
 
 def _is_pipeline_under_control(service_name, server_id=None, is_rtls=False, is_sys_monitor=False):
@@ -990,8 +1244,14 @@ def _systemctl_fail_message(result):
     return f"Failed: {detail}" if detail else "Failed"
 
 
-def service_pipeline(command, service_name, *, server_id=None, is_rtls=False, is_sys_monitor=False):
+def service_pipeline(
+    command, service_name, *, server_id=None, is_rtls=False, is_sys_monitor=False, is_kafka=False,
+):
+    if is_kafka:
+        server_id = None
     running = _is_pipeline_under_control(service_name, server_id, is_rtls, is_sys_monitor)
+    if is_kafka and not running:
+        running = _is_service_active(service_name)
 
     if command == "start":
         if running:
@@ -1014,10 +1274,28 @@ def service_pipeline(command, service_name, *, server_id=None, is_rtls=False, is
             )
         return "Succeed"
     if command == "restart":
+        if server_id:
+            if running or _is_pipeline_container_running(server_id, is_rtls, is_sys_monitor):
+                stop_result = _run_systemctl("stop", service_name)
+                if stop_result.returncode != 0:
+                    detail = _cmd_detail(stop_result)
+                    print(f"{service_name}: stop before restart failed: {detail or stop_result.returncode}")
+            _force_remove_pipeline_container(
+                server_id, is_rtls=is_rtls, is_sys_monitor=is_sys_monitor,
+            )
+            _wait_for_pipeline_container(
+                server_id, is_rtls, False, RESTART_CONTAINER_STOP_TIMEOUT,
+                is_sys_monitor=is_sys_monitor,
+            )
+            result = _run_systemctl("start", service_name)
+            if result.returncode != 0:
+                return _systemctl_fail_message(result)
+            if not _wait_for_pipeline_ready(service_name, server_id, is_rtls, is_sys_monitor):
+                return "Start timed out"
+            return "Succeed"
         result = _run_systemctl("restart", service_name)
         if result.returncode != 0:
             return _systemctl_fail_message(result)
-        # systemctl restart already blocks until the unit finishes restarting.
         return "Succeed"
     if command == "status":
         result = _run_systemctl("is-active", service_name)
@@ -1031,10 +1309,18 @@ def service_pipeline(command, service_name, *, server_id=None, is_rtls=False, is
     return "Succeed"
 
 
-def _restart_service_or_raise(service_name, *, server_id=None, is_rtls=False, is_sys_monitor=False, wait_active=False):
+def _restart_service_or_raise(
+    service_name, *, server_id=None, is_rtls=False, is_sys_monitor=False, is_kafka=False,
+    wait_active=False,
+):
     print("Restarting service:", service_name)
     result = service_pipeline(
-        "restart", service_name, server_id=server_id, is_rtls=is_rtls, is_sys_monitor=is_sys_monitor,
+        "restart",
+        service_name,
+        server_id=server_id,
+        is_rtls=is_rtls,
+        is_sys_monitor=is_sys_monitor,
+        is_kafka=is_kafka,
     )
     if result not in ("Succeed", "Already running"):
         raise RuntimeError(f"{service_name}: {result}")
@@ -1117,7 +1403,11 @@ def _run_docker_build(repo_path, label, *, pre_remove=()):
     )
 
 
-_SYS_MONITOR_BUILD_IMAGES = ("eg/basics:latest", "eg/sys:latest")
+def _append_update_error(errors, service_name, exc, *, failed_label, summary=None):
+    msg = summary or f"{service_name}: {exc}"
+    errors.append(msg)
+    _mark_service_step_failed(service_name, label=failed_label)
+    print("update step failed:", msg)
 
 
 def _docker_error_summary(result, max_lines=8):
@@ -1173,14 +1463,6 @@ def _git_error_summary(result, max_lines=6):
     return "\n".join(uniq[:max_lines])
 
 
-_GIT_PULL_RECOVERABLE = (
-    "refusing to merge unrelated histories",
-    "have diverged",
-    "cannot lock ref",
-    "not possible to fast-forward",
-    "non-fast-forward",
-)
-
 _keyed_locks_guard = threading.Lock()
 _git_sync_locks = {}
 _repo_build_locks = {}
@@ -1227,76 +1509,81 @@ def _git_output_text(result):
     return f"{result.stderr or ''}\n{result.stdout or ''}"
 
 
+def _git_ref_exists(repo, ref):
+    result = _git_run(repo, ["rev-parse", "--verify", ref])
+    return result.returncode == 0
+
+
+def _git_resolve_pull_branch(repo, label):
+    branch = _git_current_branch(repo)
+    fetch = _git_run(repo, ["fetch", "origin", "--prune"])
+    if fetch.returncode != 0:
+        _raise_git_failure(f"{label}: git fetch origin", fetch)
+
+    if _git_ref_exists(repo, f"origin/{branch}"):
+        return branch
+
+    for fallback in _GIT_PULL_BRANCH_FALLBACKS:
+        if fallback != branch and _git_ref_exists(repo, f"origin/{fallback}"):
+            print(f"{label}: no upstream for {branch}; syncing to origin/{fallback}")
+            return fallback
+
+    raise RuntimeError(
+        f"{label}: no upstream branch for {branch} and no fallback found on origin",
+    )
+
+
+def _git_sync_to_origin_with_stash(repo, label, branch, *, log_prefix=None, reset_notice=None):
+    prefix = log_prefix or label
+    stashed = False
+    if not _git_working_tree_clean(repo):
+        print(f"{prefix}: stashing local changes before sync")
+        stashed = _git_stash_local_changes(repo, label)
+    if reset_notice:
+        print(reset_notice)
+    _git_reset_to_origin(repo, label, branch)
+    if stashed:
+        print(f"{prefix}: restoring stashed local changes")
+        _git_stash_pop(repo, label)
+
+
+def _git_pull_no_upstream(repo, label, detail):
+    lower = (detail or "").lower()
+    if not any(marker in lower for marker in _GIT_PULL_NO_UPSTREAM):
+        return False
+
+    branch = _git_resolve_pull_branch(repo, label)
+    _git_sync_to_origin_with_stash(
+        repo, label, branch, log_prefix=f"{label}: git pull",
+    )
+    return True
+
+
 def _git_pull_recoverable_result(result):
     lower = _git_output_text(result).lower()
     return any(marker in lower for marker in _GIT_PULL_RECOVERABLE)
 
 
-def _is_git_repo_dir(path):
-    from git_versions import is_git_repo_dir
-    return is_git_repo_dir(path)
-
-
-def _git_short_rev(repo_path, ref="HEAD"):
-    if not _is_git_repo_dir(repo_path):
-        return None
-    result = _git_cmd(repo_path, "rev-parse", "--short", ref)
-    if result.returncode != 0:
-        return None
-    return (result.stdout or "").strip() or None
-
-
-def _git_commit_date(repo_path, ref):
-    if not repo_path or not ref:
-        return None
-    result = _git_cmd(repo_path, "show", "-s", "--format=%ci", ref)
-    if result.returncode != 0:
-        return None
-    text = (result.stdout or "").strip()
-    return text[:16] if text else None
-
-
-def _git_latest_remote_sha(repo_path):
-    if not _is_git_repo_dir(repo_path):
-        return None, None
-    result = _git_cmd(
-        repo_path, "ls-remote", "--heads", "origin",
-        timeout=GIT_VERSION_TIMEOUT, use_credentials=True,
+def _edge_version_git_cmd(repo_path, *args, timeout=None, **_ignored):
+    return _git_cmd(
+        repo_path, *args,
+        timeout=timeout or GIT_VERSION_TIMEOUT,
+        use_credentials=True,
     )
-    if result.returncode != 0:
-        return None, None
-    from git_versions import parse_ls_remote_heads
-    return parse_ls_remote_heads(result.stdout)
 
 
 def _read_repo_versions(repo_path):
-    current = _git_short_rev(repo_path)
-    current_date = _git_commit_date(repo_path, "HEAD") if current else None
-    full_sha, latest = _git_latest_remote_sha(repo_path)
-    latest_date = None
-    if full_sha:
-        latest_date = _git_commit_date(repo_path, full_sha)
-        if not latest_date:
-            _git_cmd(
-                repo_path, "fetch", "origin", full_sha, "--depth=1", "--quiet",
-                timeout=GIT_VERSION_TIMEOUT, use_credentials=True,
-            )
-            latest_date = _git_commit_date(repo_path, full_sha)
-    if current and latest and current == latest and current_date:
-        latest_date = current_date
-    return current, current_date, latest, latest_date
-
-
-def _repo_path_for_item(item):
-    if item.get("is_sys_monitor"):
-        # Proxy status item should include sys_monitor_path.
-        return item.get("sys_monitor_path") or SYS_MONITOR_PATH
-    return item.get("eg_pipeline_path")
+    return read_local_repo_versions(
+        repo_path,
+        git_cmd=_edge_version_git_cmd,
+        timeout=GIT_VERSION_TIMEOUT,
+        include_remote=False,
+    )
 
 
 def _unique_repo_paths(items):
     return list(_dedupe_preserve_order(
-        (_repo_path_for_item(item) for item in items),
+        (repo_path_for_pipeline(item=item) for item in items),
         skip_falsy=True,
     ))
 
@@ -1320,16 +1607,15 @@ def _prefetch_repo_versions(items):
 
 
 def _apply_repo_versions(entry, item, version_cache):
-    repo_path = _repo_path_for_item(item)
+    repo_path = repo_path_for_pipeline(item=item)
     if not repo_path:
         return
-    current, current_date, latest, latest_date = version_cache.get(
+    current, current_date, _latest, _latest_date = version_cache.get(
         repo_path, (None, None, None, None),
     )
     entry["version_current"] = current
     entry["version_current_date"] = current_date
-    entry["version_latest"] = latest
-    entry["version_latest_date"] = latest_date
+    # Remote latest is filled by the central proxy.
 
 
 def _step_failure_detail(label, result):
@@ -1500,6 +1786,92 @@ def _git_reset_to_origin(repo, label, branch):
     print(f"{label}: synced to {remote_ref}")
 
 
+def _git_stash_local_changes(repo, label):
+    stash = _git_run(repo, ["stash", "push", "-u", "-m", "server_command update"])
+    if stash.returncode != 0:
+        raise RuntimeError(
+            f"{label}: git stash failed: {_git_error_summary(stash) or stash.returncode}",
+        )
+    if "No local changes to save" in (stash.stdout or "") + (stash.stderr or ""):
+        return False
+    return True
+
+
+def _git_has_merge_conflicts(repo):
+    result = _git_run(repo, ["ls-files", "-u"])
+    return bool((result.stdout or "").strip())
+
+
+def _git_raise_stash_merge_conflict(label):
+    raise RuntimeError(
+        f"{label}: git stash pop left merge conflicts "
+        f"(local changes conflict with upstream). "
+        f"Stash preserved; resolve manually, then retry.",
+    )
+
+
+def _git_stash_pop(repo, label):
+    pop = _git_run(repo, ["stash", "pop"])
+    if pop.returncode == 0 and not _git_has_merge_conflicts(repo):
+        return
+    if _git_has_merge_conflicts(repo):
+        _git_run(repo, ["reset", "--hard"])
+        _git_raise_stash_merge_conflict(label)
+    detail = _git_error_summary(pop) or pop.returncode
+    raise RuntimeError(
+        f"{label}: git stash pop failed (local changes preserved in stash): {detail}",
+    )
+
+
+def _git_resolve_fetch_ref(repo, git_ref):
+    """Resolve a fetched ref to a commit-ish usable with reset --hard."""
+    candidates = [
+        git_ref,
+        f"refs/tags/{git_ref}",
+        f"origin/{git_ref}",
+        "FETCH_HEAD",
+    ]
+    for candidate in candidates:
+        if _git_ref_exists(repo, candidate):
+            return candidate
+    return None
+
+
+def _git_checkout_ref(repo, label, git_ref):
+    """Fetch and hard-reset to a branch, tag, or commit SHA."""
+    ref = (git_ref or "").strip()
+    if not ref:
+        raise RuntimeError(f"{label}: empty git ref")
+
+    fetch_label = f"{label}: git fetch origin {ref}"
+    fetch = _git_run(repo, ["fetch", "origin", "--prune", "--tags"])
+    if fetch.returncode != 0:
+        _raise_git_failure(f"{label}: git fetch origin --tags", fetch)
+
+    targeted = _git_run(repo, ["fetch", "origin", ref, "--depth=1"])
+    if targeted.returncode != 0:
+        # Tags/commits may already be present after --tags fetch; keep going.
+        print(f"{fetch_label}: targeted fetch skipped ({_git_error_summary(targeted) or 'exit '+str(targeted.returncode)})")
+
+    resolved = _git_resolve_fetch_ref(repo, ref)
+    if not resolved:
+        raise RuntimeError(f"{label}: git ref not found after fetch: {ref}")
+
+    stashed = False
+    if not _git_working_tree_clean(repo):
+        print(f"{label}: stashing local changes before checkout {ref}")
+        stashed = _git_stash_local_changes(repo, label)
+
+    reset = _git_run(repo, ["reset", "--hard", resolved])
+    if reset.returncode != 0:
+        _raise_git_failure(f"{label}: git reset --hard {resolved}", reset)
+    print(f"{label}: synced to {ref} ({resolved})")
+
+    if stashed:
+        print(f"{label}: restoring stashed local changes")
+        _git_stash_pop(repo, label)
+
+
 def _git_pull_inner(repo, label):
     pull_label = f"{label}: git pull"
     pull = _git_run(repo, ["pull"])
@@ -1507,14 +1879,21 @@ def _git_pull_inner(repo, label):
         return
 
     detail = _git_error_summary(pull)
-    if _git_pull_recoverable_result(pull) and _git_working_tree_clean(repo):
+    if _git_pull_no_upstream(repo, label, detail):
+        return
+    if _git_pull_recoverable_result(pull):
         branch = _git_current_branch(repo)
-        print(
-            f"{pull_label} failed; resetting to origin/{branch} "
-            "(diverged local history, working tree clean)",
-        )
         try:
-            _git_reset_to_origin(repo, label, branch)
+            _git_sync_to_origin_with_stash(
+                repo,
+                label,
+                branch,
+                log_prefix=pull_label,
+                reset_notice=(
+                    f"{pull_label} failed; resetting to origin/{branch} "
+                    "(recoverable sync error)"
+                ),
+            )
             return
         except RuntimeError as exc:
             raise RuntimeError(
@@ -1527,11 +1906,81 @@ def _git_pull_inner(repo, label):
     raise RuntimeError(f"{pull_label} failed (exit {pull.returncode}): {detail}")
 
 
+def _git_submodule_run_shell(repo, inner_cmd):
+    script = (
+        f"cd {shlex.quote(repo)} && "
+        f"git submodule foreach --recursive {shlex.quote(inner_cmd)}"
+    )
+    return subprocess.run(
+        ["bash", "-lc", script],
+        cwd=EDGE_HOME,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_git_env(),
+    )
+
+
+def _git_submodule_foreach(repo, git_args, *, ignore_errors=False):
+    inner_cmd = "git " + " ".join(shlex.quote(arg) for arg in git_args)
+    if ignore_errors:
+        inner_cmd += " || true"
+    return _git_submodule_run_shell(repo, inner_cmd)
+
+
+def _git_submodule_stash_all(repo, label):
+    result = _git_submodule_foreach(
+        repo,
+        ["stash", "push", "-u", "-m", "server_command update"],
+        ignore_errors=True,
+    )
+    if result.returncode != 0:
+        detail = _cmd_detail(result) or (result.stderr or "").strip()
+        if detail and "No local changes to save" not in detail:
+            print(f"{label}: submodule stash warning: {detail}")
+
+
+def _git_submodule_has_merge_conflicts(repo):
+    inner_cmd = 'if [ -n "$(git ls-files -u)" ]; then exit 1; fi'
+    return _git_submodule_run_shell(repo, inner_cmd).returncode != 0
+
+
+def _git_submodule_reset_hard_all(repo):
+    _git_submodule_foreach(repo, ["reset", "--hard"], ignore_errors=True)
+
+
+def _git_submodule_raise_stash_conflict(repo, label):
+    _git_submodule_reset_hard_all(repo)
+    raise RuntimeError(
+        f"{label}: submodule stash pop left merge conflicts "
+        f"(local compat changes conflict with upstream). "
+        f"Stash preserved; resolve eg_common manually, then retry.",
+    )
+
+
+def _git_submodule_pop_all(repo, label):
+    result = _git_submodule_run_shell(
+        repo,
+        "if git stash list | grep -q .; then git stash pop; fi",
+    )
+    if result.returncode != 0:
+        detail = _cmd_detail(result) or (result.stderr or "").strip()
+        if _git_submodule_has_merge_conflicts(repo):
+            _git_submodule_raise_stash_conflict(repo, label)
+        raise RuntimeError(
+            f"{label}: submodule stash pop failed (exit {result.returncode}): {detail}"
+        )
+    if _git_submodule_has_merge_conflicts(repo):
+        _git_submodule_raise_stash_conflict(repo, label)
+
+
 def _git_submodule_update_inner(repo, label):
+    _git_submodule_stash_all(repo, label)
     _run_login_shell(
-        _git_shell_command(repo, ["submodule", "update", "--recursive", "--remote"]),
+        _git_shell_command(repo, ["submodule", "update", "--recursive"]),
         f"{label}: submodule update",
     )
+    _git_submodule_pop_all(repo, label)
 
 
 def _run_login_shell(script, label):
@@ -1544,11 +1993,32 @@ def _prepare_git_repo(repo_path, label):
     return repo
 
 
-def _git_sync_repo(repo_path, label):
-    """git pull (+ fetch/reset fallback) and submodule update under one repo lock."""
+def _git_ref_for_repo(git_refs, repo_path, label=None):
+    if not git_refs:
+        return None
+    keys = []
+    if label:
+        keys.append(label)
+    base = os.path.basename((repo_path or "").rstrip(os.sep))
+    if base:
+        keys.append(base)
+    if repo_path:
+        keys.append(repo_path)
+    for key in keys:
+        ref = (git_refs.get(key) or "").strip()
+        if ref:
+            return ref
+    return None
+
+
+def _git_sync_repo(repo_path, label, git_ref=None):
+    """git pull (or checkout git_ref) and submodule update under one repo lock."""
     repo = _prepare_git_repo(repo_path, label)
     with _git_sync_lock(repo):
-        _git_pull_inner(repo, label)
+        if git_ref:
+            _git_checkout_ref(repo, label, git_ref)
+        else:
+            _git_pull_inner(repo, label)
         _git_submodule_update_inner(repo, label)
 
 
@@ -1591,6 +2061,8 @@ def _pipeline_job_from_item(item):
         job["server_id"] = server_id
     if item.get("is_rtls"):
         job["is_rtls"] = True
+    if item.get("is_kafka"):
+        job["is_kafka"] = True
     return job
 
 
@@ -1601,11 +2073,18 @@ def _pipeline_jobs_from_command(command):
         if jobs:
             return jobs
     eg_path = command.get("eg_pipeline_path")
-    return [
-        {"service_name": name, "eg_pipeline_path": eg_path}
-        for name in _service_names_from_command(command)
-        if name and eg_path
-    ]
+    server_ids = command.get("server_ids") or {}
+    legacy_server_id = command.get("server_id")
+    jobs = []
+    for name in _service_names_from_command(command):
+        if not name or not eg_path:
+            continue
+        job = {"service_name": name, "eg_pipeline_path": eg_path}
+        server_id = server_ids.get(name) or legacy_server_id
+        if server_id:
+            job["server_id"] = server_id
+        jobs.append(job)
+    return jobs
 
 
 # --- update ---
@@ -1621,23 +2100,38 @@ def _set_update_step(step, step_label, *, service_name=None):
             _update_state["service_steps"] = service_steps
 
 
-def _mark_service_step_done(service_name, *, label=None):
+def _mark_service_step(service_name, step, *, label=None):
     with _update_lock:
         service_steps = dict(_update_state.get("service_steps") or {})
         service_steps[service_name] = {
-            "step": "done",
-            "label": label or f"{service_name}: done",
+            "step": step,
+            "label": label or f"{service_name}: {step}",
         }
         _update_state["service_steps"] = service_steps
 
 
-def _begin_update_state(service_names):
+def _mark_service_step_done(service_name, *, label=None):
+    _mark_service_step(service_name, "done", label=label)
+
+
+def _mark_service_step_failed(service_name, *, label=None):
+    _mark_service_step(service_name, "failed", label=label)
+
+
+def _begin_update_state(service_names, *, include_sys_monitor=True, pipeline_jobs=None):
+    if include_sys_monitor:
+        step, step_label = "sys_monitor_git", "system_monitor: git pull"
+    elif pipeline_jobs:
+        first = pipeline_jobs[0]["service_name"]
+        step, step_label = "pipelines_git", f"{first}: git pull"
+    else:
+        step, step_label = "starting", "Preparing update…"
     with _update_lock:
         now = time.time()
         _update_state.update({
             "running": True,
-            "step": "sys_monitor_git",
-            "step_label": "system_monitor: git pull",
+            "step": step,
+            "step_label": step_label,
             "started_at": now,
             "updated_at": now,
             "error": None,
@@ -1652,10 +2146,12 @@ def _finish_update_state(success, error=None):
         _update_state["step"] = "done" if success else "failed"
         if success:
             _update_state["step_label"] = "Update complete"
+        elif error:
+            _update_state["step_label"] = "Update finished with errors"
         _update_state["updated_at"] = time.time()
         if error and _update_state.get("step_label"):
             step_label = _update_state["step_label"]
-            if step_label not in error:
+            if ";" not in error and step_label not in error:
                 error = f"{step_label}: {error}"
         _update_state["error"] = error
 
@@ -1671,7 +2167,6 @@ def get_update_status():
 
 
 def _prune_unused_docker_images():
-    _set_update_step("prune_images", "Cleaning unused docker images")
     result = _docker_cmd("image", "prune", "-f", text=True)
     if result.returncode != 0:
         raise RuntimeError(f"docker image prune failed: {_cmd_detail(result) or result.returncode}")
@@ -1680,11 +2175,17 @@ def _prune_unused_docker_images():
         print("docker image prune:", removed)
 
 
-def _build_sys_monitor(sys_monitor_path, sys_monitor_service):
-    _set_update_step(
-        "sys_monitor_git", "system_monitor: git pull", service_name=sys_monitor_service,
-    )
-    _git_sync_repo(sys_monitor_path, "system_monitor")
+def _update_in_progress():
+    return _update_state["running"] or _update_pruning
+
+
+def _build_sys_monitor(sys_monitor_path, sys_monitor_service, git_ref=None):
+    if git_ref:
+        step_label = f"system_monitor: git checkout {git_ref}"
+    else:
+        step_label = "system_monitor: git pull"
+    _set_update_step("sys_monitor_git", step_label, service_name=sys_monitor_service)
+    _git_sync_repo(sys_monitor_path, "system_monitor", git_ref=git_ref)
     _set_update_step(
         "sys_monitor_build", "system_monitor: docker build", service_name=sys_monitor_service,
     )
@@ -1721,12 +2222,13 @@ def _group_pipeline_jobs_by_repo(jobs):
     return [(repo_path, groups[repo_path]) for repo_path in order]
 
 
-def _build_repo_for_jobs(repo_path, jobs, step_lock):
+def _build_repo_for_jobs(repo_path, jobs, step_lock, git_ref=None):
     label = os.path.basename(repo_path.rstrip(os.sep)) or "repo"
     service_names = [job["service_name"] for job in jobs]
 
-    _set_service_group_step("pipeline_build", "git pull", service_names, step_lock)
-    _git_sync_repo(repo_path, label)
+    git_suffix = f"git checkout {git_ref}" if git_ref else "git pull"
+    _set_service_group_step("pipeline_build", git_suffix, service_names, step_lock)
+    _git_sync_repo(repo_path, label, git_ref=git_ref)
     _set_service_group_step("pipeline_build", "docker build", service_names, step_lock)
     with _repo_build_lock(repo_path):
         _run_docker_build(repo_path, label)
@@ -1736,39 +2238,66 @@ def _build_repo_for_jobs(repo_path, jobs, step_lock):
         _mark_service_step_done(service_name, label=f"{service_name}: build complete")
 
 
-def _run_tasks_collect_failures(tasks):
-    """Run ``(name, callable)`` tasks in parallel; raise a combined RuntimeError on failure."""
-    failures = []
-    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-        futures = {executor.submit(fn): name for name, fn in tasks}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                failures.append((name, exc))
-    if failures:
-        raise RuntimeError("; ".join(f"{name}: {exc}" for name, exc in failures))
+def _try_build_repo_for_jobs(repo_path, jobs, step_lock, git_ref=None):
+    label = os.path.basename(repo_path.rstrip(os.sep)) or "repo"
+    try:
+        _build_repo_for_jobs(repo_path, jobs, step_lock, git_ref=git_ref)
+        return None
+    except Exception as exc:
+        for job in jobs:
+            _mark_service_step_failed(
+                job["service_name"],
+                label=f"{job['service_name']}: build failed",
+            )
+        print(f"pipeline build failed ({label}): {exc}")
+        return f"{label}: {exc}"
 
 
-def _build_pipeline_jobs(pipeline_jobs, step_lock):
+def _build_pipeline_jobs(pipeline_jobs, step_lock, git_refs=None):
+    """Build all pipeline repos first. Returns (errors, jobs that built successfully)."""
     groups = _group_pipeline_jobs_by_repo(pipeline_jobs)
+    errors = []
+    built_jobs = []
+    git_refs = git_refs or {}
+
+    def build_one(repo_path, jobs):
+        label = os.path.basename(repo_path.rstrip(os.sep)) or "repo"
+        err = _try_build_repo_for_jobs(
+            repo_path, jobs, step_lock,
+            git_ref=_git_ref_for_repo(git_refs, repo_path, label),
+        )
+        return err, ([] if err else list(jobs))
+
     if len(groups) == 1:
-        repo_path, jobs = groups[0]
-        _build_repo_for_jobs(repo_path, jobs, step_lock)
-        return
+        build_err, jobs = build_one(*groups[0])
+        if build_err:
+            errors.append(build_err)
+        built_jobs.extend(jobs)
+        return errors, built_jobs
 
     _set_update_step(
         "pipelines_parallel",
         f"Building {len(pipeline_jobs)} pipeline(s) across {len(groups)} repo(s)",
     )
-    _run_tasks_collect_failures([
-        (
-            os.path.basename(repo_path),
-            (lambda rp=repo_path, js=jobs: _build_repo_for_jobs(rp, js, step_lock)),
-        )
-        for repo_path, jobs in groups
-    ])
+    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+        futures = {
+            executor.submit(build_one, repo_path, jobs): repo_path
+            for repo_path, jobs in groups
+        }
+        for future in as_completed(futures):
+            build_err, jobs = future.result()
+            if build_err:
+                errors.append(build_err)
+            built_jobs.extend(jobs)
+    return errors, built_jobs
+
+
+def _build_and_restart_pipeline_jobs(pipeline_jobs, active_before, step_lock, git_refs=None):
+    """Build every repo, then restart all previously-active pipelines, before sys_monitor."""
+    errors, built_jobs = _build_pipeline_jobs(pipeline_jobs, step_lock, git_refs=git_refs)
+    if built_jobs:
+        errors.extend(_restart_active_pipelines(built_jobs, active_before, step_lock))
+    return errors
 
 
 def _restart_pipeline_job(job, step_lock):
@@ -1779,6 +2308,7 @@ def _restart_pipeline_job(job, step_lock):
         service_name,
         server_id=job.get("server_id"),
         is_rtls=bool(job.get("is_rtls")),
+        is_kafka=bool(job.get("is_kafka")),
     )
     _mark_service_step_done(service_name, label=f"{service_name}: restarted")
 
@@ -1793,57 +2323,136 @@ def _restart_sys_monitor_if_active(sys_monitor_service, was_active):
     _mark_service_step_done(sys_monitor_service, label="system_monitor: restarted")
 
 
-def _run_parallel_pipeline_tasks(label, jobs, worker):
-    if len(jobs) == 1:
-        worker(jobs[0])
-        return
-    _set_update_step("pipelines_parallel", label)
-    _run_tasks_collect_failures([
-        ((job.get("service_name") or "pipeline"), (lambda j=job: worker(j)))
-        for job in jobs
-    ])
+def _try_restart_pipeline_job(job, step_lock):
+    service_name = job["service_name"]
+    try:
+        _restart_pipeline_job(job, step_lock)
+        return None
+    except Exception as exc:
+        _mark_service_step_failed(
+            service_name,
+            label=f"{service_name}: restart failed",
+        )
+        print(f"pipeline restart failed ({service_name}): {exc}")
+        return f"{service_name}: {exc}"
 
 
 def _restart_active_pipelines(pipeline_jobs, active_before, step_lock):
     active_jobs = [job for job in pipeline_jobs if job["service_name"] in active_before]
     if not active_jobs:
-        return
+        return []
     _set_update_step("pipelines_restart", f"Restarting {len(active_jobs)} pipeline(s)")
-    _run_parallel_pipeline_tasks(
+    errors = []
+    if len(active_jobs) == 1:
+        err = _try_restart_pipeline_job(active_jobs[0], step_lock)
+        if err:
+            errors.append(err)
+        return errors
+
+    _set_update_step(
+        "pipelines_parallel",
         f"Restarting {len(active_jobs)} pipeline(s) in parallel",
-        active_jobs,
-        lambda job: _restart_pipeline_job(job, step_lock),
     )
+    with ThreadPoolExecutor(max_workers=len(active_jobs)) as executor:
+        futures = {
+            executor.submit(_try_restart_pipeline_job, job, step_lock): job
+            for job in active_jobs
+        }
+        for future in as_completed(futures):
+            err = future.result()
+            if err:
+                errors.append(err)
+    return errors
 
 
 def update_pipeline(command):
-    sys_monitor_path = command["sys_monitor_path"]
-    sys_monitor_service = _sys_monitor_service_name(command)
+    sys_monitor_path = str(command.get("sys_monitor_path") or "").strip() or None
+    include_sys_monitor = bool(sys_monitor_path)
+    sys_monitor_service = _sys_monitor_service_name(command) if include_sys_monitor else None
     pipeline_jobs = _pipeline_jobs_from_command(command)
     if not pipeline_jobs and not sys_monitor_path:
         raise RuntimeError("no pipeline jobs in update command")
 
+    git_refs = command.get("git_refs") if isinstance(command.get("git_refs"), dict) else {}
+    sys_git_ref = (
+        _git_ref_for_repo(git_refs, sys_monitor_path, "system_monitor")
+        if include_sys_monitor else None
+    )
+
     pipeline_names = [job["service_name"] for job in pipeline_jobs]
     active_before = _active_pipeline_service_names(pipeline_jobs)
-    sys_monitor_was_active = _is_service_active(sys_monitor_service)
-    tracked_services = list(dict.fromkeys(pipeline_names + [sys_monitor_service]))
-    _begin_update_state(tracked_services)
-    error = None
+    sys_monitor_was_active = (
+        _is_service_active(sys_monitor_service) if include_sys_monitor else False
+    )
+    tracked_services = list(pipeline_names)
+    if include_sys_monitor and sys_monitor_service:
+        tracked_services = list(dict.fromkeys(pipeline_names + [sys_monitor_service]))
+    _begin_update_state(
+        tracked_services,
+        include_sys_monitor=include_sys_monitor,
+        pipeline_jobs=pipeline_jobs,
+    )
+    errors = []
     step_lock = threading.Lock()
+    sys_build_ok = not include_sys_monitor
 
     try:
-        _build_sys_monitor(sys_monitor_path, sys_monitor_service)
-        if pipeline_jobs:
-            _build_pipeline_jobs(pipeline_jobs, step_lock)
-            _restart_active_pipelines(pipeline_jobs, active_before, step_lock)
+        if include_sys_monitor:
+            try:
+                _build_sys_monitor(sys_monitor_path, sys_monitor_service, git_ref=sys_git_ref)
+                sys_build_ok = True
+            except Exception as exc:
+                _append_update_error(
+                    errors, sys_monitor_service, exc,
+                    failed_label="system_monitor: build failed",
+                    summary=f"system_monitor: {exc}",
+                )
 
-        _restart_sys_monitor_if_active(sys_monitor_service, sys_monitor_was_active)
-        _prune_unused_docker_images()
+        if pipeline_jobs and sys_build_ok:
+            # Build all repos, restart all active pipelines, then sys_monitor last.
+            errors.extend(_build_and_restart_pipeline_jobs(
+                pipeline_jobs, active_before, step_lock, git_refs=git_refs,
+            ))
+        elif pipeline_jobs and not sys_build_ok:
+            skip_msg = "pipeline update skipped: system_monitor build failed"
+            errors.append(skip_msg)
+            print("update step failed:", skip_msg)
+            for job in pipeline_jobs:
+                _mark_service_step_failed(
+                    job["service_name"],
+                    label=f"{job['service_name']}: skipped (system_monitor build failed)",
+                )
+
+        if include_sys_monitor and sys_build_ok:
+            try:
+                _restart_sys_monitor_if_active(sys_monitor_service, sys_monitor_was_active)
+            except Exception as exc:
+                _append_update_error(
+                    errors, sys_monitor_service, exc,
+                    failed_label="system_monitor: restart failed",
+                    summary=f"system_monitor restart: {exc}",
+                )
+
     except Exception as exc:
-        error = str(exc)
+        errors.append(str(exc))
         print("update failed:", exc)
     finally:
-        _finish_update_state(error is None, error)
+        error = "; ".join(errors) if errors else None
+        _finish_update_state(not errors, error)
+
+    def _prune_after_update():
+        global _update_pruning
+        try:
+            with _update_lock:
+                _update_pruning = True
+            _prune_unused_docker_images()
+        except Exception as exc:
+            print("update prune failed:", exc)
+        finally:
+            with _update_lock:
+                _update_pruning = False
+
+    threading.Thread(target=_prune_after_update, daemon=True).start()
 
 
 def _mark_update_preparing():
@@ -1870,7 +2479,7 @@ def start_update_pipeline(command):
                     _finish_update_state(False, str(exc))
 
     with _update_lock:
-        if _update_state["running"]:
+        if _update_in_progress():
             return False
         _mark_update_preparing()
     _invalidate_probe_caches()
@@ -1883,10 +2492,11 @@ def check_pipeline(target):
         server_id = target.get("server_id")
         is_rtls = bool(target.get("is_rtls"))
         is_sys_monitor = bool(target.get("is_sys_monitor"))
+        is_kafka = bool(target.get("is_kafka"))
         service_name = target.get("service_name") or ""
     else:
         server_id = target
-        is_rtls = is_sys_monitor = False
+        is_rtls = is_sys_monitor = is_kafka = False
         service_name = ""
 
     running_names = _running_container_names()
@@ -1899,13 +2509,17 @@ def check_pipeline(target):
             is_rtls=is_rtls,
             is_sys_monitor=is_sys_monitor,
         )
+    if is_kafka:
+        return _kafka_unit_running(service_name, server_id, running_names)
 
     if server_id and server_id in running_names:
         return True
-    # Same server_id may back both EG and RTLS containers on one host.
+    # Same server_id may back an RTLS container when the check payload omits is_rtls.
     if _container_running_for_kind(server_id, running_names, is_rtls=True):
         return True
     if _is_container_running(server_id, "sys", running_names):
+        return True
+    if service_name and _is_service_active(service_name):
         return True
     return False
 
@@ -1915,8 +2529,7 @@ def check_pipeline(target):
 def _monitored_peer_names(items, monitor_host):
     return [
         peer["name"] for peer in items
-        if not peer.get("is_sys_monitor")
-        and not peer.get("is_rtls")
+        if is_sys_monitored_peer(item=peer)
         and peer.get("monitor_host_ip") == monitor_host
     ]
 
@@ -1936,12 +2549,12 @@ def _set_camera_status(entry, item):
     camera_links = item.get("camera_links") or []
     if not camera_links:
         return
-    entry["camera_status"] = _camera_device_status(
-        camera_links,
-        entry.get("cameras_now"),
-        entry.get("cameras_set"),
-        entry.get("running"),
-    )
+    if not entry.get("running"):
+        entry["camera_status"] = ["idle"] * len(camera_links)
+        return
+    statuses, cameras_now = _probe_camera_links(camera_links)
+    entry["camera_status"] = statuses
+    entry["cameras_now"] = cameras_now
 
 
 def _status_entry(name, item, running_names):
@@ -1953,8 +2566,11 @@ def _status_entry(name, item, running_names):
         "qlight_now": None,
         "speaker_now": None,
         "is_rtls": item.get("is_rtls", False),
+        "is_kafka": item.get("is_kafka", False),
+        "is_camera_drift": item.get("is_camera_drift", False),
         "is_sys_monitor": item.get("is_sys_monitor", False),
         "rtls_config_missing": bool(item.get("rtls_config_missing")),
+        "rtls_devices_missing": bool(item.get("rtls_devices_missing")),
         "cameras_now": None,
         "camera_links": item.get("camera_links") or [],
         "qlight_status": [],
@@ -1971,6 +2587,8 @@ def _status_entry(name, item, running_names):
         "version_latest_date": None,
         "mem_usage": None,
         "mem_usage_percent": None,
+        **empty_plc_tag_metrics(),
+        **empty_camera_drift_metrics(),
     }
 
 
@@ -1983,6 +2601,23 @@ def _populate_rtls_metrics(entry, item):
     entry["qlight_links"], entry["speaker_links"] = _rtls_device_links(ql_probes, sp_probes)
 
 
+def _populate_kafka_metrics(entry, item):
+    base = plc_status_url_for(item, prefer_localhost=True)
+    if not base:
+      base = plc_status_url_for(item, host_ip=item.get("server_ip"))
+    entry.update(fetch_plc_tag_metrics(base, timeout=PROBE_TIMEOUT))
+
+
+def _populate_camera_drift_metrics(entry, item):
+    base = drift_service_url_for(item, prefer_localhost=True)
+    if not base:
+      base = drift_service_url_for(item, host_ip=item.get("server_ip"))
+    entry.update(fetch_camera_drift_metrics(base, timeout=max(PROBE_TIMEOUT, 10)))
+    if base:
+      entry["drift_service_url"] = base
+      entry["url"] = base
+
+
 def _populate_stream_metrics(entry, item, probe_cfg):
     health_ok, cameras_now = _cached_probe_local_stream(
         item, probe_cfg["stream_probe_interval_sec"],
@@ -1990,7 +2625,7 @@ def _populate_stream_metrics(entry, item, probe_cfg):
     if health_ok:
         entry["stream_health"] = True
         entry["running"] = True
-    if cameras_now is not None:
+    if cameras_now is not None and not (item.get("camera_links") or []):
         entry["cameras_now"] = cameras_now
     _set_camera_status(entry, item)
 
@@ -2012,6 +2647,10 @@ def status_one(
 
     if entry["is_rtls"]:
         _populate_rtls_metrics(entry, item)
+    elif entry.get("is_kafka"):
+        _populate_kafka_metrics(entry, item)
+    elif entry.get("is_camera_drift"):
+        _populate_camera_drift_metrics(entry, item)
     elif not item.get("streaming_port"):
         _set_camera_status(entry, item)
     else:
@@ -2097,6 +2736,7 @@ def _service_control_kwargs(source):
         "server_id": source.get("server_id"),
         "is_rtls": bool(source.get("is_rtls")),
         "is_sys_monitor": bool(source.get("is_sys_monitor")),
+        "is_kafka": bool(source.get("is_kafka")),
     }
 
 
@@ -2133,6 +2773,33 @@ def _service_batch_results(command):
     return results
 
 
+_HOST_POWER_ACTIONS = {
+    "reboot": "reboot",
+    "shutdown": "poweroff",
+}
+
+
+def host_power(action):
+    """Schedule host reboot/poweroff after the HTTP response can flush."""
+    systemctl_action = _HOST_POWER_ACTIONS.get(action)
+    if not systemctl_action:
+        return f"unsupported host power action: {action}"
+
+    def _run():
+        time.sleep(1.0)
+        result = subprocess.run(
+            _systemctl_cmd(systemctl_action),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = _cmd_detail(result) or result.returncode
+            print(f"host_power {action} failed: {detail}", flush=True)
+
+    threading.Thread(target=_run, daemon=True, name=f"host-power-{action}").start()
+    return "Scheduled"
+
+
 def handle_command(command):
     """Dispatch POST /command JSON from the central proxy."""
     if "run" in command:
@@ -2143,6 +2810,8 @@ def handle_command(command):
         return "Started" if start_update_pipeline(command["update"]) else "Busy"
     if command.get("update_status"):
         return jsonify(get_update_status())
+    if "host_power" in command:
+        return host_power(command["host_power"])
     if "service_batch" in command:
         return jsonify({"results": _service_batch_results(command)})
     for action in _SERVICE_ACTIONS:
@@ -2171,9 +2840,25 @@ def _log_command(command):
     print("command:", ", ".join(parts) or "(empty)")
 
 
+def _parse_command_body():
+    command = request.get_json(silent=True)
+    if isinstance(command, dict):
+        return command
+    raw = request.get_data(as_text=True)
+    if not raw or not raw.strip():
+        return None
+    try:
+        command = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return command if isinstance(command, dict) else None
+
+
 @app.route("/command", methods=["POST"])
 def command_recv():
-    command = json.loads(request.data)
+    command = _parse_command_body()
+    if command is None:
+        return jsonify({"error": "invalid JSON body"}), 400
     _log_command(command)
     return handle_command(command)
 

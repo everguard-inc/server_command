@@ -20,55 +20,87 @@
 	{% endfor %}
 </div>
 {% endmacro %}
+{% macro stat_filter_pills() %}
+{% for filter_key, tone, label, sum_id in [
+	("OK", "ok", "OK", "sum_ok"),
+	("WARN", "warn", "WARN", "sum_warn"),
+	("ERR", "err", "ERR", "sum_err"),
+] %}
+<button type="button" class="card-tab card-stat-tab {{ tone }} filter-pill" data-filter="{{ filter_key }}">
+	<span class="card-stat-value" id="{{ sum_id }}">0</span>
+	<span class="card-tab-label">{{ label }}</span>
+</button>
+{% endfor %}
+<button type="button" class="card-tab card-stat-tab filter-pill active" id="total_pill" data-filter="all">
+	<span class="card-stat-value" id="sum_total">0</span>
+	<span class="card-tab-label">Total</span>
+</button>
+{% endmacro %}
+{% macro control_section(section_id, title, select_all_id, hint_id, body_id) %}
+<section class="card card--collapsible is-expanded" id="{{ section_id }}">
+	<div class="card-section-head">
+		<div class="card-section-title-row card-section-title-row--compact">
+			<div class="card-section-heading">
+				<button type="button" class="card-collapse-btn" aria-expanded="true" aria-controls="{{ section_id }}_panel" aria-label="Toggle {{ title }}">
+					<span class="card-collapse-chevron" aria-hidden="true"></span>
+				</button>
+				<h2 class="card-section-title">{{ title }}</h2>
+			</div>
+		</div>
+		<div class="command-toolbar">
+			<div class="command-toolbar-slot command-toolbar-slot--meta">
+				<label class="command-toolbar-select check-label">
+					<input type="checkbox" id="{{ select_all_id }}" />
+					Select all
+				</label>
+				<span class="command-toolbar-count" id="{{ hint_id }}">0 selected</span>
+			</div>
+			<div class="command-toolbar-slot command-toolbar-slot--actions">
+				{{ caller() }}
+			</div>
+		</div>
+	</div>
+	<div class="card-collapsible-panel" id="{{ section_id }}_panel">
+		<div class="card-section-body">
+			<div id="{{ body_id }}"></div>
+		</div>
+	</div>
+</section>
+{% endmacro %}
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
 	<meta charset="UTF-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
 	<meta name="color-scheme" content="dark" />
-	<title>Docker Image Manager</title>
-	<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css') }}" />
+	<title>Service &amp; Server Manager</title>
+	<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
 </head>
-
 <body>
 	<div class="page">
-		<div class="sticky-toolbar">
+		<header class="sticky-toolbar">
 			<div class="sticky-toolbar__top">
 				<div class="page-title-block">
-					<h1 class="page-title">Docker Image Manager</h1>
-					<div class="meta page-title-meta">Last update: <span id="lst_update">-</span></div>
+					<h1 class="page-title">Service &amp; Server Manager</h1>
+					<p class="meta page-title-meta">Last update: <span id="lst_update">-</span></p>
 				</div>
 				<div class="view-controls-bar">
 					{{ pipeline_view_controls() }}
 				</div>
 			</div>
-			<div class="card-grid-4 status-summary-bar" id="status_summary">
-				{% for filter_key, tone, label, sum_id in [
-					('OK', 'ok', 'OK', 'sum_ok'),
-					('WARN', 'warn', 'WARN', 'sum_warn'),
-					('ERR', 'err', 'ERR', 'sum_err'),
-				] %}
-				<button type="button" class="card-tab card-stat-tab {{ tone }} filter-pill" data-filter="{{ filter_key }}">
-					<span class="card-stat-value" id="{{ sum_id }}">0</span>
-					<span class="card-tab-label">{{ label }}</span>
-				</button>
-				{% endfor %}
-				<button type="button" class="card-tab card-stat-tab filter-pill active" id="total_pill" data-filter="all">
-					<span class="card-stat-value" id="sum_total">0</span>
-					<span class="card-tab-label">Total</span>
-				</button>
+			<div class="card-grid-4" id="status_summary">
+				{{ stat_filter_pills() }}
 			</div>
-		</div>
+		</header>
 
-		<div class="card card--collapsible is-expanded" id="section_pipeline_status">
+		<section class="card card--collapsible is-expanded" id="section_pipeline_status">
 			<div class="card-section-head">
 				<div class="card-section-title-row card-section-title-row--compact">
 					<div class="card-section-heading">
-						<button type="button" class="card-collapse-btn" aria-expanded="true" aria-controls="section_pipeline_status_panel" aria-label="Toggle Pipeline Status">
+						<button type="button" class="card-collapse-btn" aria-expanded="true" aria-controls="section_pipeline_status_panel" aria-label="Toggle Service Status">
 							<span class="card-collapse-chevron" aria-hidden="true"></span>
 						</button>
-						<h2 class="card-section-title">Pipeline Status</h2>
+						<h2 class="card-section-title">Service Status</h2>
 					</div>
 				</div>
 			</div>
@@ -77,41 +109,20 @@
 					<div id="status_body"></div>
 				</div>
 			</div>
-		</div>
+		</section>
 
-		<div class="card card--collapsible is-expanded" id="section_service_control">
-			<div class="card-section-head">
-				<div class="card-section-title-row card-section-title-row--compact">
-					<div class="card-section-heading">
-						<button type="button" class="card-collapse-btn" aria-expanded="true" aria-controls="section_service_control_panel" aria-label="Toggle Service Control">
-							<span class="card-collapse-chevron" aria-hidden="true"></span>
-						</button>
-						<h2 class="card-section-title">Service Control</h2>
-					</div>
-				</div>
-				<div class="command-toolbar">
-					<div class="command-toolbar-slot command-toolbar-slot--meta">
-						<label class="command-toolbar-select check-label">
-							<input type="checkbox" id="select_all">
-							Select all
-						</label>
-						<span class="command-toolbar-count" id="selection_hint">0 selected</span>
-					</div>
-					<div class="command-toolbar-slot command-toolbar-slot--actions">
-						<button type="button" class="btn btn-start command-action-btn" id="btn_start" data-command="service:start">Start</button>
-						<button type="button" class="btn btn-stop command-action-btn" id="btn_stop" data-command="service:stop">Stop</button>
-						<button type="button" class="btn btn-restart command-action-btn" id="btn_restart" data-command="service:restart">Restart</button>
-						<button type="button" class="btn btn-status command-action-btn" id="btn_status" data-command="service:status">Status</button>
-						<button type="button" class="btn btn-update command-action-btn" id="btn_update" data-command="update">Update</button>
-					</div>
-				</div>
-			</div>
-			<div class="card-collapsible-panel" id="section_service_control_panel">
-				<div class="card-section-body">
-					<div id="target_groups"></div>
-				</div>
-			</div>
-		</div>
+		{% call control_section("section_service_control", "Service Control", "select_all", "selection_hint", "target_groups") %}
+		<button type="button" class="btn btn-start command-action-btn" id="btn_start" data-command="service:start">Start</button>
+		<button type="button" class="btn btn-stop command-action-btn" id="btn_stop" data-command="service:stop">Stop</button>
+		<button type="button" class="btn btn-restart command-action-btn" id="btn_restart" data-command="service:restart">Restart</button>
+		<button type="button" class="btn btn-status command-action-btn" id="btn_status" data-command="service:status">Status</button>
+		<button type="button" class="btn btn-update command-action-btn" id="btn_update" data-command="update">Update</button>
+		{% endcall %}
+
+		{% call control_section("section_server_control", "Server Control", "select_all_servers", "server_selection_hint", "server_groups") %}
+		<button type="button" class="btn btn-stop command-action-btn" id="btn_server_shutdown" data-server-command="server:shutdown">Shutdown</button>
+		<button type="button" class="btn btn-restart command-action-btn" id="btn_server_reboot" data-server-command="server:reboot">Reboot</button>
+		{% endcall %}
 	</div>
 
 	<div id="camera_live_modal" class="overlay hidden" aria-hidden="true">
@@ -122,8 +133,69 @@
 				<button type="button" class="overlay__close" id="camera_live_close" aria-label="Close">&times;</button>
 			</div>
 			<div class="overlay__body overlay__body--media">
-				<img id="camera_live_img" class="is-hidden" alt="" />
+				<img id="camera_live_img" class="hidden" alt="" />
 				<div id="camera_live_status" class="overlay__caption">Connecting…</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="plc_tag_modal" class="overlay hidden" aria-hidden="true">
+		<div class="overlay__backdrop"></div>
+		<div class="overlay__dialog overlay__dialog--plc-tags" role="dialog" aria-modal="true" aria-labelledby="plc_tag_modal_title">
+			<div class="overlay__header">
+				<span id="plc_tag_modal_title">PLC Tags</span>
+				<button type="button" class="overlay__close" id="plc_tag_modal_close" aria-label="Close">&times;</button>
+			</div>
+			<div class="overlay__body">
+				<div id="plc_tag_modal_summary" class="plc-tag-summary"></div>
+				<div id="plc_tag_modal_meta" class="plc-tag-meta" hidden></div>
+				<div id="plc_tag_modal_list" class="plc-tag-list"></div>
+				<div class="plc-tag-modal-actions">
+					<a id="plc_tag_modal_link" class="plc-tag-open-link" href="#" target="_blank" rel="noopener">Open API</a>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="drift_images_modal" class="overlay hidden" aria-hidden="true">
+		<div class="overlay__backdrop"></div>
+		<div class="overlay__dialog overlay__dialog--wide" role="dialog" aria-modal="true" aria-labelledby="drift_images_title">
+			<div class="overlay__header">
+				<span id="drift_images_title">Drift Images</span>
+				<button type="button" class="overlay__close" id="drift_images_close" aria-label="Close">&times;</button>
+			</div>
+			<div class="overlay__body">
+				<div id="drift_images_hint" class="drift-images-hint" hidden>
+					<div class="drift-images-hint__title" id="drift_images_hint_title"></div>
+					<ul class="drift-images-hint__list" id="drift_images_hint_list"></ul>
+				</div>
+				<div id="drift_images_status" class="drift-images-status">Loading…</div>
+				<div id="drift_images_metrics" class="drift-images-metrics" hidden></div>
+				<figure id="drift_images_overlay_wrap" class="drift-images-overlay" hidden>
+					<figcaption id="drift_images_overlay_caption">Explanation</figcaption>
+					<img id="drift_images_overlay" alt="Drift explanation" />
+				</figure>
+				<div id="drift_images_grid" class="drift-images-grid" hidden>
+					<figure class="drift-images-panel">
+						<figcaption id="drift_images_before_caption">Before</figcaption>
+						<div class="drift-images-media">
+							<img id="drift_images_before" alt="Before image" />
+							<canvas id="drift_images_before_points" class="drift-images-arrow is-hidden" aria-hidden="true"></canvas>
+							<div id="drift_images_before_empty" class="drift-images-empty hidden">No before image</div>
+						</div>
+					</figure>
+					<figure class="drift-images-panel">
+						<figcaption id="drift_images_after_caption">After</figcaption>
+						<div class="drift-images-media">
+							<img id="drift_images_after" alt="After image" />
+							<canvas id="drift_images_after_arrow" class="drift-images-arrow is-hidden" aria-hidden="true"></canvas>
+							<div id="drift_images_after_empty" class="drift-images-empty hidden">No after image</div>
+						</div>
+					</figure>
+				</div>
+			</div>
+			<div class="overlay__footer drift-images-footer" id="drift_images_footer" hidden>
+				<button type="button" class="btn drift-reset-btn" id="drift_images_reset">Reset</button>
 			</div>
 		</div>
 	</div>
@@ -175,7 +247,7 @@
 				<div id="app_modal_message" class="overlay__message"></div>
 			</div>
 			<div class="overlay__footer">
-				<button type="button" class="btn overlay__btn overlay__btn--cancel" id="app_modal_cancel">Cancel</button>
+				<button type="button" class="btn overlay__btn" id="app_modal_cancel">Cancel</button>
 				<button type="button" class="btn overlay__btn overlay__btn--ok" id="app_modal_ok">OK</button>
 			</div>
 		</div>
@@ -195,10 +267,12 @@
 				getStatus: {{ url_for('get_status') | tojson }},
 				serviceCommandStatus: {{ url_for('service_command_status') | tojson }},
 				manageDocker: {{ url_for('manage_docker') | tojson }},
+				manageServers: {{ url_for('manage_servers') | tojson }},
+				cameraDriftReset: {{ url_for('camera_drift_reset') | tojson }},
+				cameraDriftImages: {{ url_for('camera_drift_images') | tojson }},
 			},
 		};
 	</script>
 	<script src="{{ url_for('static', filename='index.js') }}"></script>
 </body>
-
 </html>

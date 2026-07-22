@@ -23,12 +23,11 @@ import subprocess
 import sys
 import tempfile
 
-from edge_sudoers import SUDOERS_DEST, sudoers_body_bytes, systemctl_paths
+from edge_sudoers import SERVICE_UNIT, SUDOERS_DEST, sudoers_body_bytes, systemctl_paths
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.basename(__file__)
 REQUIREMENTS = os.path.join(REPO, "requirements.txt")
-SERVICE_UNIT = "server_command_client.service"
 SERVICE_PATH = f"/etc/systemd/system/{SERVICE_UNIT}"
 SITE_ID_FILE = os.path.join(".eg", "site_id")
 DEFAULT_REPO_URL = "https://github.com/everguard-inc/server_command.git"

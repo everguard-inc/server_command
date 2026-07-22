@@ -24,19 +24,42 @@ let updatePollTimer = null;
 let updateFailureNotified = false;
 let lastUpdateServerByIp = {};
 const POLL_MS = 5000;
-const UPDATE_POLL_MS = 1000;
-const SERVICE_POLL_MS = 1000;
+const JOB_POLL_MS = 1000;
 const COMMAND_PROGRESS_TICK_MS = 250;
 const COMMAND_BTN_IDS = ["btn_start", "btn_stop", "btn_restart", "btn_status", "btn_update"];
-const CARD_SECTION_IDS = ["section_pipeline_status", "section_service_control"];
-const PIPELINE_KIND_ORDER = [
-	["sys", "SYSTEM"],
-	["rtls", "RTLS"],
-	["eg", "EG"],
-	["cobble", "COBBLE"],
-	["forklift", "FORKLIFT"],
-	["detseg", "DETSEG"],
+const SERVER_COMMAND_BTN_IDS = ["btn_server_shutdown", "btn_server_reboot"];
+const COMMAND_LABELS = {
+	"service:start": "Start",
+	"service:stop": "Stop",
+	"service:restart": "Restart",
+	"service:status": "Status",
+	update: "Update",
+	"server:shutdown": "Shutdown",
+	"server:reboot": "Reboot",
+};
+const CARD_SECTION_IDS = [
+	"section_pipeline_status",
+	"section_service_control",
+	"section_server_control",
 ];
+const UPDATE_PIPELINE_STEPS = new Set([
+	"pipeline_build",
+	"pipeline_restart",
+	"pipelines_parallel",
+	"pipelines_restart",
+]);
+// Labels for known kinds. Dropdown/filter order follows servers.json
+// (first appearance in pipelineOrder), not this array.
+const PIPELINE_KIND_LABELS = {
+	sys: "SYSTEM",
+	rtls: "RTLS",
+	camera_drift: "DRIFT",
+	eg: "EG",
+	plc: "PLC",
+	cobble: "COBBLE",
+	forklift: "FORKLIFT",
+	detseg: "DETSEG",
+};
 const VIEW_FILTER_META = {
 	group: {
 		key: "groupFilter",
@@ -63,7 +86,9 @@ const VIEW_FILTER_META = {
 		key: "typeFilter",
 		allLabel: "All types",
 		options() {
-			return pipelineKindsPresent().map(([value, label]) => ({ value, label }));
+			return pipelineKindsPresent()
+				.map(([value, label]) => ({ value, label }))
+				.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
 		},
 	},
 };
@@ -182,16 +207,29 @@ function fetchJsonGet(url, onLoad, options) {
 // --- Pipeline metadata & grouping ---
 
 function pipelineKindLabel(kind) {
-	const match = PIPELINE_KIND_ORDER.find(([value]) => value === kind);
-	return match ? match[1] : kind.toUpperCase();
+	return PIPELINE_KIND_LABELS[kind] || String(kind || "").toUpperCase();
 }
 
 function pipelineKindMeta(name) {
 	const info = pipelineInfo(name);
-	if (info.pipeline_kind) {
+	const rawKind = info.pipeline_kind || "";
+	// Type badge/filter: Kafka + CV collapse to a single PLC kind.
+	if (
+		rawKind === "plc_cv"
+		|| rawKind === "plc_kafka"
+		|| rawKind === "plc"
+		|| info.is_plc_cv
+		|| info.is_kafka
+	) {
+		return { kind: "plc", label: "PLC" };
+	}
+	if (pipelineRuntimeFlags(name).isCameraDrift) {
+		return { kind: "camera_drift", label: pipelineKindLabel("camera_drift") };
+	}
+	if (rawKind) {
 		return {
-			kind: info.pipeline_kind,
-			label: info.pipeline_kind_label || pipelineKindLabel(info.pipeline_kind),
+			kind: rawKind,
+			label: info.pipeline_kind_label || pipelineKindLabel(rawKind),
 		};
 	}
 	if (info.is_sys_monitor) return { kind: "sys", label: "SYSTEM" };
@@ -204,8 +242,16 @@ function pipelineKindKey(name) {
 }
 
 function pipelineKindsPresent() {
-	const present = new Set(pipelineOrder.map(pipelineKindKey));
-	return PIPELINE_KIND_ORDER.filter(([kind]) => present.has(kind));
+	// Order = first appearance in servers.json / pipelineOrder.
+	const ordered = [];
+	const seen = new Set();
+	for (const name of pipelineOrder) {
+		const meta = pipelineKindMeta(name);
+		if (seen.has(meta.kind)) continue;
+		seen.add(meta.kind);
+		ordered.push([meta.kind, meta.label]);
+	}
+	return ordered;
 }
 
 function pipelineInGroup(name, groupKey) {
@@ -254,6 +300,7 @@ function filteredPipelineNames(state) {
 }
 
 function bucketNamesByServer(names) {
+	// Preserve first-seen IP order from names (already pipelineOrder-filtered).
 	const buckets = new Map();
 	for (const name of names) {
 		const ip = pipelineInfo(name).server_ip || "no IP";
@@ -262,11 +309,7 @@ function bucketNamesByServer(names) {
 		}
 		buckets.get(ip).push(name);
 	}
-	return [...buckets.entries()].sort(([a], [b]) => {
-		if (a === "no IP") return 1;
-		if (b === "no IP") return -1;
-		return a.localeCompare(b, undefined, { numeric: true });
-	});
+	return [...buckets.entries()];
 }
 
 function currentGroups() {
@@ -320,14 +363,39 @@ function uniqueHostIps(names, requireIp = false) {
 
 function pipelineRuntimeFlags(name, entry) {
 	const info = pipelineInfo(name);
+	const rawKind = info.pipeline_kind || "";
 	return {
 		isRtls: Boolean(entry?.is_rtls ?? info.is_rtls),
 		isSys: Boolean(entry?.is_sys_monitor ?? info.is_sys_monitor),
+		isKafka: Boolean(
+			entry?.is_kafka
+			?? info.is_kafka
+			?? rawKind === "plc_kafka",
+		),
+		isCameraDrift: Boolean(
+			entry?.is_camera_drift
+			?? info.is_camera_drift
+			?? rawKind === "camera_drift",
+		),
 	};
 }
 
 function streamUrlFor(name, entry) {
-	return (entry && entry.url) || pipelineInfo(name).url || "";
+	const info = pipelineInfo(name);
+	const { isKafka, isCameraDrift } = pipelineRuntimeFlags(name, entry);
+	const preferred = isKafka
+		? "plc_status_url"
+		: (isCameraDrift ? "drift_service_url" : null);
+	if (preferred) {
+		return (
+			(entry && entry[preferred])
+			|| (entry && entry.url)
+			|| info[preferred]
+			|| info.url
+			|| ""
+		);
+	}
+	return (entry && entry.url) || info.url || "";
 }
 
 // --- Modals ---
@@ -369,7 +437,7 @@ function setCommandModalFinishedTitle(command, allOk) {
 	$("command_modal_title").textContent = allOk
 		? `${commandLabel(command)} complete`
 		: `${commandLabel(command)} finished with errors`;
-	$("command_modal_hint").textContent = "Pipeline Status refreshes when done";
+	$("command_modal_hint").textContent = "Service Status refreshes when done";
 }
 
 function resultsByPipeline(results) {
@@ -409,6 +477,7 @@ function openAppModal(options) {
 	const {
 		title = "Notice",
 		message = "",
+		bodyHtml = "",
 		mode = "alert",
 		tone = "info",
 		okLabel = "OK",
@@ -421,14 +490,19 @@ function openAppModal(options) {
 		const dialog = modal.querySelector(".overlay__dialog");
 		const cancelBtn = $("app_modal_cancel");
 		const okBtn = $("app_modal_ok");
+		const messageEl = $("app_modal_message");
+		const isHtml = Boolean(bodyHtml);
 
 		$("app_modal_title").textContent = title;
-		const messageEl = $("app_modal_message");
-		messageEl.textContent = message;
-		messageEl.className = `overlay__message overlay__message--${tone}`;
+		messageEl.className = `overlay__message overlay__message--${tone}${isHtml ? " overlay__message--html" : ""}`;
+		if (isHtml) {
+			messageEl.innerHTML = bodyHtml;
+		} else {
+			messageEl.textContent = message;
+		}
 
 		modal.dataset.mode = mode;
-		dialog.classList.toggle("overlay__dialog--confirm", mode === "confirm");
+		dialog.classList.toggle("overlay__dialog--form", isHtml);
 		cancelBtn.hidden = mode !== "confirm";
 		okBtn.textContent = okLabel;
 		cancelBtn.textContent = cancelLabel;
@@ -458,6 +532,72 @@ function showConfirmModal(message, options) {
 		cancelLabel: "Cancel",
 		...(options || {}),
 	}).then((result) => result === true);
+}
+
+function repoLabelForPipeline(name) {
+	const path = (pipelineInfo(name).eg_pipeline_path || "").replace(/\\/g, "/");
+	if (!path) return "";
+	const parts = path.split("/").filter(Boolean);
+	return parts.length ? parts[parts.length - 1] : "";
+}
+
+function updateIncludesSysMonitor(targets) {
+	for (const name of targets) {
+		const info = pipelineInfo(name);
+		if (info.is_sys_monitor || info.sys_monitor_path) return true;
+	}
+	const ips = new Set(
+		targets.map((name) => pipelineInfo(name).server_ip).filter(Boolean),
+	);
+	if (ips.size !== 1) return false;
+	const ip = [...ips][0];
+	return pipelineOrder.some((name) => {
+		const info = pipelineInfo(name);
+		return info.is_sys_monitor && info.server_ip === ip;
+	});
+}
+
+function updateReposForTargets(targets) {
+	const repos = new Set();
+	for (const name of targets) {
+		const info = pipelineInfo(name);
+		if (info.is_sys_monitor) continue;
+		const repo = repoLabelForPipeline(name);
+		if (repo) repos.add(repo);
+	}
+	if (updateIncludesSysMonitor(targets)) repos.add("system_monitor");
+	return [...repos];
+}
+
+function collectUpdateGitRefs() {
+	const refs = {};
+	document.querySelectorAll("#app_modal_message [data-git-ref-repo]").forEach((input) => {
+		const repo = input.getAttribute("data-git-ref-repo");
+		const value = (input.value || "").trim();
+		if (repo && value) refs[repo] = value;
+	});
+	return refs;
+}
+
+function showUpdateConfirmModal(targets) {
+	const rows = updateReposForTargets(targets).map((repo) => `
+		<label class="update-ref-row">
+			<span class="update-ref-repo">${escapeAttr(repo)}</span>
+			<input type="text" class="update-ref-input" data-git-ref-repo="${escapeAttr(repo)}"
+				placeholder="latest (empty)" autocomplete="off" spellcheck="false" />
+		</label>
+	`).join("");
+	return openAppModal({
+		title: "Update",
+		bodyHtml: `
+			<p class="update-ref-lead">Update ${targets.length} service(s)?</p>
+			<p class="update-ref-hint">Optional: set a branch, tag, or commit per repo. Leave empty for latest.</p>
+			<div class="update-ref-list">${rows}</div>
+		`,
+		mode: "confirm",
+		okLabel: "Update",
+		cancelLabel: "Cancel",
+	}).then((result) => (result === true ? collectUpdateGitRefs() : null));
 }
 
 // --- Card sections ---
@@ -588,7 +728,7 @@ function startUpdateModalPolling(targets) {
 	updateFailureNotified = false;
 	updateSeenActive = false;
 	fetchUpdateStatus();
-	updatePollTimer = setInterval(fetchUpdateStatus, UPDATE_POLL_MS);
+	updatePollTimer = setInterval(fetchUpdateStatus, JOB_POLL_MS);
 	startCommandProgressTick();
 }
 
@@ -602,35 +742,56 @@ function mergeUpdateServers(servers) {
 	return { ...lastUpdateServerByIp };
 }
 
+function parseServiceStep(serviceStep) {
+	if (!serviceStep) return { step: "", label: "" };
+	if (typeof serviceStep === "string") return { step: "", label: serviceStep };
+	return {
+		step: serviceStep.step || "",
+		label: serviceStep.label || "",
+	};
+}
+
+function finalizeUpdateEntry(base, { ok, response, error = null }) {
+	const message = error || response || (ok ? "Update complete" : "Update failed");
+	return {
+		...base,
+		status: "done",
+		phase: "done",
+		step: ok ? "done" : "failed",
+		ok,
+		response: message,
+		...(error != null ? { error } : {}),
+	};
+}
+
 function pipelineUpdateResponse(name, serverStatus) {
 	const staticInfo = pipelineInfo(name);
 	const service = staticInfo.service_name || "";
 	const step = serverStatus.step || "";
 	const serviceSteps = serverStatus.service_steps || {};
+	const { step: serviceStepState, label: serviceLabel } = parseServiceStep(serviceSteps[service]);
 
 	if (service && serviceSteps[service]) {
-		const svcStep = serviceSteps[service];
-		const label = typeof svcStep === "string" ? svcStep : (svcStep.label || "");
-		if (label) return label;
+		if (serviceStepState === "failed") {
+			return serviceLabel || "Update failed";
+		}
+		if (serviceLabel) return serviceLabel;
 	}
 
 	if (staticInfo.is_sys_monitor && step.startsWith("sys_monitor")) {
 		return serverStatus.step_label || "Working";
 	}
 
-	const hostLabel = serverStatus.step_label || step || "Working";
-	if (
-		step === "pipeline_build"
-		|| step === "pipeline_restart"
-		|| step === "pipelines_parallel"
-		|| step === "pipelines_restart"
-	) {
+	if (UPDATE_PIPELINE_STEPS.has(step)) {
+		if (serviceStepState === "failed") {
+			return serviceLabel || "Update failed";
+		}
 		return service ? `${service}: waiting` : "Waiting…";
 	}
 	if (!staticInfo.is_sys_monitor && step.startsWith("sys_monitor")) {
 		return serverStatus.step_label || "system_monitor: working";
 	}
-	return hostLabel;
+	return serverStatus.step_label || step || "Working";
 }
 
 function updateStepDetail(text) {
@@ -674,19 +835,61 @@ function updateOverallActiveLabel(serverStatus, order) {
 		}
 	}
 
-	if (step.includes("restart")) return "Pipelines · restarting";
+	if (step.includes("restart")) return "Services · restarting";
 	if (step === "pipeline_build" || step === "pipelines_parallel") {
-		return "Pipelines · building";
+		return "Services · building";
 	}
 	return "Update";
 }
 
-function hostUpdateErrorForService(err, service) {
-	if (!err || !service) return err;
+function hostUpdateErrorForService(err, service, pipelineName) {
+	if (!err) return null;
 	const parts = err.split(/;\s*/).filter(Boolean);
-	if (parts.length <= 1) return err;
-	const match = parts.find((part) => part.startsWith(`${service}:`));
-	return match || err;
+	const repoLabel = repoLabelForPipeline(pipelineName);
+	const matchesService = (part) => {
+		if (service && part.startsWith(`${service}:`)) return true;
+		if (repoLabel && (part.startsWith(`${repoLabel}:`) || part.includes(`${repoLabel}:`))) {
+			return true;
+		}
+		if (pipelineName && part.includes(pipelineName)) return true;
+		return false;
+	};
+	if (parts.length <= 1) {
+		return matchesService(err) ? err : null;
+	}
+	return parts.find(matchesService) || null;
+}
+
+function pipelineServiceStep(serverStatus, serviceName) {
+	if (!serverStatus || !serviceName) return null;
+	const steps = serverStatus.service_steps || {};
+	return steps[serviceName] || null;
+}
+
+function sysMonitorUpdateComplete(name, serverStatus) {
+	if (!pipelineInfo(name).is_sys_monitor || !serverStatus) return false;
+	const step = serverStatus.step || "";
+	if (step === "done" || step === "failed") return true;
+	const service = pipelineInfo(name).service_name || "";
+	const serviceStep = pipelineServiceStep(serverStatus, service);
+	if (!serviceStep || typeof serviceStep === "string") return false;
+	if (serviceStep.step === "failed") return true;
+	if (serviceStep.step !== "done") return false;
+	const label = (serviceStep.label || "").toLowerCase();
+	return label.includes("restarted");
+}
+
+function pipelineUpdateTerminal(name, serverStatus) {
+	if (!serverStatus) return false;
+	const step = serverStatus.step || "";
+	if (step === "done" || step === "failed") return true;
+	if (pipelineInfo(name).is_sys_monitor) {
+		return sysMonitorUpdateComplete(name, serverStatus);
+	}
+	const service = pipelineInfo(name).service_name || "";
+	const serviceStep = pipelineServiceStep(serverStatus, service);
+	if (!serviceStep || typeof serviceStep === "string") return false;
+	return serviceStep.step === "done" || serviceStep.step === "failed";
 }
 
 function pipelineUpdateEntry(name, serverStatus) {
@@ -702,43 +905,54 @@ function pipelineUpdateEntry(name, serverStatus) {
 			response: waiting ? "Connecting…" : "",
 		};
 	}
+
 	const step = serverStatus.step || "";
-	if (step === "done") {
-		return {
-			...base,
-			status: "done",
-			phase: "done",
-			step: "done",
-			ok: true,
-			response: serverStatus.step_label || "Update complete",
-		};
-	}
-	if (step === "failed") {
-		const stepLabel = serverStatus.step_label || "";
-		const err = serverStatus.error || stepLabel || "Update failed";
-		const service = staticInfo.service_name || "";
-		const serviceErr = hostUpdateErrorForService(err, service);
-		let response = serviceErr;
-		if (
-			serviceErr === err
-			&& stepLabel
-			&& !err.includes(name)
-			&& service
-			&& !err.includes(service)
-			&& !staticInfo.is_sys_monitor
-		) {
-			response = `Host update failed (${stepLabel}). ${err}`;
-		}
-		return {
-			...base,
-			status: "done",
-			phase: "done",
-			step: "failed",
+	const service = staticInfo.service_name || "";
+	const serviceStep = pipelineServiceStep(serverStatus, service);
+	const { step: serviceStepState, label: serviceLabel } = parseServiceStep(serviceStep);
+
+	if (serviceStepState === "failed") {
+		return finalizeUpdateEntry(base, {
 			ok: false,
-			response,
-			error: serviceErr,
-		};
+			response: serviceLabel,
+			error: serviceLabel || "Update failed",
+		});
 	}
+
+	if (serviceStepState === "done" && step !== "done" && step !== "failed") {
+		const earlyDone = !staticInfo.is_sys_monitor || sysMonitorUpdateComplete(name, serverStatus);
+		if (earlyDone) {
+			return finalizeUpdateEntry(base, { ok: true, response: serviceLabel });
+		}
+	}
+
+	if (step === "done") {
+		return finalizeUpdateEntry(base, {
+			ok: true,
+			response: serviceLabel || serverStatus.step_label || "Update complete",
+		});
+	}
+
+	if (step === "failed") {
+		if (serviceStepState === "done") {
+			return finalizeUpdateEntry(base, { ok: true, response: serviceLabel });
+		}
+		const err = serverStatus.error || serverStatus.step_label || "Update failed";
+		const serviceErr = hostUpdateErrorForService(err, service, name)
+			|| (serviceStepState === "failed" ? (serviceLabel || "Update failed") : null);
+		if (!serviceErr) {
+			return finalizeUpdateEntry(base, {
+				ok: true,
+				response: serviceLabel || "Update complete",
+			});
+		}
+		return finalizeUpdateEntry(base, {
+			ok: false,
+			response: serviceErr,
+			error: serviceErr,
+		});
+	}
+
 	const elapsed = Math.max(0, Number(serverStatus.elapsed_sec) || 0);
 	return {
 		...base,
@@ -773,19 +987,39 @@ function isUpdateModalComplete(data) {
 		updateSeenActive = true;
 	}
 	if (!updateSeenActive) return false;
+
+	const byPipeline = buildUpdateByPipeline(activeUpdateTargets, servers);
+	const allTargetsDone = activeUpdateTargets.every((name) => {
+		const entry = byPipeline[name];
+		if (!entry || entry.status !== "done") return false;
+		if (pipelineInfo(name).is_sys_monitor) {
+			const ip = pipelineInfo(name).server_ip || "";
+			return sysMonitorUpdateComplete(name, servers[ip]);
+		}
+		return true;
+	});
+	if (allTargetsDone) return true;
+
 	const ips = uniqueHostIps(activeUpdateTargets, true);
 	if (!ips.length) return true;
 	for (const ip of ips) {
 		const status = servers[ip];
 		if (!status) return false;
-		if (status.step !== "done" && status.step !== "failed") return false;
+		if (status.step === "done" || status.step === "failed") continue;
+		const hostTargets = activeUpdateTargets.filter(
+			(name) => (pipelineInfo(name).server_ip || "") === ip,
+		);
+		if (!hostTargets.every((name) => pipelineUpdateTerminal(name, status))) {
+			return false;
+		}
 	}
 	return true;
 }
 
 function renderUpdateModalProgress(data, nowMs) {
 	if (!activeUpdateTargets || !activeUpdateTargets.length) return;
-	const byPipeline = buildUpdateByPipeline(activeUpdateTargets, data.servers || {});
+	const servers = mergeUpdateServers(data.servers || {});
+	const byPipeline = buildUpdateByPipeline(activeUpdateTargets, servers);
 	const results = activeUpdateTargets.map((name) => byPipeline[name]);
 	const allDone = isUpdateModalComplete(data);
 	renderCommandJobProgress(
@@ -793,7 +1027,7 @@ function renderUpdateModalProgress(data, nowMs) {
 		{ done: allDone, results },
 		activeUpdateTargets,
 		nowMs || Date.now(),
-		mergeUpdateServers((data && data.servers) || {}),
+		servers,
 	);
 }
 
@@ -837,7 +1071,7 @@ function scheduleFastPoll() {
 	if (fastPollTimer) return;
 	fastPollTimer = setInterval(function () {
 		fetchStatus(false);
-	}, SERVICE_POLL_MS);
+	}, JOB_POLL_MS);
 }
 
 function stopFastPoll() {
@@ -943,7 +1177,7 @@ function showPingModal(host, state, detail, openUrl) {
 }
 
 function setCameraLiveImageVisible(visible) {
-	$("camera_live_img").classList.toggle("is-hidden", !visible);
+	$("camera_live_img").classList.toggle("hidden", !visible);
 }
 
 function stopCameraLiveStream() {
@@ -961,6 +1195,971 @@ function closeCameraLive() {
 	setOverlayVisible($("camera_live_modal"), false);
 }
 
+function closePlcTagModal() {
+	setOverlayVisible($("plc_tag_modal"), false);
+}
+
+let driftImagesState = null;
+
+function closeDriftImagesModal() {
+	driftImagesState = null;
+	const beforeImg = $("drift_images_before");
+	const afterImg = $("drift_images_after");
+	const overlayImg = $("drift_images_overlay");
+	if (beforeImg) {
+		beforeImg.onload = null;
+		beforeImg.onerror = null;
+		beforeImg.removeAttribute("src");
+		beforeImg.dataset.driftUrl = "";
+	}
+	if (afterImg) {
+		afterImg.onload = null;
+		afterImg.onerror = null;
+		afterImg.removeAttribute("src");
+		afterImg.dataset.driftUrl = "";
+	}
+	if (overlayImg) overlayImg.removeAttribute("src");
+	clearDriftShiftArrow();
+	renderDriftHint(null);
+	renderDriftOverlay(null);
+	renderDriftRawMetrics(null);
+	setDriftResetVisible(false);
+	setOverlayVisible($("drift_images_modal"), false);
+}
+
+const DRIFT_I18N = {
+	en: {
+		overlayCaption: "Explanation",
+		before: "Before",
+		after: "After",
+		beforeEmpty: "No before image",
+		afterEmpty: "No after image",
+		threshold: "threshold",
+		matches: "matches",
+		fpHigh: "High false-positive risk",
+		fpMed: "Possible false positive",
+		fpNote: "Note",
+		loading: "Loading…",
+		unavailable: "Camera drift images unavailable",
+		notFound: "No drift images found",
+		failed: "Failed to load drift images",
+		timeout: "Timed out loading drift images",
+		title: "Drift Images",
+		reset: "Reset",
+	},
+	ko: {
+		fpHigh: "오탐 가능성 높음",
+		fpMed: "오탐 가능성 있음",
+		fpNote: "참고",
+	},
+};
+
+function uiLang() {
+	const raw = String(
+		(typeof navigator !== "undefined" && (navigator.language || navigator.userLanguage)) || "en",
+	).toLowerCase();
+	return raw.startsWith("ko") ? "ko" : "en";
+}
+
+function driftT(key) {
+	// Chrome labels stay English; hint banner follows browser language.
+	return DRIFT_I18N.en[key] || key;
+}
+
+function driftHintT(key) {
+	const lang = uiLang();
+	return (DRIFT_I18N[lang] && DRIFT_I18N[lang][key])
+		|| DRIFT_I18N.en[key]
+		|| key;
+}
+
+function applyDriftImagesStaticI18n() {
+	const overlayCap = $("drift_images_overlay_caption");
+	if (overlayCap) overlayCap.textContent = driftT("overlayCaption");
+	const beforeEmpty = $("drift_images_before_empty");
+	if (beforeEmpty) beforeEmpty.textContent = driftT("beforeEmpty");
+	const afterEmpty = $("drift_images_after_empty");
+	if (afterEmpty) afterEmpty.textContent = driftT("afterEmpty");
+	const beforeImg = $("drift_images_before");
+	if (beforeImg) beforeImg.alt = driftT("before");
+	const afterImg = $("drift_images_after");
+	if (afterImg) afterImg.alt = driftT("after");
+}
+
+function driftImagesProxyUrl(side, camUid, pipeline, cacheBust) {
+	const base = urls.cameraDriftImages;
+	if (!base) return "";
+	const params = new URLSearchParams({
+		pipeline: pipeline || "",
+		cam_uid: camUid || "",
+		lang: uiLang(),
+	});
+	if (cacheBust != null && cacheBust !== "") {
+		params.set("_", String(cacheBust));
+	}
+	return `${base}/${encodeURIComponent(side)}?${params.toString()}`;
+}
+
+function setDriftSideImage(side, url) {
+	const img = $(`drift_images_${side}`);
+	const empty = $(`drift_images_${side}_empty`);
+	if (!img || !empty) return;
+	if (!url) {
+		img.onload = null;
+		img.onerror = null;
+		img.removeAttribute("src");
+		img.dataset.driftUrl = "";
+		img.classList.add("hidden");
+		empty.classList.remove("hidden");
+		return;
+	}
+	// Skip restarting a download already in flight / completed for the same URL.
+	if (img.dataset.driftUrl === url && (img.complete || img.getAttribute("src"))) {
+		empty.classList.add("hidden");
+		img.classList.remove("hidden");
+		return;
+	}
+	empty.classList.add("hidden");
+	img.classList.remove("hidden");
+	img.dataset.driftUrl = url;
+	img.src = url;
+}
+
+function clearDriftPairImages() {
+	setDriftSideImage("before", "");
+	setDriftSideImage("after", "");
+	const overlayImg = $("drift_images_overlay");
+	if (overlayImg) overlayImg.removeAttribute("src");
+	const grid = $("drift_images_grid");
+	if (grid) grid.hidden = true;
+	clearDriftShiftArrow();
+	renderDriftOverlay(null);
+}
+
+function isDriftCameraTag(tag) {
+	const value = String((tag && tag.value) || "").trim().toLowerCase();
+	return value === "drift" || (tag && tag.health === "err" && value !== "ok");
+}
+
+function prefetchDriftPairImages(camUid, pipeline, cacheBust) {
+	const beforeUrl = driftImagesProxyUrl("before", camUid, pipeline, cacheBust);
+	const afterUrl = driftImagesProxyUrl("after", camUid, pipeline, cacheBust);
+	setDriftPanelCaption("before", null, driftT("before"));
+	setDriftPanelCaption("after", null, driftT("after"));
+	$("drift_images_grid").hidden = false;
+	setDriftSideImage("before", beforeUrl);
+	setDriftSideImage("after", afterUrl);
+}
+
+/** Browser local TZ label: KST / UTC / UTC±N */
+function browserTzLabel() {
+	const offsetMin = -new Date().getTimezoneOffset();
+	if (offsetMin === 9 * 60) return "KST";
+	if (offsetMin === 0) return "UTC";
+	const sign = offsetMin >= 0 ? "+" : "-";
+	const abs = Math.abs(offsetMin);
+	const h = Math.floor(abs / 60);
+	const m = abs % 60;
+	return m ? `UTC${sign}${h}:${String(m).padStart(2, "0")}` : `UTC${sign}${h}`;
+}
+
+function pad2(v) {
+	return String(v).padStart(2, "0");
+}
+
+/** Format a Date in the browser local timezone with a UTC/KST label. */
+function formatDateTimeLocal(date, { withSeconds = false } = {}) {
+	if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
+	const datePart = [
+		date.getFullYear(),
+		pad2(date.getMonth() + 1),
+		pad2(date.getDate()),
+	].join("-");
+	let timePart = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+	if (withSeconds) timePart += `:${pad2(date.getSeconds())}`;
+	return `${datePart} ${timePart} (${browserTzLabel()})`;
+}
+
+function formatEpochSecondsLocal(sec, opts) {
+	const n = Number(sec);
+	if (!Number.isFinite(n) || n <= 0) return "";
+	return formatDateTimeLocal(new Date(n * 1000), opts);
+}
+
+function formatEpochMsLocal(ms, opts) {
+	const n = Number(ms);
+	if (!Number.isFinite(n) || n <= 0) return "";
+	return formatDateTimeLocal(new Date(n), opts);
+}
+
+function formatDriftBatchLabel(batchName) {
+	const raw = String(batchName || "").trim();
+	if (!raw) return "";
+	// Edge batch names are UTC wall clock: 2026-07-21__17-48-58
+	const match = raw.match(/^(\d{4}-\d{2}-\d{2})__(\d{2})-(\d{2})(?:-(\d{2}))?/);
+	if (match) {
+		const sec = match[4] || "00";
+		const d = new Date(`${match[1]}T${match[2]}:${match[3]}:${sec}Z`);
+		if (!Number.isNaN(d.getTime())) return formatDateTimeLocal(d);
+	}
+	return raw.replace(/__/g, " ");
+}
+
+function setDriftPanelCaption(side, sideInfo, fallbackLabel) {
+	const el = $(`drift_images_${side}_caption`);
+	if (!el) return;
+	const when = formatDriftBatchLabel(sideInfo && sideInfo.batch_name);
+	el.textContent = when ? `${fallbackLabel}  ·  ${when}` : fallbackLabel;
+}
+
+function formatDriftMetricValue(value) {
+	if (value == null || value === "") return "—";
+	const n = Number(value);
+	if (!Number.isFinite(n)) return String(value);
+	return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+function splitDriftHintSentences(text) {
+	return String(text || "")
+		.split(/(?<=[.。!?])\s+/)
+		.map((part) => part.trim())
+		.filter(Boolean);
+}
+
+function highlightDriftHintSentence(text) {
+	return escapeHtml(text).replace(
+		/(\d+(?:\.\d+)?\s*px)/gi,
+		"<strong>$1</strong>",
+	);
+}
+
+function renderDriftHint(meta) {
+	const box = $("drift_images_hint");
+	const titleEl = $("drift_images_hint_title");
+	const listEl = $("drift_images_hint_list");
+	if (!box || !titleEl || !listEl) return;
+	const hint = meta && meta.false_positive_hint;
+	if (!hint) {
+		box.hidden = true;
+		titleEl.textContent = "";
+		listEl.innerHTML = "";
+		box.classList.remove("drift-images-hint--risk", "drift-images-hint--ok");
+		return;
+	}
+	const risk = Boolean(meta.false_positive_risk);
+	const conf = String(meta.confidence || "").toLowerCase();
+	const label = risk
+		? (conf === "low" ? driftHintT("fpHigh") : driftHintT("fpMed"))
+		: driftHintT("fpNote");
+	const sentences = splitDriftHintSentences(hint);
+	box.classList.toggle("drift-images-hint--risk", risk);
+	box.classList.toggle("drift-images-hint--ok", !risk);
+	titleEl.textContent = label;
+	listEl.innerHTML = sentences
+		.map((sentence) => `<li>${highlightDriftHintSentence(sentence)}</li>`)
+		.join("");
+	box.hidden = false;
+}
+
+let driftArrowResizeObserver = null;
+
+function clearDriftShiftArrow() {
+	["drift_images_before_points", "drift_images_after_arrow"].forEach((id) => {
+		const canvas = $(id);
+		if (!canvas) return;
+		const ctx = canvas.getContext && canvas.getContext("2d");
+		if (ctx) ctx.clearRect(0, 0, canvas.width || 0, canvas.height || 0);
+		canvas.classList.add("is-hidden");
+	});
+	if (driftArrowResizeObserver) {
+		driftArrowResizeObserver.disconnect();
+		driftArrowResizeObserver = null;
+	}
+}
+
+function scheduleDriftShiftArrow(meta, attempt = 0) {
+	requestAnimationFrame(() => {
+		requestAnimationFrame(() => {
+			const ok = drawDriftMatchOverlays(meta);
+			if (!ok && attempt < 8) {
+				setTimeout(() => scheduleDriftShiftArrow(meta, attempt + 1), 50 * (attempt + 1));
+			}
+		});
+	});
+}
+
+function prepareDriftOverlayCanvas(img, canvas) {
+	if (!img || !canvas || img.classList.contains("hidden")) return null;
+	if (!img.complete || !img.naturalWidth || !img.naturalHeight) return null;
+	const media = img.closest ? img.closest(".drift-images-media") : null;
+	const mediaRect = (media || img).getBoundingClientRect();
+	const imgRect = img.getBoundingClientRect();
+	const w = Math.max(1, Math.round(imgRect.width));
+	const h = Math.max(1, Math.round(imgRect.height));
+	if (w < 8 || h < 8) return null;
+	const left = Math.round(imgRect.left - mediaRect.left);
+	const top = Math.round(imgRect.top - mediaRect.top);
+	canvas.style.left = `${left}px`;
+	canvas.style.top = `${top}px`;
+	canvas.style.width = `${w}px`;
+	canvas.style.height = `${h}px`;
+	const dpr = window.devicePixelRatio || 1;
+	canvas.width = Math.round(w * dpr);
+	canvas.height = Math.round(h * dpr);
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return null;
+	ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+	ctx.clearRect(0, 0, w, h);
+	const nw = img.naturalWidth;
+	const nh = img.naturalHeight;
+	const scale = Math.min(w / nw, h / nh);
+	const drawW = nw * scale;
+	const drawH = nh * scale;
+	const ox = (w - drawW) / 2;
+	const oy = (h - drawH) / 2;
+	return { ctx, w, h, scale, ox, oy, drawW, drawH, media };
+}
+
+function mapDriftPoint(layout, x, y) {
+	return {
+		x: layout.ox + Number(x) * layout.scale,
+		y: layout.oy + Number(y) * layout.scale,
+	};
+}
+
+function drawDriftMatchOverlays(meta) {
+	const beforeImg = $("drift_images_before");
+	const afterImg = $("drift_images_after");
+	const beforeCanvas = $("drift_images_before_points");
+	const afterCanvas = $("drift_images_after_arrow");
+	if (!meta || !afterImg || !afterCanvas) {
+		clearDriftShiftArrow();
+		return false;
+	}
+
+	const points = Array.isArray(meta.match_points) ? meta.match_points : [];
+	const afterLayout = prepareDriftOverlayCanvas(afterImg, afterCanvas);
+	if (!afterLayout) return false;
+
+	const beforeLayout = (beforeImg && beforeCanvas && !beforeImg.classList.contains("hidden"))
+		? prepareDriftOverlayCanvas(beforeImg, beforeCanvas)
+		: null;
+
+	const dx = Number(meta.delta_x != null ? meta.delta_x : meta.delta_x_display);
+	const dy = Number(meta.delta_y != null ? meta.delta_y : meta.delta_y_display);
+
+	// Draw all judgment match points.
+	if (points.length) {
+		for (const p of points) {
+			const x0 = Number(p.x0);
+			const y0 = Number(p.y0);
+			const x1 = Number(p.x1);
+			const y1 = Number(p.y1);
+			if (![x0, y0, x1, y1].every(Number.isFinite)) continue;
+
+			if (beforeLayout) {
+				const a = mapDriftPoint(beforeLayout, x0, y0);
+				beforeLayout.ctx.fillStyle = "rgba(80, 220, 255, 0.95)";
+				beforeLayout.ctx.beginPath();
+				beforeLayout.ctx.arc(a.x, a.y, 3.2, 0, Math.PI * 2);
+				beforeLayout.ctx.fill();
+			}
+
+			const b = mapDriftPoint(afterLayout, x1, y1);
+			const aOnAfter = mapDriftPoint(afterLayout, x0, y0);
+			afterLayout.ctx.strokeStyle = "rgba(0, 255, 120, 0.55)";
+			afterLayout.ctx.lineWidth = 1.2;
+			afterLayout.ctx.beginPath();
+			afterLayout.ctx.moveTo(aOnAfter.x, aOnAfter.y);
+			afterLayout.ctx.lineTo(b.x, b.y);
+			afterLayout.ctx.stroke();
+			afterLayout.ctx.fillStyle = "rgba(255, 80, 80, 0.95)";
+			afterLayout.ctx.beginPath();
+			afterLayout.ctx.arc(b.x, b.y, 3.2, 0, Math.PI * 2);
+			afterLayout.ctx.fill();
+		}
+		if (beforeLayout) {
+			beforeCanvas.classList.remove("is-hidden");
+		}
+	}
+
+	// Median summary arrow: direction from Δx/Δy; keep subtle vs match overlays.
+	if (Number.isFinite(dx) && Number.isFinite(dy) && (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6)) {
+		const ctx = afterLayout.ctx;
+		const mag = Math.hypot(dx, dy) || 1;
+		const ux = dx / mag;
+		const uy = dy / mag;
+		const maxLen = Math.min(afterLayout.drawW, afterLayout.drawH) * 0.2;
+		const len = Math.max(56, Math.min(96, maxLen));
+		const headLen = Math.max(12, len * 0.26);
+		const headHalf = headLen * 0.48;
+		const pad = headLen + 10;
+
+		let cx = afterLayout.ox + afterLayout.drawW / 2;
+		let cy = afterLayout.oy + afterLayout.drawH / 2;
+		let ex = cx + ux * len;
+		let ey = cy + uy * len;
+
+		const minX = afterLayout.ox + pad;
+		const maxX = afterLayout.ox + afterLayout.drawW - pad;
+		const minY = afterLayout.oy + pad;
+		const maxY = afterLayout.oy + afterLayout.drawH - pad;
+		if (ex < minX) { cx += minX - ex; ex = minX; }
+		if (ex > maxX) { cx -= ex - maxX; ex = maxX; }
+		if (ey < minY) { cy += minY - ey; ey = minY; }
+		if (ey > maxY) { cy -= ey - maxY; ey = maxY; }
+
+		const angle = Math.atan2(uy, ux);
+		const shaftEx = ex - ux * (headLen * 0.8);
+		const shaftEy = ey - uy * (headLen * 0.8);
+		const leftX = ex - headLen * Math.cos(angle) + headHalf * Math.cos(angle + Math.PI / 2);
+		const leftY = ey - headLen * Math.sin(angle) + headHalf * Math.sin(angle + Math.PI / 2);
+		const rightX = ex - headLen * Math.cos(angle) + headHalf * Math.cos(angle - Math.PI / 2);
+		const rightY = ey - headLen * Math.sin(angle) + headHalf * Math.sin(angle - Math.PI / 2);
+
+		ctx.save();
+		ctx.globalAlpha = 0.82;
+		ctx.strokeStyle = "rgba(255, 120, 90, 0.9)";
+		ctx.fillStyle = "rgba(255, 120, 90, 0.9)";
+		ctx.lineWidth = 2.4;
+		ctx.lineCap = "round";
+		ctx.lineJoin = "round";
+		ctx.beginPath();
+		ctx.moveTo(cx, cy);
+		ctx.lineTo(shaftEx, shaftEy);
+		ctx.stroke();
+		ctx.beginPath();
+		ctx.moveTo(ex, ey);
+		ctx.lineTo(leftX, leftY);
+		ctx.lineTo(rightX, rightY);
+		ctx.closePath();
+		ctx.fill();
+
+		ctx.beginPath();
+		ctx.arc(cx, cy, 4.5, 0, Math.PI * 2);
+		ctx.fillStyle = "rgba(255, 220, 120, 0.95)";
+		ctx.fill();
+		ctx.lineWidth = 1;
+		ctx.strokeStyle = "rgba(40, 40, 40, 0.55)";
+		ctx.stroke();
+
+		const dist = Number(
+			meta.distance_display != null ? meta.distance_display : meta.distance,
+		);
+		const distTxt = Number.isFinite(dist) ? `${Math.round(dist)}px` : "";
+		const label = [
+			distTxt,
+			`dx ${Math.round(dx)}`,
+			`dy ${Math.round(dy)}`,
+		].filter(Boolean).join("  ");
+		if (label) {
+			ctx.globalAlpha = 0.9;
+			ctx.font = "600 11px sans-serif";
+			ctx.textBaseline = "bottom";
+			const tx = Math.min(
+				afterLayout.ox + afterLayout.drawW - 8,
+				Math.max(afterLayout.ox + 8, cx + 8),
+			);
+			const ty = Math.max(afterLayout.oy + 14, cy - 8);
+			ctx.lineWidth = 2.5;
+			ctx.strokeStyle = "rgba(0,0,0,0.45)";
+			ctx.strokeText(label, tx, ty);
+			ctx.fillStyle = "rgba(255, 230, 170, 0.95)";
+			ctx.fillText(label, tx, ty);
+		}
+		ctx.restore();
+	}
+
+	afterCanvas.classList.remove("is-hidden");
+	afterCanvas.removeAttribute("hidden");
+
+	const observeTarget = afterLayout.media
+		|| (beforeLayout && beforeLayout.media)
+		|| afterImg;
+	if (!driftArrowResizeObserver && typeof ResizeObserver !== "undefined" && observeTarget) {
+		driftArrowResizeObserver = new ResizeObserver(() => {
+			if (!driftImagesState || !driftImagesState.meta) return;
+			drawDriftMatchOverlays(driftImagesState.meta);
+		});
+		driftArrowResizeObserver.observe(observeTarget);
+	}
+	return true;
+}
+
+function renderDriftOverlay(meta) {
+	const wrap = $("drift_images_overlay_wrap");
+	const img = $("drift_images_overlay");
+	if (!wrap || !img) return;
+	// Prefer the before/after pair; only show baked overlay as fallback.
+	const hasPair = Boolean(
+		meta && ((meta.before && meta.before.available) || (meta.after && meta.after.available)),
+	);
+	if (hasPair || !meta || !meta.overlay || !meta.overlay.available) {
+		img.removeAttribute("src");
+		wrap.hidden = true;
+		return;
+	}
+	const url = driftImagesProxyUrl(
+		"overlay",
+		driftImagesState && driftImagesState.camUid,
+		driftImagesState && driftImagesState.pipeline,
+		driftImagesState && driftImagesState.cacheBust,
+	);
+	if (!url) {
+		img.removeAttribute("src");
+		wrap.hidden = true;
+		return;
+	}
+	img.src = url;
+	wrap.hidden = false;
+}
+
+function renderDriftRawMetrics(meta) {
+	const box = $("drift_images_metrics");
+	if (!box) return;
+	if (!meta) {
+		box.hidden = true;
+		box.innerHTML = "";
+		return;
+	}
+	const dist = formatDriftMetricValue(
+		meta.distance_display != null ? meta.distance_display : meta.distance,
+	);
+	const dx = formatDriftMetricValue(
+		meta.delta_x_display != null ? meta.delta_x_display : meta.delta_x,
+	);
+	const dy = formatDriftMetricValue(
+		meta.delta_y_display != null ? meta.delta_y_display : meta.delta_y,
+	);
+	const thr = formatDriftMetricValue(meta.threshold);
+	const matchCount = Number(meta.match_points_count || (meta.match_points && meta.match_points.length) || 0);
+	const bits = [
+		`<span>distance <strong>${escapeHtml(dist)}px</strong></span>`,
+		`<span>${escapeHtml(driftT("threshold"))} <strong>${escapeHtml(thr)}px</strong></span>`,
+		`<span>Δx <strong>${escapeHtml(dx)}px</strong></span>`,
+		`<span>Δy <strong>${escapeHtml(dy)}px</strong></span>`,
+	];
+	if (matchCount > 0) {
+		bits.push(`<span>${escapeHtml(driftT("matches"))} <strong>${escapeHtml(String(matchCount))}</strong></span>`);
+	}
+	box.innerHTML = bits.join("");
+	box.hidden = false;
+}
+
+function setDriftResetVisible(visible) {
+	const footer = $("drift_images_footer");
+	const btn = $("drift_images_reset");
+	if (footer) footer.hidden = !visible;
+	if (btn) {
+		btn.disabled = false;
+		btn.textContent = driftT("reset");
+	}
+}
+
+function renderDriftImagesPair() {
+	if (!driftImagesState || !driftImagesState.meta) return;
+	const { pipeline, camUid, meta, cacheBust } = driftImagesState;
+	const before = meta.before;
+	const after = meta.after;
+
+	renderDriftHint(meta);
+	renderDriftRawMetrics(meta);
+	renderDriftOverlay(meta);
+	setDriftPanelCaption("before", before, driftT("before"));
+	setDriftPanelCaption("after", after, driftT("after"));
+	setDriftResetVisible(Boolean(camUid));
+
+	const beforeImg = $("drift_images_before");
+	const afterImg = $("drift_images_after");
+	const onOverlayReady = () => {
+		if (!driftImagesState || driftImagesState.camUid !== camUid) return;
+		scheduleDriftShiftArrow(meta);
+	};
+	if (beforeImg) beforeImg.onload = onOverlayReady;
+	if (afterImg) afterImg.onload = onOverlayReady;
+
+	const beforeUrl = before && before.available
+		? driftImagesProxyUrl("before", camUid, pipeline, cacheBust)
+		: "";
+	const afterUrl = after && after.available
+		? driftImagesProxyUrl("after", camUid, pipeline, cacheBust)
+		: "";
+
+	if (before && before.available) {
+		setDriftSideImage("before", beforeUrl);
+	} else {
+		setDriftSideImage("before", "");
+	}
+	if (after && after.available) {
+		setDriftSideImage("after", afterUrl);
+	} else {
+		setDriftSideImage("after", "");
+	}
+
+	const grid = $("drift_images_grid");
+	if (grid) {
+		grid.hidden = !(beforeUrl || afterUrl);
+	}
+	if (beforeUrl || afterUrl) {
+		scheduleDriftShiftArrow(meta);
+	} else {
+		clearDriftShiftArrow();
+	}
+}
+
+function openDriftImagesModal({ camUid, pipeline, title }) {
+	const uid = String(camUid || "").trim();
+	if (!uid || !urls.cameraDriftImages) {
+		showAlertModal(driftT("unavailable"));
+		return;
+	}
+	applyDriftImagesStaticI18n();
+	const cacheBust = Date.now();
+	driftImagesState = {
+		camUid: uid,
+		pipeline: pipeline || "",
+		title: title || driftT("title"),
+		meta: null,
+		cacheBust,
+		loadId: (driftImagesState && driftImagesState.loadId || 0) + 1,
+	};
+	const loadId = driftImagesState.loadId;
+	$("drift_images_title").textContent = driftImagesState.title;
+	$("drift_images_status").hidden = false;
+	$("drift_images_status").textContent = driftT("loading");
+	renderDriftHint(null);
+	renderDriftRawMetrics(null);
+	clearDriftPairImages();
+	setDriftResetVisible(false);
+	setOverlayVisible($("drift_images_modal"), true);
+
+	// Prefetch while meta computes; cache-bust avoids post-reset stale PNGs.
+	prefetchDriftPairImages(uid, driftImagesState.pipeline, cacheBust);
+
+	const params = new URLSearchParams({
+		pipeline: driftImagesState.pipeline,
+		cam_uid: uid,
+		lang: uiLang(),
+	});
+	fetchJsonGet(`${urls.cameraDriftImages}?${params.toString()}`, (data) => {
+		if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+		if (!data || data.ok === false) {
+			$("drift_images_status").textContent =
+				(data && data.error) || driftT("notFound");
+			clearDriftPairImages();
+			setDriftResetVisible(Boolean(uid));
+			return;
+		}
+		driftImagesState.meta = data;
+		const hasImage = Boolean(
+			(data.before && data.before.available)
+			|| (data.after && data.after.available)
+			|| (data.overlay && data.overlay.available),
+		);
+		if (!hasImage) {
+			$("drift_images_status").textContent = driftT("notFound");
+			clearDriftPairImages();
+			renderDriftHint(data);
+			renderDriftRawMetrics(data);
+			setDriftResetVisible(true);
+			return;
+		}
+		$("drift_images_status").hidden = true;
+		renderDriftImagesPair();
+	}, {
+		timeout: 20000,
+		onerror() {
+			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+			$("drift_images_status").textContent = driftT("failed");
+			clearDriftPairImages();
+			setDriftResetVisible(Boolean(uid));
+		},
+		ontimeout() {
+			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+			$("drift_images_status").textContent = driftT("timeout");
+			clearDriftPairImages();
+			setDriftResetVisible(Boolean(uid));
+		},
+	});
+}
+
+const PLC_TAG_META_KEYS = new Set([
+	"timestamp",
+	"everguard_srvtime",
+	"stale",
+	"stale_after_ms",
+	"updated_at_ms",
+]);
+
+function formatPlcUpdatedAt(ms) {
+	const formatted = formatEpochMsLocal(ms, { withSeconds: true });
+	if (!formatted) return "—";
+	// Keep previous PLC meta style: dots between date parts.
+	return formatted.replace(/^(\d{4})-(\d{2})-(\d{2}) /, "$1.$2.$3 ");
+}
+
+function plcTagStatusFromMeta(meta) {
+	if (!meta || typeof meta !== "object") return null;
+	const raw = String(meta.status || "").trim().toUpperCase();
+	if (raw === "OK" || raw === "WARN" || raw === "ERROR" || raw === "ERR") {
+		return raw === "ERR" ? "ERROR" : raw;
+	}
+	// Legacy edge payloads used boolean `stale`.
+	if (meta.stale != null) return meta.stale ? "WARN" : "OK";
+	return null;
+}
+
+function normalizePlcTagModalPayload(tags, meta) {
+	const nextMeta = meta && typeof meta === "object" ? { ...meta } : {};
+	const filtered = [];
+	for (const tag of Array.isArray(tags) ? tags : []) {
+		const name = String(tag?.name || "");
+		const key = name.toLowerCase();
+		if (key === "stale") {
+			if (plcTagStatusFromMeta(nextMeta) == null) {
+				nextMeta.status = String(tag.value).toLowerCase() === "true" ? "WARN" : "OK";
+			}
+			delete nextMeta.stale;
+			continue;
+		}
+		if (key === "status" && plcTagStatusFromMeta(nextMeta) == null) {
+			const v = String(tag.value || "").trim().toUpperCase();
+			if (v === "OK" || v === "WARN" || v === "ERROR" || v === "ERR") {
+				nextMeta.status = v === "ERR" ? "ERROR" : v;
+			}
+			continue;
+		}
+		if (key === "updated_at_ms") {
+			if (nextMeta.updated_at_ms == null) {
+				const n = Number(tag.value);
+				if (Number.isFinite(n) && n > 0) nextMeta.updated_at_ms = n;
+			}
+			continue;
+		}
+		if (PLC_TAG_META_KEYS.has(key) || /(_nifitime|_srctime|_srvtime)$/i.test(name)) {
+			continue;
+		}
+		filtered.push(tag);
+	}
+	const status = plcTagStatusFromMeta(nextMeta);
+	if (status) nextMeta.status = status;
+	delete nextMeta.stale;
+	return { tags: filtered, meta: nextMeta };
+}
+
+function renderPlcTagMeta(meta) {
+	const box = $("plc_tag_modal_meta");
+	if (!box) return;
+	const status = plcTagStatusFromMeta(meta);
+	const hasDriftCounts = meta
+		&& meta.total != null
+		&& meta.drifted != null;
+	const hasUpdated = meta && meta.updated_at_ms != null;
+	if (!meta || (status == null && !hasDriftCounts && !hasUpdated)) {
+		box.hidden = true;
+		box.innerHTML = "";
+		return;
+	}
+	const statusClass =
+		status === "ERROR" ? "is-error" : status === "WARN" ? "is-warn" : "is-ok";
+	const rows = [];
+	if (meta.group) {
+		rows.push(`
+		<div class="plc-tag-meta-row">
+			<span class="plc-tag-meta-label">Group</span>
+			<span class="plc-tag-meta-value">${escapeHtml(String(meta.group))}</span>
+		</div>`);
+	}
+	if (status) {
+		rows.push(`
+		<div class="plc-tag-meta-row">
+			<span class="plc-tag-meta-label">Status</span>
+			<span class="plc-tag-meta-value plc-tag-meta-status ${statusClass}">${escapeHtml(status)}</span>
+		</div>`);
+	}
+	if (hasDriftCounts) {
+		rows.push(`
+		<div class="plc-tag-meta-row">
+			<span class="plc-tag-meta-label">Drifted</span>
+			<span class="plc-tag-meta-value">${escapeHtml(String(meta.drifted))} / ${escapeHtml(String(meta.total))}</span>
+		</div>`);
+	}
+	if (meta.online != null && meta.total != null) {
+		rows.push(`
+		<div class="plc-tag-meta-row">
+			<span class="plc-tag-meta-label">Online</span>
+			<span class="plc-tag-meta-value">${escapeHtml(String(meta.online))} / ${escapeHtml(String(meta.total))}</span>
+		</div>`);
+	}
+	if (hasUpdated) {
+		rows.push(`
+		<div class="plc-tag-meta-row">
+			<span class="plc-tag-meta-label">Last update</span>
+			<span class="plc-tag-meta-value">${escapeHtml(formatPlcUpdatedAt(meta.updated_at_ms))}</span>
+		</div>`);
+	}
+	box.hidden = false;
+	box.innerHTML = rows.join("");
+}
+
+let plcTagModalState = null;
+
+function renderPlcTagValue(tag) {
+	const value = tag.value != null ? String(tag.value) : "";
+	const lower = value.toLowerCase();
+	let display = value;
+	let tone = "unknown";
+	if (lower === "true" || lower === "false") {
+		display = lower === "true" ? "TRUE" : "FALSE";
+		tone = lower === "true" ? "ok" : "idle";
+	} else if (tag.health === "err" || lower === "error" || lower === "drift") {
+		tone = "err";
+		if (lower === "drift") display = "DRIFT";
+	} else if (lower === "ok") {
+		tone = "ok";
+		display = "OK";
+	}
+	return `<span class="device-chip device-chip--tag chip-${tone}">${escapeHtml(display)}</span>`;
+}
+
+function ipv4SortKeyFromText(text) {
+	const match = String(text || "").match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/);
+	if (!match) return [1, 999, 999, 999, 999, String(text || "")];
+	const parts = match[1].split(".").map((part) => Number(part));
+	if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+		return [1, 999, 999, 999, 999, String(text || "")];
+	}
+	return [0, ...parts, String(text || "")];
+}
+
+function compareDriftCameraTags(a, b) {
+	const aDrift = String(a?.value || "").toLowerCase() === "drift" ? 0 : 1;
+	const bDrift = String(b?.value || "").toLowerCase() === "drift" ? 0 : 1;
+	if (aDrift !== bDrift) return aDrift - bDrift;
+	const aKey = ipv4SortKeyFromText(a?.name);
+	const bKey = ipv4SortKeyFromText(b?.name);
+	for (let i = 0; i < aKey.length; i += 1) {
+		if (aKey[i] < bKey[i]) return -1;
+		if (aKey[i] > bKey[i]) return 1;
+	}
+	return 0;
+}
+
+function openPlcTagModal({ title, url, tags, meta, pipeline }) {
+	const normalized = normalizePlcTagModalPayload(tags, meta);
+	let list = normalized.tags;
+	const trueN = list.filter((t) => String(t.value).toLowerCase() === "true").length;
+	const falseN = list.filter((t) => String(t.value).toLowerCase() === "false").length;
+	const driftN = list.filter((t) => String(t.value).toLowerCase() === "drift").length;
+	const okN = list.filter((t) => String(t.value).toLowerCase() === "ok").length;
+	const errN = list.filter((t) => t.health === "err" || String(t.value).toLowerCase() === "error").length;
+	const otherN = list.length - trueN - falseN - driftN - okN - errN;
+
+	const isDriftModal = driftN > 0 || okN > 0;
+	if (isDriftModal) {
+		list = [...list].sort(compareDriftCameraTags);
+	}
+	plcTagModalState = {
+		title: title || (isDriftModal ? "Drift Cameras" : "PLC Tags"),
+		url: url || "",
+		tags: list,
+		meta: normalized.meta,
+		pipeline: pipeline || "",
+		isDriftModal,
+	};
+	$("plc_tag_modal_title").textContent = plcTagModalState.title;
+	const parts = isDriftModal
+		? [`${list.length} cameras`, `${driftN} DRIFT`, `${okN} OK`]
+		: [`${list.length} tags`, `${trueN} true`, `${falseN} false`];
+	if (otherN > 0) parts.push(`${otherN} other`);
+	if (!isDriftModal && errN > 0) parts.push(`${errN} error`);
+	$("plc_tag_modal_summary").textContent = parts.join(" · ");
+
+	// Drift modal: group/status/counts already appear in title + summary.
+	if (isDriftModal) {
+		const box = $("plc_tag_modal_meta");
+		if (box) {
+			box.hidden = true;
+			box.innerHTML = "";
+		}
+	} else {
+		renderPlcTagMeta(normalized.meta);
+	}
+
+	const link = $("plc_tag_modal_link");
+	if (!isDriftModal && url) {
+		link.href = url;
+		link.classList.remove("hidden");
+	} else {
+		link.removeAttribute("href");
+		link.classList.add("hidden");
+	}
+
+	$("plc_tag_modal_list").innerHTML = list.length
+		? list.map((tag) => {
+			const camUid = String(tag.id || "").trim();
+			const name = tag.name || "";
+			// Only drifted cameras open the images modal.
+			const nameHtml = isDriftModal && camUid && isDriftCameraTag(tag)
+				? `<button type="button" class="plc-tag-name plc-tag-name-btn drift-images-btn" title="${escapeAttr(name)}" data-cam-uid="${escapeAttr(camUid)}" data-pipeline="${escapeAttr(plcTagModalState.pipeline || "")}" data-cam-name="${escapeAttr(name)}">${escapeHtml(name)}</button>`
+				: `<span class="plc-tag-name" title="${escapeAttr(name)}">${escapeHtml(name)}</span>`;
+			return `<div class="plc-tag-row">
+				${nameHtml}
+				${renderPlcTagValue(tag)}
+			</div>`;
+		}).join("")
+		: `<div class="plc-tag-empty">${isDriftModal ? "No cameras" : "No tags"}</div>`;
+
+	setOverlayVisible($("plc_tag_modal"), true);
+}
+
+function resetCameraDrift(camUid, pipeline, btn) {
+	const uid = String(camUid || "").trim();
+	if (!uid || !urls.cameraDriftReset) return;
+	if (btn) {
+		btn.disabled = true;
+		btn.textContent = "…";
+	}
+	postJson(urls.cameraDriftReset, { cam_uid: uid, pipeline: pipeline || "" }, 25000, {
+		onload(_status, data) {
+			if (!data || !data.ok) {
+				if (btn) {
+					btn.disabled = false;
+					btn.textContent = "Reset";
+				}
+				showAlertModal((data && data.error) || "Camera drift reset failed");
+				return;
+			}
+			closeDriftImagesModal();
+			if (plcTagModalState && Array.isArray(plcTagModalState.tags)) {
+				plcTagModalState.tags = plcTagModalState.tags.filter(
+					(tag) => String(tag.id || "") !== uid,
+				);
+				if (plcTagModalState.tags.length) {
+					openPlcTagModal(plcTagModalState);
+				} else {
+					closePlcTagModal();
+				}
+			}
+			fetchStatus(true);
+		},
+		onerror() {
+			if (btn) {
+				btn.disabled = false;
+				btn.textContent = "Reset";
+			}
+			showAlertModal("Camera drift reset failed");
+		},
+		ontimeout() {
+			if (btn) {
+				btn.disabled = false;
+				btn.textContent = "Reset";
+			}
+			showAlertModal("Camera drift reset timed out");
+		},
+	});
+}
+
 function openCameraLive(pipeline, camIndex, title) {
 	stopCameraLiveStream();
 	const img = $("camera_live_img");
@@ -972,6 +2171,7 @@ function openCameraLive(pipeline, camIndex, title) {
 
 	const feedUrl = `${cameraFeedBase}?pipeline=${encodeURIComponent(pipeline)}&cam=${camIndex}`;
 	let receivedFrame = false;
+	let lastFps = null;
 	cameraLiveSource = new EventSource(feedUrl);
 	cameraLiveSource.onmessage = function (event) {
 		let data = {};
@@ -989,7 +2189,12 @@ function openCameraLive(pipeline, camIndex, title) {
 			receivedFrame = true;
 			img.src = `data:image/jpeg;base64,${data.jpeg}`;
 			setCameraLiveImageVisible(true);
-			status.textContent = data.fps ? `FPS: ${data.fps}` : "Live";
+			// PLC /stream often sends fps as "" on most frames — keep last value.
+			const fps = data.fps;
+			if (fps != null && String(fps).trim() !== "") {
+				lastFps = fps;
+			}
+			status.textContent = lastFps != null ? `FPS: ${lastFps}` : "Live";
 		} else if (!receivedFrame) {
 			status.textContent = "Waiting for frame…";
 		}
@@ -1057,11 +2262,17 @@ function memoryToneClass(percent) {
 }
 
 function formatStreamLink(name, entry) {
-	const { isRtls, isSys } = pipelineRuntimeFlags(name, entry);
+	const { isRtls, isSys, isKafka, isCameraDrift } = pipelineRuntimeFlags(name, entry);
 	const url = streamUrlFor(name, entry);
 	if (isRtls || isSys || !url) return "";
-	const safeUrl = escapeAttr(url);
-	return `<div class="pipeline-stream-row"><span class="pipeline-stream-label">Stream:</span><a class="svc-stream" href="${safeUrl}" target="_blank" rel="noopener" title="${safeUrl}">${streamEndpointLabel(url)}</a></div>`;
+	let href = url;
+	if (isKafka || isCameraDrift) {
+		href = (/^https?:\/\//.test(url) ? url : `http://${url}`).replace(/\/$/, "");
+	}
+	const safeUrl = escapeAttr(href);
+	const label = streamEndpointLabel(url);
+	const rowLabel = isKafka ? "PLC:" : (isCameraDrift ? "Drift:" : "Stream:");
+	return `<div class="pipeline-stream-row"><span class="pipeline-stream-label">${rowLabel}</span><a class="svc-stream" href="${safeUrl}" target="_blank" rel="noopener" title="${safeUrl}">${escapeHtml(label)}</a></div>`;
 }
 
 function formatServerIpRow(name) {
@@ -1112,6 +2323,7 @@ function updateServerIp(name, event) {
 			pipelineStatic[name].server_ip = data.server_ip;
 			refreshViewSelects();
 			renderTargetGroups(new Set(getSelectedTargets()));
+			renderServerGroups(new Set(getSelectedServers()));
 			if (lastPipelines) renderTable(lastPipelines);
 			fetchStatus(true);
 		},
@@ -1137,13 +2349,13 @@ function formatVersionRow(entry) {
 	}
 	const upToDate = Boolean(current && latest && current === latest);
 	const curClass = upToDate ? "version-tag--ok" : (current && latest ? "version-tag--warn" : "");
-	return `<div class="version-row" title="Git revision: current / latest on origin">
+	return `<div class="version-row" title="Git revision: current on edge / latest from central">
 		<span class="version-label">Current:</span>
-		<span class="version-tag ${curClass}">${escapeAttr(current || "?")}</span>
-		<span class="version-date">${escapeAttr(currentDate)}</span>
+		<span class="version-tag ${curClass}">${escapeHtml(current || "?")}</span>
+		<span class="version-date">${escapeHtml(currentDate)}</span>
 		<span class="version-label">Latest:</span>
-		<span class="version-tag">${escapeAttr(latest || "?")}</span>
-		<span class="version-date">${escapeAttr(latestDate)}</span>
+		<span class="version-tag">${escapeHtml(latest || "?")}</span>
+		<span class="version-date">${escapeHtml(latestDate)}</span>
 	</div>`;
 }
 
@@ -1162,7 +2374,7 @@ function formatMemoryUsage(entry) {
 	const pctHtml = percent != null
 		? `<span class="svc-mem-pct">${formatMemoryPercent(percent)}</span>`
 		: "";
-	return `<div class="svc-mem-row${toneClass}"><span class="svc-mem-label">Memory:</span><span class="svc-mem-value" title="Container memory">${escapeAttr(text)}</span>${pctHtml}</div>`;
+	return `<div class="svc-mem-row${toneClass}"><span class="svc-mem-label">Memory:</span><span class="svc-mem-value" title="Container memory">${escapeHtml(text)}</span>${pctHtml}</div>`;
 }
 
 function metricTone(now, set) {
@@ -1197,32 +2409,53 @@ function chipStatusesFromCount(now, set, running) {
 }
 
 function renderMetricChip({ prefix, index, status, link, liveOptions }) {
-	const label = `${prefix}${index + 1}`;
+	const fallback = `${prefix}${index + 1}`;
+	// PLC tags: chip text is the state value (true/false/number/error).
+	const label = (prefix === "T" && link && link.value != null && String(link.value) !== "")
+		? String(link.value)
+		: (prefix === "D" && link && link.label)
+			? String(link.label)
+		: (prefix === "P" && link && link.value != null && String(link.value) !== "")
+			? String(link.value)
+		: fallback;
 	const title = link ? (link.title || link.label || label) : label;
 	const safeTitle = escapeAttr(title);
-	const chipClass = `device-chip chip-${status}`;
+	const chipClass = `device-chip chip-${status}${prefix === "T" ? " device-chip--tag" : ""}`;
 	const streamUrl = link && link.url ? link.url : "";
 
 	if (
 		prefix === "P" && link && link.pipeline
 	) {
-		return `<button type="button" class="device-chip-btn" title="Go to ${safeTitle}" aria-label="Go to ${safeTitle}" data-pipeline="${escapeAttr(link.pipeline)}"><span class="${chipClass}">${label}</span></button>`;
+		return `<button type="button" class="device-chip-btn" title="Go to ${safeTitle}" aria-label="Go to ${safeTitle}" data-pipeline="${escapeAttr(link.pipeline)}"><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
 	}
 	if (
 		prefix === "C" && status === "ok" && liveOptions
-		&& liveOptions.pipeline && liveOptions.streamUrl && liveOptions.streamHealth
+		&& liveOptions.pipeline && liveOptions.streamUrl
 	) {
-		return `<button type="button" class="device-chip-btn device-chip-live" title="View live: ${safeTitle}" aria-label="View live ${escapeAttr(label)}" data-pipeline="${escapeAttr(liveOptions.pipeline)}" data-cam="${index}" data-title="${safeTitle}"><span class="${chipClass}">${label}</span></button>`;
+		return `<button type="button" class="device-chip-btn device-chip-live" title="View live: ${safeTitle}" aria-label="View live ${escapeAttr(fallback)}" data-pipeline="${escapeAttr(liveOptions.pipeline)}" data-cam="${index}" data-title="${safeTitle}"><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
+	}
+	if (prefix === "T" || (prefix === "D" && link && Array.isArray(link.tags) && link.tags.length)) {
+		const tagsJson = escapeAttr(JSON.stringify(link && link.tags ? link.tags : []));
+		const groupTitle = escapeAttr(
+			(link && (link.location ? `${link.location}/${link.value || link.label}` : (link.value || link.label)))
+			|| label,
+		);
+		const metaJson = escapeAttr(JSON.stringify(link && link.meta ? link.meta : {}));
+		const chipBtnClass = prefix === "D" ? "device-chip-drift-tag" : "device-chip-plc-tag";
+		const pipelineAttr = prefix === "D" && liveOptions && liveOptions.pipeline
+			? ` data-pipeline="${escapeAttr(liveOptions.pipeline)}"`
+			: "";
+		return `<button type="button" class="device-chip-btn ${chipBtnClass}" title="${safeTitle}" aria-label="${safeTitle}" data-plc-title="${groupTitle}" data-plc-url="${escapeAttr(streamUrl)}" data-plc-tags="${tagsJson}" data-plc-meta="${metaJson}"${pipelineAttr}><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
 	}
 	if (status === "ok" && streamUrl) {
-		return `<a class="device-chip-link" href="${escapeAttr(streamUrl)}" target="_blank" rel="noopener" title="${safeTitle}"><span class="${chipClass}">${label}</span></a>`;
+		return `<a class="device-chip-link" href="${escapeAttr(streamUrl)}" target="_blank" rel="noopener" title="${safeTitle}"><span class="${chipClass}">${escapeHtml(label)}</span></a>`;
 	}
 	const host = deviceHost(link);
 	if (status !== "ok" && host && prefix !== "P") {
 		const openUrl = deviceOpenUrl(link, host);
 		return `<button type="button" class="device-chip-btn" title="Ping ${escapeAttr(host)}" aria-label="Ping ${escapeAttr(host)}" data-host="${escapeAttr(host)}" data-url="${escapeAttr(openUrl)}"><span class="${chipClass}">${label}</span></button>`;
 	}
-	return `<span class="${chipClass}" title="${safeTitle}">${label}</span>`;
+	return `<span class="${chipClass}" title="${safeTitle}">${escapeHtml(label)}</span>`;
 }
 
 function deviceChips(prefix, statuses, links, liveOptions) {
@@ -1232,7 +2465,7 @@ function deviceChips(prefix, statuses, links, liveOptions) {
 		index: idx,
 		status,
 		link: links && links[idx],
-		liveOptions: prefix === "C" ? liveOptions : null,
+		liveOptions: (prefix === "C" || prefix === "D") ? liveOptions : null,
 	})).join("");
 	return `<div class="device-chips">${chips}</div>`;
 }
@@ -1243,7 +2476,12 @@ function metricBlock(label, now, set, running, chipPrefix, chipStatuses, links, 
 	const tone = toneOverride || metricTone(now, set);
 	const width = metricBar(now, set);
 	const chips = chipPrefix && chipStatuses && chipStatuses.length
-		? deviceChips(chipPrefix, chipStatuses, links, chipPrefix === "C" ? liveOptions : null)
+		? deviceChips(
+			chipPrefix,
+			chipStatuses,
+			links,
+			(chipPrefix === "C" || chipPrefix === "D") ? liveOptions : null,
+		)
 		: "";
 	return `<div class="metric-block">
 		<div class="metric-head">
@@ -1267,11 +2505,67 @@ function rtlsDeviceMetric(entry, label, prefix, nowKey, setKey, statusKey, links
 
 function formatRtlsMetricCell(entry) {
 	if (entry.rtls_config_missing) {
-		return `<div class="metric-grid metric-grid--warn"><span class="metric-note">RTLS config missing</span></div>`;
+		return `<div class="metric-grid"><div class="metric-block"><span class="metric-label">Config</span><span class="metric-nums"><strong class="metric-fill warn">missing</strong></span></div></div>`;
+	}
+	if (entry.rtls_devices_missing) {
+		return `<div class="metric-grid"><div class="metric-block"><span class="metric-label">Devices</span><span class="metric-nums"><strong>-</strong></span></div></div>`;
 	}
 	const qlBlock = rtlsDeviceMetric(entry, "Tower Lamp", "L", "qlight_now", "qlight_set", "qlight_status", "qlight_links");
 	const spBlock = rtlsDeviceMetric(entry, "IP Speaker", "S", "speaker_now", "speaker_set", "speaker_status", "speaker_links");
 	return `<div class="metric-grid">${qlBlock}${spBlock}</div>`;
+}
+
+function formatCameraDriftMetricCell(entry, name) {
+	const running = !!entry.running;
+	const liveOptions = { pipeline: name || entry.pipeline || "" };
+	const groups = entry.drift_camera_groups;
+	if (Array.isArray(groups) && groups.length) {
+		const blocks = groups.map((group) => {
+			const statuses = (group.chip_status || []).map((status) => (
+				running ? status : "idle"
+			));
+			const tone = !running
+				? "idle"
+				: (group.now > 0 ? "warn" : "ok");
+			return metricBlock(
+				group.label || "Drift",
+				group.now,
+				group.set,
+				running,
+				"D",
+				statuses,
+				group.links || [],
+				liveOptions,
+				tone,
+			);
+		}).join("");
+		return `<div class="metric-grid metric-grid--plc">${blocks}</div>`;
+	}
+	const now = entry.drift_cameras_now;
+	const set = entry.drift_cameras_set;
+	if (set == null || now == null) {
+		return `<div class="metric-grid"><div class="metric-block">
+			<span class="metric-label">Drift</span>
+			<span class="metric-nums"><strong class="metric-fill warn">?</strong></span>
+		</div></div>`;
+	}
+	const statuses = entry.drift_camera_status && entry.drift_camera_status.length
+		? (running
+			? entry.drift_camera_status
+			: entry.drift_camera_status.map(() => "idle"))
+		: [];
+	const tone = now > 0 ? "warn" : "ok";
+	return metricBlock(
+		"Drift",
+		now,
+		set,
+		running,
+		"D",
+		statuses,
+		entry.drift_camera_links || [],
+		liveOptions,
+		tone,
+	);
 }
 
 function formatEgMetricCell(entry, name) {
@@ -1287,25 +2581,111 @@ function formatEgMetricCell(entry, name) {
 	});
 }
 
+function formatKafkaMetricCell(entry) {
+	const running = !!entry.running;
+	const groups = entry.plc_tag_groups;
+	if (Array.isArray(groups) && groups.length) {
+		const blocks = groups.map((group) => {
+			const statuses = (group.chip_status || []).map((status) => (
+				running ? status : "idle"
+			));
+			return metricBlock(
+				group.label || "PLC",
+				group.now,
+				group.set,
+				running,
+				"T",
+				statuses,
+				group.links || [],
+			);
+		}).join("");
+		return `<div class="metric-grid metric-grid--plc">${blocks}</div>`;
+	}
+	const set = entry.plc_tags_set;
+	if (set == null) {
+		return `<div class="metric-grid"><div class="metric-block">
+			<span class="metric-label">PLC Tags</span>
+			<span class="metric-nums"><strong class="metric-fill warn">?</strong></span>
+		</div></div>`;
+	}
+	const statuses = entry.plc_tag_status && entry.plc_tag_status.length
+		? (running
+			? entry.plc_tag_status
+			: entry.plc_tag_status.map(() => "idle"))
+		: chipStatusesFromCount(entry.plc_tags_now, set, running);
+	return metricBlock(
+		"PLC Tags",
+		entry.plc_tags_now,
+		set,
+		running,
+		"T",
+		statuses,
+		entry.plc_tag_links || [],
+	);
+}
+
 function formatMetricCell(entry, name) {
-	const { isRtls, isSys } = pipelineRuntimeFlags(name, entry);
+	const { isRtls, isSys, isKafka, isCameraDrift } = pipelineRuntimeFlags(name, entry);
 	if (isSys) return formatSysMetricCell(name, entry);
 	if (isRtls) return formatRtlsMetricCell(entry);
+	if (isKafka) return formatKafkaMetricCell(entry);
+	if (isCameraDrift) return formatCameraDriftMetricCell(entry, name);
 	return formatEgMetricCell(entry, name);
 }
 
 // --- SYS monitor metrics ---
 
-function isMonitoredEgPipeline(name, monitorHostIp) {
+function pipelineMonitorHost(name) {
+	// Keep in sync with servers_cfg.pipeline_monitor_host.
 	const info = pipelineInfo(name);
-	return !info.is_sys_monitor
-		&& !info.is_rtls
-		&& (info.monitor_host_ip || "") === monitorHostIp;
+	if (info.monitor_host_ip) return info.monitor_host_ip;
+	const { isRtls, isSys } = pipelineRuntimeFlags(name);
+	if (isSys || isRtls) return info.server_ip || "";
+	return "";
+}
+
+function isMonitoredEgPipeline(name, monitorHostIp) {
+	// Keep in sync with servers_cfg.is_sys_monitored_peer (excludes SYS).
+	const { isSys } = pipelineRuntimeFlags(name);
+	if (isSys) return false;
+	return pipelineMonitorHost(name) === monitorHostIp;
 }
 
 function monitoredPipelineNames(monitorHostIp) {
 	if (!monitorHostIp) return [];
 	return pipelineOrder.filter((name) => isMonitoredEgPipeline(name, monitorHostIp));
+}
+
+function monitorKindBucket(name) {
+	// SYS MONITOR chips keep Kafka/CV split even though type badge is unified PLC.
+	const info = pipelineInfo(name);
+	const rawKind = info.pipeline_kind || "";
+	const lower = String(name || "").toLowerCase();
+	if (rawKind === "rtls" || info.is_rtls) return "rtls";
+	if (
+		rawKind === "plc_cv"
+		|| info.is_plc_cv
+		|| /plc-cv|cv-plc|plc_cv/.test(lower)
+	) {
+		return "plc_cv";
+	}
+	if (
+		rawKind === "plc_kafka"
+		|| info.is_kafka
+		|| /plc-kafka|kafka/.test(lower)
+	) {
+		return "plc_kafka";
+	}
+	if (pipelineRuntimeFlags(name).isCameraDrift) return "camera_drift";
+	return "peer";
+}
+
+function monitorPlcCvChipLabel(name) {
+	// RND-PLC-CV-RND → PLC-CV-RND (also accepts legacy …-CV-PLC-…).
+	const s = String(name || "");
+	const match = s.match(/PLC-CV-(.+)$/i) || s.match(/CV-PLC-(.+)$/i);
+	if (match) return `PLC-CV-${match[1]}`;
+	return "PLC-CV";
 }
 
 function sysMonitorStatusFromCounts(runningCount, totalCount, monitorRunning) {
@@ -1322,30 +2702,92 @@ function monitorMetricTone(runningCount, totalCount, monitorRunning) {
 	return "idle";
 }
 
-function monitoredPipelineView(monitorHostIp, monitorRunning) {
-	const names = monitoredPipelineNames(monitorHostIp);
+function monitorGroupChipStatus(members, monitorRunning) {
+	if (!monitorRunning) return "idle";
 	let running = 0;
 	let pending = false;
-	const chipStatuses = [];
-	const links = [];
-	for (const name of names) {
+	for (const name of members) {
 		const entry = lastPipelines && lastPipelines[name];
 		if (!entry || entry.status === "PENDING") {
 			pending = true;
-			chipStatuses.push(monitorRunning ? "unknown" : "idle");
-			links.push({ title: name, label: name, url: "", pipeline: name });
 			continue;
 		}
-		const isRunning = !!entry.running;
-		if (isRunning) running += 1;
-		chipStatuses.push(!monitorRunning || !isRunning ? "idle" : "ok");
-		links.push({
-			title: name,
-			label: name,
-			url: isRunning ? streamUrlFor(name, entry) : "",
-			pipeline: name,
-		});
+		if (entry.running) running += 1;
 	}
+	if (pending && running <= 0) return "unknown";
+	if (running >= members.length) return "ok";
+	if (running > 0) return "warn";
+	return "idle";
+}
+
+function monitorGroupNavigateTarget(members) {
+	for (const name of members) {
+		const entry = lastPipelines && lastPipelines[name];
+		if (!entry || entry.status === "PENDING" || !entry.running) return name;
+	}
+	return members[0] || "";
+}
+
+function monitoredPipelineView(monitorHostIp, monitorRunning) {
+	// Chip order follows servers.json / pipelineOrder (first appearance).
+	// PLC-CV is one chip per pipeline (PLC-CV-RND / PC2 / LBC, …).
+	const names = monitoredPipelineNames(monitorHostIp);
+	let running = 0;
+	let pending = false;
+	const groups = {
+		rtls: [],
+		plc_kafka: [],
+		camera_drift: [],
+	};
+	const groupLabels = {
+		rtls: "RTLS",
+		plc_kafka: "PLC-KAFKA",
+		camera_drift: "CAM-DRIFT",
+	};
+
+	for (const name of names) {
+		const entry = lastPipelines && lastPipelines[name];
+		if (!entry || entry.status === "PENDING") pending = true;
+		else if (entry.running) running += 1;
+
+		const bucket = monitorKindBucket(name);
+		if (bucket !== "peer" && bucket !== "plc_cv") groups[bucket].push(name);
+	}
+
+	const chipStatuses = [];
+	const links = [];
+	const seenGroup = new Set();
+	let peerIndex = 0;
+	const pushChip = (label, members) => {
+		if (!members.length) return;
+		const target = monitorGroupNavigateTarget(members);
+		const status = monitorGroupChipStatus(members, monitorRunning);
+		chipStatuses.push(status);
+		links.push({
+			title: `${label}: ${members.join(", ")}`,
+			label,
+			value: label,
+			url: "",
+			pipeline: target,
+		});
+	};
+
+	for (const name of names) {
+		const bucket = monitorKindBucket(name);
+		if (bucket === "peer") {
+			peerIndex += 1;
+			pushChip(`P${peerIndex}`, [name]);
+			continue;
+		}
+		if (bucket === "plc_cv") {
+			pushChip(monitorPlcCvChipLabel(name), [name]);
+			continue;
+		}
+		if (seenGroup.has(bucket)) continue;
+		seenGroup.add(bucket);
+		pushChip(groupLabels[bucket] || bucket.toUpperCase(), groups[bucket]);
+	}
+
 	const counts = { running, total: names.length };
 	let status;
 	if (pending && names.length) {
@@ -1411,19 +2853,9 @@ function streamEndpointLabel(url) {
 
 function formatServiceCell(entry, pipelineName) {
 	const name = pipelineName || entry.pipeline || "";
-	const { isRtls, isSys } = pipelineRuntimeFlags(name, entry);
-	let stateHtml;
-	if (!entry.running) {
-		stateHtml = `<span class="svc-state stopped"><span class="svc-dot"></span>Stopped</span>`;
-	} else if (isRtls && entry.rtls_config_missing) {
-		stateHtml = `<span class="svc-state degraded" title="RTLS config missing"><span class="svc-dot"></span>Running</span>`;
-	} else if (isRtls && entry.status === "WARN") {
-		stateHtml = `<span class="svc-state degraded"><span class="svc-dot"></span>Running</span>`;
-	} else if (!isRtls && !isSys && !entry.stream_health) {
-		stateHtml = `<span class="svc-state degraded"><span class="svc-dot"></span>Running</span>`;
-	} else {
-		stateHtml = `<span class="svc-state running"><span class="svc-dot"></span>Running</span>`;
-	}
+	const stateHtml = entry.running
+		? `<span class="svc-state running"><span class="svc-dot"></span>Running</span>`
+		: `<span class="svc-state stopped"><span class="svc-dot"></span>Stopped</span>`;
 	const streamHtml = formatStreamLink(name, entry);
 	return `<div class="service-stack">${stateHtml}${streamHtml}${formatMemoryUsage(entry)}</div>`;
 }
@@ -1475,14 +2907,14 @@ function navigateToPipeline(pipelineName) {
 	if (!pipelineOrder.includes(pipelineName)) return;
 	showConfirmModal(
 		`"${pipelineName}" is hidden by the current filter.\nClear filters and jump to it?`,
-		{ title: "Hidden pipeline", tone: "warn", okLabel: "Show", cancelLabel: "Cancel" },
+		{ title: "Hidden service", tone: "warn", okLabel: "Show", cancelLabel: "Cancel" },
 	).then((ok) => {
 		if (!ok) return;
 		revealPipelineInStatusView();
 		if (!scrollToPipeline(pipelineName)) {
 			showAlertModal(
 				`Could not show "${pipelineName}" in the status list.`,
-				{ title: "Hidden pipeline", tone: "warn" },
+				{ title: "Hidden service", tone: "warn" },
 			);
 		}
 	});
@@ -1504,7 +2936,7 @@ function statusGroupPanel(group, count, itemsHtml) {
 	return `<div class="group-panel status-group-panel" data-group="${safeGroup}">
 		<div class="group-panel-header">
 			<span class="group-panel-title">${escapeHtml(group)}</span>
-			<span class="group-panel-count">${count} pipelines</span>
+			<span class="group-panel-count">${count} services</span>
 		</div>
 		<div class="group-panel-body status-panel-body">${itemsHtml}</div>
 	</div>`;
@@ -1545,6 +2977,7 @@ function setStatusFilter(filter) {
 		renderTable(lastPipelines);
 	}
 	renderTargetGroups();
+	renderServerGroups();
 }
 
 function updateFilterPills() {
@@ -1645,7 +3078,7 @@ function updateLastUpdateDisplay(meta, force) {
 	}
 	el.classList.remove("updating");
 	if (meta.updated_at > 0) {
-		el.textContent = new Date(meta.updated_at * 1000).toLocaleString();
+		el.textContent = formatEpochSecondsLocal(meta.updated_at, { withSeconds: true }) || "-";
 	} else {
 		el.textContent = "-";
 	}
@@ -1821,6 +3254,7 @@ function refreshViewSection() {
 		showLoadingTable();
 	}
 	renderTargetGroups(new Set(getSelectedTargets()));
+	renderServerGroups(new Set(getSelectedServers()));
 }
 
 function setViewFilterValues(kind, values) {
@@ -1904,17 +3338,28 @@ function bindPageActions() {
 			return;
 		}
 
+		const serverCommandBtn = event.target.closest("[data-server-command]");
+		if (serverCommandBtn) {
+			sendServerCommand(serverCommandBtn.dataset.serverCommand);
+			return;
+		}
+
 		const commandBtn = event.target.closest("[data-command]");
 		if (commandBtn) {
 			sendCommand(commandBtn.dataset.command);
 		}
 	});
 
-	const toolbar = document.querySelector(".command-toolbar");
-	if (toolbar) {
+	const toolbarBindings = [
+		["#section_service_control .command-toolbar", "select_all", toggleAll],
+		["#section_server_control .command-toolbar", "select_all_servers", toggleAllServers],
+	];
+	for (const [selector, selectAllId, handler] of toolbarBindings) {
+		const toolbar = document.querySelector(selector);
+		if (!toolbar) continue;
 		toolbar.addEventListener("change", (event) => {
-			if (event.target.id === "select_all") {
-				toggleAll(event.target);
+			if (event.target.id === selectAllId) {
+				handler(event.target);
 			}
 		});
 	}
@@ -1928,12 +3373,23 @@ function bindPageActions() {
 			updateSelectionHint();
 		}
 	});
+
+	$("server_groups").addEventListener("change", (event) => {
+		if (event.target.classList.contains("server-group-toggle")) {
+			toggleServerGroup(event.target);
+			return;
+		}
+		if (event.target.classList.contains("server-cb")) {
+			syncServerCheckbox(event.target);
+		}
+	});
 }
 
 function handleEscapeKey(event) {
 	if (event.key !== "Escape") return;
 	closeAllViewMenus();
 	closeCameraLive();
+	closePlcTagModal();
 	closePingModal();
 	closeCommandModal();
 	const appModal = $("app_modal");
@@ -1959,7 +3415,7 @@ function targetGroupPanelHtml(groupKey, names, selected) {
 				<input type="checkbox" class="group-toggle" data-group="${safeGroup}">
 				${escapeHtml(groupKey)}
 			</label>
-			<span class="group-panel-count">${names.length} pipelines</span>
+			<span class="group-panel-count">${names.length} services</span>
 		</div>
 		<div class="group-panel-body">${items}</div>
 	</div>`;
@@ -1988,19 +3444,22 @@ function getSelectedTargets() {
 	return [...document.querySelectorAll(".target-cb:checked")].map((cb) => cb.id);
 }
 
+function syncGroupToggles(toggleSelector, itemSelector) {
+	for (const toggle of document.querySelectorAll(toggleSelector)) {
+		const group = toggle.dataset.group;
+		const items = [...document.querySelectorAll(`${itemSelector}[data-group="${group}"]`)];
+		const checked = items.filter((cb) => cb.checked).length;
+		toggle.checked = checked > 0 && checked === items.length;
+		toggle.indeterminate = checked > 0 && checked < items.length;
+	}
+}
+
 function updateSelectionHint() {
 	const count = getSelectedTargets().length;
 	$("selection_hint").textContent = `${count} selected`;
 	$("select_all").checked =
 		count > 0 && count === document.querySelectorAll(".target-cb").length;
-
-	for (const toggle of document.querySelectorAll(".group-toggle")) {
-		const group = toggle.dataset.group;
-		const items = [...document.querySelectorAll(`.target-cb[data-group="${group}"]`)];
-		const checked = items.filter((cb) => cb.checked).length;
-		toggle.checked = checked > 0 && checked === items.length;
-		toggle.indeterminate = checked > 0 && checked < items.length;
-	}
+	syncGroupToggles(".group-toggle", ".target-cb");
 }
 
 function toggleAll(source) {
@@ -2018,16 +3477,212 @@ function toggleGroup(source) {
 	updateSelectionHint();
 }
 
+// --- Server selection ---
+
+function currentServerGroups() {
+	const groups = [];
+	for (const [groupKey, names] of currentGroups()) {
+		const byIp = new Map();
+		for (const name of statusFilteredNames(names)) {
+			const ip = (pipelineInfo(name).server_ip || "").trim();
+			if (!ip) continue;
+			if (!byIp.has(ip)) {
+				byIp.set(ip, []);
+			}
+			byIp.get(ip).push(name);
+		}
+		if (!byIp.size) continue;
+		// IP order follows first appearance in the filtered pipeline list.
+		const servers = [...byIp.entries()].map(([ip, pipelines]) => ({ ip, pipelines }));
+		groups.push([groupKey, servers]);
+	}
+	return groups;
+}
+
+function serverGroupPanelHtml(groupKey, servers, selected) {
+	const safeGroup = escapeAttr(groupKey);
+	const items = servers.map(({ ip, pipelines }) => {
+		const checked = selected.has(ip) ? " checked" : "";
+		const count = pipelines.length;
+		const title = escapeAttr(pipelines.join(", "));
+		return `<label class="check-label target-item" title="${title}">
+			<input type="checkbox" class="server-cb" data-group="${safeGroup}" value="${escapeAttr(ip)}"${checked}>
+			<span class="server-item-ip">${escapeHtml(ip)}</span>
+			<span class="server-item-meta">${count} service${count === 1 ? "" : "s"}</span>
+		</label>`;
+	}).join("");
+	return `<div class="group-panel" data-group="${safeGroup}">
+		<div class="group-panel-header">
+			<label class="check-label group-panel-title">
+				<input type="checkbox" class="server-group-toggle" data-group="${safeGroup}">
+				${escapeHtml(groupKey)}
+			</label>
+			<span class="group-panel-count">${servers.length} server${servers.length === 1 ? "" : "s"}</span>
+		</div>
+		<div class="group-panel-body">${items}</div>
+	</div>`;
+}
+
+function renderServerGroups(preserveSelected) {
+	const selected = preserveSelected || new Set(getSelectedServers());
+	const html = currentServerGroups()
+		.map(([groupKey, servers]) => serverGroupPanelHtml(groupKey, servers, selected))
+		.join("");
+	$("server_groups").innerHTML = html;
+	updateServerSelectionHint();
+}
+
+function getSelectedServers() {
+	return [...new Set(
+		[...document.querySelectorAll(".server-cb:checked")].map((cb) => cb.value),
+	)];
+}
+
+function uniqueServerIps() {
+	return [...new Set(
+		[...document.querySelectorAll(".server-cb")].map((cb) => cb.value),
+	)];
+}
+
+function setServerIpChecked(ip, checked) {
+	for (const cb of document.querySelectorAll(".server-cb")) {
+		if (cb.value === ip) {
+			cb.checked = checked;
+		}
+	}
+}
+
+function updateServerSelectionHint() {
+	const selected = getSelectedServers();
+	const total = uniqueServerIps().length;
+	const count = selected.length;
+	$("server_selection_hint").textContent = `${count} selected`;
+	$("select_all_servers").checked = count > 0 && count === total;
+	$("select_all_servers").indeterminate = count > 0 && count < total;
+	syncGroupToggles(".server-group-toggle", ".server-cb");
+}
+
+function toggleAllServers(source) {
+	const checked = source.checked;
+	for (const ip of uniqueServerIps()) {
+		setServerIpChecked(ip, checked);
+	}
+	updateServerSelectionHint();
+}
+
+function toggleServerGroup(source) {
+	const group = source.dataset.group;
+	const checked = source.checked;
+	const ips = new Set(
+		[...document.querySelectorAll(`.server-cb[data-group="${group}"]`)].map((cb) => cb.value),
+	);
+	for (const ip of ips) {
+		setServerIpChecked(ip, checked);
+	}
+	updateServerSelectionHint();
+}
+
+function syncServerCheckbox(source) {
+	setServerIpChecked(source.value, source.checked);
+	updateServerSelectionHint();
+}
+
+function renderServerCommandResults(command, results) {
+	const label = commandLabel(command);
+	$("command_modal_title").textContent = "Server Control";
+	$("command_modal_hint").textContent = label;
+	$("command_modal_overall").classList.add("hidden");
+	$("command_modal_overall").innerHTML = "";
+	const lines = (results || []).map((entry) => {
+		const tone = entry.ok ? "ok" : "err";
+		const response = entry.response || (entry.ok ? "Scheduled" : "Failed");
+		return `<div class="command-result-line command-result-line--${tone}">
+			<span class="command-result-host">${escapeHtml(entry.server_ip || "")}</span>
+			<span class="command-result-response">${escapeHtml(response)}</span>
+		</div>`;
+	}).join("");
+	$("command_modal_list").innerHTML = lines || `<div class="command-result-line">No results</div>`;
+	setCommandModalActions(true);
+	openCommandModal();
+}
+
+async function sendServerCommand(command) {
+	const servers = getSelectedServers();
+	if (!servers.length) {
+		showAlertModal("Select at least one server.", { title: "Server Control" });
+		return;
+	}
+	const label = commandLabel(command);
+	const confirmed = await showConfirmModal(
+		`${label} ${servers.length} server(s)? This affects the whole host, not just services.`,
+		{ title: "Server Control", okLabel: label, tone: "err" },
+	);
+	if (!confirmed) {
+		return;
+	}
+
+	setCommandButtonsDisabled(true);
+	$("command_modal_title").textContent = "Server Control";
+	$("command_modal_hint").textContent = label;
+	$("command_modal_overall").classList.add("hidden");
+	$("command_modal_list").innerHTML = servers.map((ip) => `
+		<div class="command-result-line">
+			<span class="command-result-host">${escapeHtml(ip)}</span>
+			<span class="command-result-response">Sending…</span>
+		</div>
+	`).join("");
+	setCommandModalActions(false);
+	openCommandModal();
+
+	postJson(
+		urls.manageServers,
+		{ command, servers },
+		30000,
+		{
+			onload: (status, data) => {
+				setCommandButtonsDisabled(false);
+				renderServerCommandResults(command, (data && data.results) || []);
+				if (status !== 200 && status !== 409) {
+					showAlertModal("Server command failed.", { title: "Server Control", tone: "err" });
+				}
+			},
+			onerror: () => {
+				setCommandButtonsDisabled(false);
+				renderServerCommandResults(command, servers.map((ip) => ({
+					server_ip: ip,
+					ok: false,
+					response: "request failed",
+				})));
+				showAlertModal("Server command failed.", { title: "Server Control", tone: "err" });
+			},
+			ontimeout: () => {
+				setCommandButtonsDisabled(false);
+				renderServerCommandResults(command, servers.map((ip) => ({
+					server_ip: ip,
+					ok: false,
+					response: "timed out",
+				})));
+				showAlertModal("Server command timed out.", { title: "Server Control", tone: "err" });
+			},
+		},
+	);
+}
+
+// --- Service control helpers ---
+
 function setCommandButtonsDisabled(disabled) {
 	for (const id of COMMAND_BTN_IDS) {
+		$(id).disabled = disabled;
+	}
+	for (const id of SERVER_COMMAND_BTN_IDS) {
 		$(id).disabled = disabled;
 	}
 }
 
 function commandLabel(command) {
-	if (command === "update") return "Update";
-	const name = command.replace("service:", "");
-	return name.charAt(0).toUpperCase() + name.slice(1);
+	if (COMMAND_LABELS[command]) return COMMAND_LABELS[command];
+	const name = String(command || "").replace(/^(service|server):/, "");
+	return name ? name.charAt(0).toUpperCase() + name.slice(1) : "";
 }
 
 function commandHostLabel(pipelineName, entry) {
@@ -2072,51 +3727,53 @@ function commandProgressLabel(command, phase) {
 	return "Done";
 }
 
-function representativePipelineForHost(order, ip) {
-	return order.find((name) => (pipelineInfo(name).server_ip || name) === ip) || order[0];
+function pipelineCountsAsDoneForUpdate(name, entry, updateContext) {
+	if (commandPipelinePhase(entry) !== "done") return false;
+	if (!pipelineInfo(name).is_sys_monitor) return true;
+	const ip = pipelineInfo(name).server_ip || "";
+	const serverStatus = (updateContext?.servers || {})[ip];
+	return sysMonitorUpdateComplete(name, serverStatus);
 }
 
 function computeOverallCommandProgress(command, order, byPipeline, nowMs, updateContext) {
-	const progressOrder = command === "update" ? uniqueHostIps(order) : order;
+	const progressOrder = order.length ? order : ["_"];
 	const total = Math.max(1, progressOrder.length);
 	let sum = 0;
 	let doneCount = 0;
 	let activeLabel = "";
-	for (const key of progressOrder) {
-		const name = command === "update"
-			? representativePipelineForHost(order, key)
-			: key;
+	for (const name of progressOrder) {
 		const entry = byPipeline[name] || { phase: "queued" };
 		const phase = commandPipelinePhase(entry);
-		if (phase === "done") {
+		const countsDone = command === "update"
+			? pipelineCountsAsDoneForUpdate(name, entry, updateContext)
+			: phase === "done";
+		if (countsDone) {
 			sum += 100;
 			doneCount += 1;
 			continue;
 		}
-		if (phase === "active") {
+		if (phase === "active" || (phase === "done" && command === "update" && pipelineInfo(name).is_sys_monitor)) {
 			const elapsed = commandPipelineElapsed(entry, nowMs);
-			sum += commandPipelinePercent(command, phase, elapsed);
+			const progressPhase = phase === "done" ? "active" : phase;
+			sum += commandPipelinePercent(command, progressPhase, elapsed);
 			if (command === "update" && updateContext) {
-				const ips = uniqueHostIps(order, true);
-				const hostIp = ips.find((ip) => {
-					const hostName = representativePipelineForHost(order, ip);
-					return commandPipelinePhase(byPipeline[hostName] || {}) === "active";
-				}) || ips[0];
-				const serverStatus = (updateContext.servers || {})[hostIp];
+				const ip = pipelineInfo(name).server_ip || "";
+				const serverStatus = (updateContext.servers || {})[ip];
 				activeLabel = updateOverallActiveLabel(serverStatus, order);
 			} else if (command === "update" && entry.response) {
 				activeLabel = entry.response;
 			} else {
-				activeLabel = commandProgressLabel(command, phase);
+				activeLabel = commandProgressLabel(command, progressPhase);
 			}
 		}
 	}
+	const allDone = doneCount === total;
 	return {
-		pct: Math.min(100, Math.round(sum / total)),
+		pct: allDone ? 100 : Math.min(99, Math.round(sum / total)),
 		doneCount,
 		total,
 		activeLabel,
-		unitLabel: command === "update" ? "hosts" : "pipelines",
+		unitLabel: "services",
 	};
 }
 
@@ -2131,7 +3788,7 @@ function renderOverallCommandProgress(command, order, byPipeline, nowMs, finishe
 		command, order, byPipeline, nowMs, updateContext,
 	);
 	const label = activeLabel || commandLabel(command);
-	const unit = unitLabel || "pipelines";
+	const unit = unitLabel || "services";
 	panel.classList.remove("hidden");
 	panel.innerHTML = `
 		<div class="command-result-progress-row">
@@ -2230,7 +3887,11 @@ function renderCommandJobProgress(command, job, targets, nowMs, updateServers) {
 		return;
 	}
 
-	$("command_modal_title").textContent = `${commandLabel(command)} in progress`;
+	const failedDone = results.filter((entry) => entry.status === "done" && entry.ok === false).length;
+	const title = failedDone > 0
+		? `${commandLabel(command)} in progress (${failedDone} failed)`
+		: `${commandLabel(command)} in progress`;
+	$("command_modal_title").textContent = title;
 	$("command_modal_hint").textContent = "";
 	setCommandModalActions(false);
 	openCommandModal();
@@ -2280,7 +3941,7 @@ function resumeServiceCommandPolling() {
 	if (!activeServiceJobId || document.hidden) return;
 	if (servicePollTimer) return;
 	fetchServiceCommandStatus();
-	servicePollTimer = setInterval(fetchServiceCommandStatus, SERVICE_POLL_MS);
+	servicePollTimer = setInterval(fetchServiceCommandStatus, JOB_POLL_MS);
 }
 
 function renderCommandResults(command, results) {
@@ -2381,16 +4042,20 @@ function handleManageDockerResponse(command, targets, status, data) {
 async function sendCommand(command) {
 	const targets = getSelectedTargets();
 	if (!targets.length) {
-		showAlertModal("Select at least one pipeline.", { title: "Service Control" });
+		showAlertModal("Select at least one service.", { title: "Service Control" });
 		return;
 	}
 	const label = commandLabel(command);
-	const extra = command === "update"
-		? "\n\nGit pull and docker build on each server.\nThis may take several minutes."
-		: "";
-	if (command !== "service:status") {
+	let gitRefs = {};
+	if (command === "update") {
+		const confirmed = await showUpdateConfirmModal(targets);
+		if (confirmed === null) {
+			return;
+		}
+		gitRefs = confirmed;
+	} else if (command !== "service:status") {
 		const confirmed = await showConfirmModal(
-			`${label} ${targets.length} pipeline(s)?${extra}`,
+			`${label} ${targets.length} service(s)?`,
 			{ title: "Service Control", okLabel: label },
 		);
 		if (!confirmed) {
@@ -2401,9 +4066,13 @@ async function sendCommand(command) {
 	setCommandButtonsDisabled(true);
 	stopAllPolling();
 	showCommandProgress(command, targets);
+	const body = { command: command, lst_images: targets };
+	if (command === "update" && Object.keys(gitRefs).length) {
+		body.git_refs = gitRefs;
+	}
 	postJson(
 		urls.manageDocker,
-		{ command: command, lst_images: targets },
+		body,
 		command === "update" ? 900000 : 30000,
 		{
 			onload: (status, data) => handleManageDockerResponse(command, targets, status, data),
@@ -2438,7 +4107,7 @@ function onVisibilityChange() {
 		}
 		fetchUpdateStatus();
 		if (!updatePollTimer) {
-			updatePollTimer = setInterval(fetchUpdateStatus, UPDATE_POLL_MS);
+			updatePollTimer = setInterval(fetchUpdateStatus, JOB_POLL_MS);
 		}
 		startCommandProgressTick();
 	}
@@ -2466,6 +4135,28 @@ function bindOverlayDismiss(modalId, closeBtnId, onClose) {
 }
 
 bindOverlayDismiss("camera_live_modal", "camera_live_close", closeCameraLive);
+bindOverlayDismiss("plc_tag_modal", "plc_tag_modal_close", closePlcTagModal);
+bindOverlayDismiss("drift_images_modal", "drift_images_close", closeDriftImagesModal);
+$("plc_tag_modal_list").addEventListener("click", (event) => {
+	const driftImagesBtn = event.target.closest(".drift-images-btn");
+	if (!driftImagesBtn) return;
+	event.preventDefault();
+	openDriftImagesModal({
+		camUid: driftImagesBtn.dataset.camUid,
+		pipeline: driftImagesBtn.dataset.pipeline
+			|| (plcTagModalState && plcTagModalState.pipeline)
+			|| "",
+		title: driftImagesBtn.dataset.camName || "Drift Images",
+	});
+});
+$("drift_images_reset").addEventListener("click", () => {
+	if (!driftImagesState) return;
+	resetCameraDrift(
+		driftImagesState.camUid,
+		driftImagesState.pipeline || "",
+		$("drift_images_reset"),
+	);
+});
 bindOverlayDismiss("ping_modal", "ping_modal_close", closePingModal);
 $("ping_modal_open").addEventListener("click", () => {
 	const url = $("ping_modal_open").dataset.url;
@@ -2492,6 +4183,36 @@ $("status_body").addEventListener("click", (event) => {
 		);
 		return;
 	}
+	const plcTagBtn = event.target.closest(".device-chip-plc-tag, .device-chip-drift-tag");
+	if (plcTagBtn) {
+		event.preventDefault();
+		let tags = [];
+		let meta = {};
+		try {
+			tags = JSON.parse(plcTagBtn.dataset.plcTags || "[]");
+		} catch (_e) {
+			tags = [];
+		}
+		try {
+			meta = JSON.parse(plcTagBtn.dataset.plcMeta || "{}");
+		} catch (_e) {
+			meta = {};
+		}
+		const isDrift = plcTagBtn.classList.contains("device-chip-drift-tag");
+		const pipeline = plcTagBtn.dataset.pipeline
+			|| plcTagBtn.closest(".status-item")?.dataset?.pipeline
+			|| "";
+		openPlcTagModal({
+			title: plcTagBtn.dataset.plcTitle
+				|| plcTagBtn.getAttribute("title")
+				|| (isDrift ? "Drift Cameras" : "PLC Tags"),
+			url: plcTagBtn.dataset.plcUrl || "",
+			tags,
+			meta,
+			pipeline,
+		});
+		return;
+	}
 	const scrollBtn = event.target.closest(".device-chip-btn[data-pipeline]:not([data-cam])");
 	if (scrollBtn) {
 		event.preventDefault();
@@ -2512,12 +4233,55 @@ $("status_body").addEventListener("click", (event) => {
 	}
 });
 
+function syncStickyOffset() {
+	const toolbar = document.querySelector(".sticky-toolbar");
+	const height = toolbar ? Math.ceil(toolbar.getBoundingClientRect().height) : 0;
+	document.documentElement.style.setProperty("--sticky-offset", `${height}px`);
+	updateStickySectionHeads();
+}
+
+function stickyOffsetPx() {
+	const raw = getComputedStyle(document.documentElement).getPropertyValue("--sticky-offset");
+	const n = parseFloat(raw);
+	return Number.isFinite(n) ? n : 0;
+}
+
+function updateStickySectionHeads() {
+	const offset = stickyOffsetPx();
+	document.querySelectorAll(".card--collapsible > .card-section-head").forEach((head) => {
+		const sentinel = head.previousElementSibling;
+		if (!sentinel || !sentinel.classList.contains("card-sticky-sentinel")) return;
+		const stuck = sentinel.getBoundingClientRect().top < offset + 0.5;
+		head.classList.toggle("is-stuck", stuck);
+	});
+}
+
+function bindStickyOffset() {
+	document.querySelectorAll(".card--collapsible > .card-section-head").forEach((head) => {
+		if (head.previousElementSibling?.classList.contains("card-sticky-sentinel")) return;
+		const sentinel = document.createElement("div");
+		sentinel.className = "card-sticky-sentinel";
+		sentinel.setAttribute("aria-hidden", "true");
+		head.parentElement.insertBefore(sentinel, head);
+	});
+	syncStickyOffset();
+	window.addEventListener("scroll", updateStickySectionHeads, { passive: true });
+	window.addEventListener("resize", syncStickyOffset);
+	const toolbar = document.querySelector(".sticky-toolbar");
+	if (toolbar && typeof ResizeObserver !== "undefined") {
+		const observer = new ResizeObserver(() => syncStickyOffset());
+		observer.observe(toolbar);
+	}
+}
+
 document.addEventListener("keydown", handleEscapeKey);
 document.addEventListener("visibilitychange", onVisibilityChange);
 bindPageActions();
 bindViewControls();
+bindStickyOffset();
 restoreCardSections();
 refreshViewSelects();
 renderTargetGroups();
+renderServerGroups();
 fetchUpdateStatus();
 startFreshCollect();

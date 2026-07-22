@@ -1,0 +1,27 @@
+# Central proxy UI (port 5503). Edge agents use setup_client.py instead.
+#
+# Install (as root), then edit User / paths / Python if needed:
+#   sudo cp systemd/server_command_proxy.service.example \
+#     /etc/systemd/system/server_command_proxy.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now server_command_proxy.service
+#
+# After changing servers.json, restart this unit (config is loaded at process start).
+
+[Unit]
+Description=Server Command Proxy
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+User=everguard
+WorkingDirectory=/home/everguard/server_command
+# Prefer the same interpreter used to install requirements (python3 or python3.8).
+ExecStart=/usr/bin/python3 /home/everguard/server_command/proxy_server.py
+
+[Install]
+WantedBy=multi-user.target

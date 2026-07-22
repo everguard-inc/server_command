@@ -25,6 +25,7 @@ from servers_cfg import (
   SYS_MONITOR_SERVICE,
   default_service_name,
   eg_service_name,
+  is_kafka_pipeline,
   is_rtls_pipeline,
   is_sys_monitor_entry,
   is_usable_edge_host,
@@ -43,6 +44,8 @@ PIPELINE_FIELD_ORDER = (
   "eg_pipeline_path",
   "sys_monitor_path",
 )
+# Optional plc_status_* / drift_service_* keys are preserved via the extra-keys
+# pass when present locally; runtime builds defaults from server_ip.
 SYS_MONITOR_FIELD_ORDER = (
   "server_ip",
   "server_id",
@@ -221,13 +224,24 @@ def build_pipeline_entry(pipeline_name, site_entry, cfg=None, local_entry=None):
     return None
 
   local_entry = local_entry or {}
+  eg_path = (
+    str(local_entry.get("eg_pipeline_path") or "").strip()
+    or pipeline_path_for(pipeline_name)
+  )
   entry = {
     "server_id": server_id,
     "service_name": local_entry.get("service_name") or default_service_name(pipeline_name, server_id),
-    "eg_pipeline_path": pipeline_path_for(pipeline_name),
-    "sys_monitor_path": SYS_MONITOR_PATH,
+    "eg_pipeline_path": eg_path,
     "server_ip": _resolved_server_ip(cfg, local_entry, streaming_ip_from_cfg),
   }
+  # Keep local absence of sys_monitor_path (e.g. PLC-Kafka). New non-kafka AWS
+  # pipelines still get the default path so Update keeps building system_monitor.
+  if "sys_monitor_path" in local_entry:
+    sys_path = str(local_entry.get("sys_monitor_path") or "").strip()
+    if sys_path:
+      entry["sys_monitor_path"] = sys_path
+  elif not is_kafka_pipeline(name=pipeline_name, cfg={"eg_pipeline_path": eg_path}):
+    entry["sys_monitor_path"] = SYS_MONITOR_PATH
   monitor_host = system_monitor_host_from_cfg(cfg) or local_entry.get("monitor_host_ip")
   if is_usable_edge_host(monitor_host):
     entry["monitor_host_ip"] = monitor_host
@@ -260,7 +274,54 @@ def reorder_pipeline_entry(entry, pipeline_name=None):
       if is_sys_monitor_entry(name=pipeline_name, cfg=entry)
       else eg_service_name(entry.get("server_id", ""))
     )
+  # Keep any extra local-only keys (future fields) after the known order.
+  for key, value in entry.items():
+    if key not in ordered:
+      ordered[key] = value
   return ordered
+
+
+def compose_synced_servers(aws_servers, local_servers, site_servers, failed_names):
+  """Keep AWS sync results, preserve local-only pipelines not present in S3.
+
+  Local file order is kept for entries that already existed locally; brand-new
+  AWS pipelines are appended. Extra local keys (e.g. plc_status_url) survive
+  on entries that exist in both.
+  """
+  final = OrderedDict()
+  preserved = []
+  failed = set(failed_names or [])
+  aws_ok = set(aws_servers)
+
+  for name, local_entry in local_servers.items():
+    local = local_entry or {}
+    if name in aws_ok:
+      entry = dict(aws_servers[name])
+      if local.get("eg_pipeline_path"):
+        entry["eg_pipeline_path"] = local["eg_pipeline_path"]
+      if local.get("service_name"):
+        entry["service_name"] = local["service_name"]
+      if "sys_monitor_path" in local:
+        sys_path = str(local.get("sys_monitor_path") or "").strip()
+        if sys_path:
+          entry["sys_monitor_path"] = sys_path
+        else:
+          entry.pop("sys_monitor_path", None)
+      for key, value in local.items():
+        if key not in entry:
+          entry[key] = value
+      final[name] = reorder_pipeline_entry(entry, pipeline_name=name)
+      continue
+    if name not in site_servers or name in failed:
+      # Not in S3 (manual local add), or S3 sync failed — keep local entry.
+      final[name] = reorder_pipeline_entry(dict(local), pipeline_name=name)
+      preserved.append(name)
+
+  for name, entry in aws_servers.items():
+    if name not in final:
+      final[name] = entry
+
+  return final, preserved
 
 
 def main():
@@ -327,7 +388,7 @@ def main():
   fetch_elapsed = time.time() - t0
 
   synced, failed = 0, []
-  servers = OrderedDict()
+  aws_servers = OrderedDict()
 
   for name in pipeline_names:
     local_entry = local_servers.get(name, {})
@@ -343,9 +404,12 @@ def main():
     if not entry:
       failed.append(name)
       continue
-    servers[name] = reorder_pipeline_entry(entry, pipeline_name=name)
+    aws_servers[name] = reorder_pipeline_entry(entry, pipeline_name=name)
     synced += 1
 
+  servers, preserved = compose_synced_servers(
+    aws_servers, local_servers, site_servers, failed,
+  )
   write_servers_file(meta, servers, path=args.servers, xsite_id=xsite_id)
 
   elapsed = time.time() - t0
@@ -353,9 +417,13 @@ def main():
   print(
     f"Done in {elapsed:.1f}s ({fetch_note}): "
     f"synced {synced}/{len(pipeline_names)}, skipped {len(skipped)}, failed {len(failed)}, "
-    f"cfg fetched {cfg_count}"
+    f"preserved local-only {len(preserved)}, cfg fetched {cfg_count}"
   )
-  for label, names in (("Skipped", skipped), ("Failed", failed)):
+  for label, names in (
+    ("Skipped", skipped),
+    ("Failed", failed),
+    ("Preserved local-only", preserved),
+  ):
     if not names:
       continue
     shown = ", ".join(names[:10])

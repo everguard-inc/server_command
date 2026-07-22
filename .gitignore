@@ -128,8 +128,10 @@ ENV/
 env.bak/
 venv.bak/
 
-#IDE
+# IDE / OS
 .vscode/
+.DS_Store
+**/.DS_Store
 
 # Spyder project settings
 .spyderproject

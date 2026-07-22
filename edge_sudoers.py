@@ -1,10 +1,10 @@
 """Shared sudoers/systemctl helpers for deploy_clients and setup_client."""
 
 import os
-import shlex
 import shutil
 
 SUDOERS_DEST = "/etc/sudoers.d/server_command"
+SERVICE_UNIT = "server_command_client.service"
 REMOTE_SHELL = ("env", "-u", "BASH_ENV", "bash", "--norc", "--noprofile")
 
 
