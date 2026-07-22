@@ -53,6 +53,7 @@ EDGE_STATUS_KEYS = (
   "plc_tags_now", "plc_tags_set", "plc_tag_status", "plc_tag_links",
   "plc_tag_groups", "plc_tags_ok",
   "drift_status", "drift_cameras_set", "drift_cameras_now",
+  "drift_cameras_online",
   "drift_camera_status", "drift_camera_links", "drift_camera_groups",
   "drift_api_ok",
   "stream_health", "status", "mem_usage", "mem_usage_percent",
@@ -380,6 +381,7 @@ def empty_camera_drift_metrics():
     "drift_status": None,
     "drift_cameras_set": None,
     "drift_cameras_now": None,
+    "drift_cameras_online": None,
     "drift_camera_status": [],
     "drift_camera_links": [],
     "drift_camera_groups": [],
@@ -424,12 +426,12 @@ def _ipv4_sort_key(text):
 
 
 def _drift_tag_sort_key(tag):
-  """DRIFT first, then numeric IP ascending from the camera label."""
+  """DRIFT first; otherwise numeric IP ascending."""
   value = str((tag or {}).get("value") or "").strip().lower()
   drifted = 0 if value == "drift" else 1
   name = str((tag or {}).get("name") or "")
-  _found, ip_parts, label = _ipv4_sort_key(name)
-  return (drifted, _found, ip_parts, label.lower())
+  found, ip_parts, label = _ipv4_sort_key(name)
+  return (drifted, found, ip_parts, label.lower())
 
 
 def _drift_area_key(cam):
@@ -446,8 +448,29 @@ def _drift_area_key(cam):
   return parts[0] if parts else "Other"
 
 
+def _is_camera_online(cam):
+  return str((cam or {}).get("status") or "").strip().lower() == "online"
+
+
+def _drift_tag_fields(is_drift, is_online):
+  """Return (value, health, title_state, area_chip_state). OFF never warns chips."""
+  if is_drift:
+    return "DRIFT", "err", "Drifted", "err"
+  if not is_online:
+    return "OFF", "idle", "Offline", "ok"
+  return "OK", "ok", "OK", "ok"
+
+
+def _drift_area_chip_health(drifted, total):
+  if drifted <= 0:
+    return "ok"
+  if total and drifted >= total:
+    return "err"
+  return "warn"
+
+
 def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
-  """Probe /get_drift + /api/cameras; group like PLC (area → sub chips)."""
+  """Probe /get_drift + /api/cameras; one TOTAL block with area chips."""
   empty = empty_camera_drift_metrics()
   if not base_url:
     return empty
@@ -473,26 +496,23 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
   except _HTTP_JSON_ERRORS:
     cameras = []
 
-  # /api/cameras timed out or failed: do not publish a fake 0-camera OK.
+  # Incomplete cameras list: avoid publishing a fake 0-camera OK.
   if not cameras_ok:
-    empty["drift_status"] = str(drift_payload.get("camera_status") or "").strip().upper() or None
+    empty["drift_status"] = (
+      str(drift_payload.get("camera_status") or "").strip().upper() or None
+    )
     empty["drift_api_ok"] = None
     return empty
 
   abnormal = drift_payload.get("abnormal_cameras") or []
   if not isinstance(abnormal, list):
     abnormal = []
-  drifted_ids = {
-    str(cid).strip() for cid in abnormal if str(cid).strip()
-  }
-  # Prefer live isDrift flags when /api/cameras is available.
+  drifted_ids = {str(cid).strip() for cid in abnormal if str(cid).strip()}
   for cam in cameras:
     cid = str(cam.get("id") or "").strip()
     if cid and cam.get("isDrift"):
       drifted_ids.add(cid)
 
-  drift_status = str(drift_payload.get("camera_status") or "").strip().upper()
-  # One Drift block; chips are top areas (RND, LBC, PC2, …).
   preferred_chip_order = ("RND", "LBC", "PC2")
   areas = {}
   flat_links = []
@@ -502,46 +522,57 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     cid = str(cam.get("id") or "").strip()
     if not cid:
       continue
-    top = _drift_area_key(cam)
     is_drift = cid in drifted_ids or bool(cam.get("isDrift"))
+    is_online = _is_camera_online(cam)
     name = str(cam.get("display_name") or cam.get("name") or cid).strip()
-    short = _drift_camera_short_label(cam)
+    tag_value, tag_health, title_state, chip_state = _drift_tag_fields(
+      is_drift, is_online,
+    )
     tag = {
       "name": name,
-      "value": "DRIFT" if is_drift else "OK",
-      "health": "err" if is_drift else "ok",
+      "value": tag_value,
+      "health": tag_health,
       "id": cid,
     }
+    top = _drift_area_key(cam)
     area = areas.setdefault(top, {"now": 0, "set": 0, "tags": []})
     area["set"] += 1
     if is_drift:
       area["now"] += 1
     area["tags"].append(tag)
     flat_links.append({
-      "label": short,
-      "title": f"{'Drifted' if is_drift else 'OK'}: {name}",
+      "label": _drift_camera_short_label(cam),
+      "title": f"{title_state}: {name}",
       "value": cid,
       "id": cid,
       "url": root,
     })
-    flat_statuses.append("err" if is_drift else "ok")
+    flat_statuses.append(chip_state)
+
+	# Empty /api/cameras: surface drifted IDs from /get_drift only.
+  if not cameras:
+    for cid in sorted(drifted_ids):
+      flat_links.append({
+        "label": _drift_camera_short_label({"id": cid}),
+        "title": f"Drifted camera: {cid}",
+        "value": cid,
+        "id": cid,
+        "url": root,
+      })
+      flat_statuses.append("err")
 
   chip_status = []
   chip_links = []
   ordered_areas = [name for name in preferred_chip_order if name in areas]
-  ordered_areas.extend(sorted(name for name in areas if name not in preferred_chip_order))
+  ordered_areas.extend(
+    sorted(name for name in areas if name not in preferred_chip_order)
+  )
   for area_name in ordered_areas:
     area = areas[area_name]
     area["tags"].sort(key=_drift_tag_sort_key)
     area_now = area["now"]
     area_set = area["set"]
-    if area_now <= 0:
-      health = "ok"
-    elif area_now >= area_set:
-      health = "err"
-    else:
-      health = "warn"
-    chip_status.append(health)
+    chip_status.append(_drift_area_chip_health(area_now, area_set))
     chip_links.append({
       "label": area_name,
       "title": f"{area_name}: {area_now} drifted / {area_set} cameras",
@@ -551,41 +582,36 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
       "tags": area["tags"],
     })
 
+  if cameras:
+    drift_set = len(cameras)
+    drift_now = sum(
+      1 for cam in cameras if str(cam.get("id") or "").strip() in drifted_ids
+    )
+    drift_online = sum(1 for cam in cameras if _is_camera_online(cam))
+  else:
+    drift_set = len(flat_links)
+    drift_now = sum(1 for status in flat_statuses if status == "err")
+    drift_online = 0
+
   groups = []
   if chip_links:
     groups.append({
       "label": "Drift",
-      "now": sum(area["now"] for area in areas.values()),
-      "set": sum(area["set"] for area in areas.values()),
+      "now": drift_now,
+      "set": drift_set,
+      "online": drift_online,
       "chip_status": chip_status,
       "links": chip_links,
     })
 
-  # Fallback when /api/cameras is empty: flat drifted IDs only.
-  if not cameras:
-    for cid in sorted(drifted_ids):
-      short_id = cid.split("-", 1)[0] if "-" in cid else cid[:8]
-      flat_links.append({
-        "label": short_id,
-        "title": f"Drifted camera: {cid}",
-        "value": cid,
-        "id": cid,
-        "url": root,
-      })
-      flat_statuses.append("err")
-
-  drift_now = sum(1 for status in flat_statuses if status == "err")
-  if cameras:
-    drift_now = sum(
-      1 for cam in cameras if str(cam.get("id") or "").strip() in drifted_ids
-    )
-  drift_set = len(cameras) if cameras else len(flat_links)
+  drift_status = str(drift_payload.get("camera_status") or "").strip().upper()
   if not drift_status:
     drift_status = "OK" if drift_now == 0 else "WARN"
   return {
     "drift_status": drift_status,
     "drift_cameras_set": drift_set,
     "drift_cameras_now": drift_now,
+    "drift_cameras_online": drift_online,
     "drift_camera_status": flat_statuses,
     "drift_camera_links": flat_links,
     "drift_camera_groups": groups,

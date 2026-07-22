@@ -153,6 +153,12 @@ def _camera_count_hint(payload, pipeline_name=None):
   cameras = _config_cameras_from_payload(payload)
   if cameras:
     return len(cameras)
+  by_cam = _plc_jpeg_by_cam_map(payload)
+  if by_cam:
+    return len(by_cam)
+  unique = _plc_unique_cam_numbers(payload)
+  if unique:
+    return len(unique)
   jpeg = payload.get("jpeg")
   if isinstance(jpeg, list):
     return len(jpeg)
@@ -173,15 +179,14 @@ def _camera_stream_slot(payload, cam_idx, *, pipeline_name=None):
   if cam_idx < 0:
     return None
 
+  handled, slot = _plc_special_slot(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  if handled:
+    return slot
+
   cameras = _config_cameras_from_payload(payload)
   jpeg = payload.get("jpeg")
-
-  # PLC /stream: one jpeg blob, often without config.camera — serve mosaic for any cam.
-  if isinstance(jpeg, str) and jpeg:
-    count = _camera_count_hint(payload, pipeline_name)
-    if count is None or cam_idx < count:
-      return 0
-    return None
 
   if not cameras or cam_idx >= len(cameras):
     # No config cameras: map by jpeg list index when possible.
@@ -243,13 +248,15 @@ def _sse_can_map_camera(payload, cam_idx, *, pipeline_name=None):
   """Return False when SSE cannot ever serve this camera index."""
   if cam_idx < 0:
     return False
+
+  handled, slot = _plc_special_slot(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  if handled:
+    return slot is not None
+
   cameras = _config_cameras_from_payload(payload)
   jpeg = payload.get("jpeg")
-
-  # PLC mosaic jpeg (string) without config.camera.
-  if isinstance(jpeg, str) and jpeg:
-    count = _camera_count_hint(payload, pipeline_name)
-    return count is None or cam_idx < count
 
   if not cameras:
     return isinstance(jpeg, list) and cam_idx < len(jpeg)
@@ -379,6 +386,13 @@ def _stream_feed_paths_for_pipeline(pipeline_name):
 
 
 def _camera_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
+  # Prefer PLC-CV per-camera / per-sign ROI maps when present.
+  if _plc_has_per_cam_frames(payload):
+    frame = _plc_roi_frame_from_payload(
+      payload, cam_idx, pipeline_name=pipeline_name,
+    )
+    return frame or ""
+
   jpeg = payload.get("jpeg")
   slot = _camera_stream_slot(payload, cam_idx, pipeline_name=pipeline_name)
   if slot is None:
@@ -391,6 +405,308 @@ def _camera_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
   if isinstance(jpeg, str) and slot == 0:
     return jpeg
   return ""
+
+
+_LAMP_COLOR_RE = re.compile(
+  r"\b(RED|GREEN|YELLOW|ORANGE|BLUE|WHITE|AMBER)\b", re.I,
+)
+_LAMP_CAM_RE = re.compile(r"Cam\s*(\d+)", re.I)
+_ROI_COLOR_PRIORITY = {
+  "RED": 0,
+  "YELLOW": 1,
+  "ORANGE": 1,
+  "AMBER": 1,
+  "GREEN": 2,
+  "BLUE": 3,
+  "WHITE": 4,
+}
+
+
+def _lamp_color_from_text(*parts):
+  for part in parts:
+    match = _LAMP_COLOR_RE.search(str(part or ""))
+    if match:
+      return match.group(1).upper()
+  return ""
+
+
+def _lamp_is_on(state):
+  text = str(state or "").strip()
+  if not text or re.fullmatch(r"OFF", text, re.I):
+    return False
+  if re.search(r"\bOFF\b", text, re.I) and not re.search(r"\bON\b", text, re.I):
+    return False
+  return bool(re.search(r"\bON\b", text, re.I))
+
+
+def _cam_number_from_text(text):
+  match = _LAMP_CAM_RE.search(str(text or ""))
+  return int(match.group(1)) if match else None
+
+
+def _camera_link_cam_number(pipeline_name, cam_idx):
+  """Prefer CamN embedded in camera_links title/label for this C-chip index."""
+  if not pipeline_name or not isinstance(cam_idx, int) or cam_idx < 0:
+    return None
+  entry = img_n_status.get(pipeline_name) or {}
+  links = entry.get("camera_links") or []
+  if cam_idx >= len(links):
+    return None
+  link = links[cam_idx] or {}
+  for key in ("title", "label", "name"):
+    num = _cam_number_from_text(link.get(key))
+    if num is not None:
+      return num
+  return None
+
+
+def _plc_sign_ids(payload):
+  states = payload.get("states")
+  if not isinstance(states, dict) or not states:
+    return []
+  order = payload.get("signOrder")
+  ids = [sid for sid in order if sid in states] if isinstance(order, list) else []
+  ids.extend(sid for sid in states if sid not in ids)
+  return ids
+
+
+def _plc_sign_entries(payload):
+  """Return [(sign_id, name, cam_num, color, state), ...] in signOrder."""
+  states = payload.get("states")
+  if not isinstance(states, dict):
+    return []
+  stats_map = payload.get("allRatioStats")
+  if not isinstance(stats_map, dict):
+    stats_map = {}
+  entries = []
+  for sid in _plc_sign_ids(payload):
+    entry = states.get(sid)
+    if not isinstance(entry, (list, tuple)) or not entry:
+      continue
+    name = str(entry[0] or "").strip()
+    state = str(entry[1] if len(entry) > 1 else "").strip()
+    stats = stats_map.get(sid) if isinstance(stats_map.get(sid), dict) else {}
+    color = str(stats.get("color") or "").strip().upper() or _lamp_color_from_text(
+      state, name,
+    )
+    entries.append((sid, name, _cam_number_from_text(name), color, state))
+  return entries
+
+
+def _plc_unique_cam_numbers(payload):
+  seen = []
+  for _sid, _name, cam_num, _color, _state in _plc_sign_entries(payload):
+    if cam_num is not None and cam_num not in seen:
+      seen.append(cam_num)
+  return seen
+
+
+def _plc_resolve_cam_number(payload, cam_idx, *, pipeline_name=None):
+  """Map C-chip index to sign CamN. Plant signs use Cam8/Cam3, not Cam1=C1."""
+  if not isinstance(cam_idx, int) or cam_idx < 0:
+    return None
+  link_num = _camera_link_cam_number(pipeline_name, cam_idx)
+  if link_num is not None:
+    return link_num
+  unique = _plc_unique_cam_numbers(payload)
+  if unique and cam_idx < len(unique):
+    return unique[cam_idx]
+  return None
+
+
+def _plc_jpeg_by_sign_map(payload):
+  raw = payload.get("jpeg_by_sign")
+  return raw if isinstance(raw, dict) else {}
+
+
+def _plc_jpeg_by_cam_map(payload):
+  for key in ("jpeg_by_cam", "jpeg_by_camera", "jpegByCam"):
+    raw = payload.get(key)
+    if isinstance(raw, dict) and raw:
+      return raw
+  return {}
+
+
+def _plc_has_per_cam_frames(payload):
+  by_sign = _plc_jpeg_by_sign_map(payload)
+  if any(isinstance(v, str) and v for v in by_sign.values()):
+    return True
+  by_cam = _plc_jpeg_by_cam_map(payload)
+  return any(isinstance(v, str) and v for v in by_cam.values())
+
+
+def _plc_special_slot(payload, cam_idx, *, pipeline_name=None):
+  """PLC jpeg layouts (ROI maps / single blob / Cam-aligned list).
+
+  Returns (handled, slot). handled=False → use normal EG camera mapping.
+  """
+  if _plc_has_per_cam_frames(payload):
+    if _plc_roi_frame_from_payload(
+      payload, cam_idx, pipeline_name=pipeline_name,
+    ):
+      return True, 0
+    # Maps present but this cam not ready yet — keep reading SSE.
+    count = _camera_count_hint(payload, pipeline_name)
+    if count is None or cam_idx < count:
+      return True, 0
+    return True, None
+
+  cameras = _config_cameras_from_payload(payload)
+  jpeg = payload.get("jpeg")
+
+  # Legacy: one selected-sign ROI jpeg shared by every chip.
+  if isinstance(jpeg, str) and jpeg:
+    count = _camera_count_hint(payload, pipeline_name)
+    if count is None or cam_idx < count:
+      return True, 0
+    return True, None
+
+  # jpeg[] aligned with unique CamN order from states.
+  if isinstance(jpeg, list) and not cameras:
+    unique = _plc_unique_cam_numbers(payload)
+    if unique:
+      if cam_idx < len(unique) and cam_idx < len(jpeg):
+        return True, cam_idx
+      return True, None
+    if cam_idx < len(jpeg):
+      return True, cam_idx
+    return True, None
+
+  return False, None
+
+
+def _lookup_cam_keyed_frame(by_cam, cam_num, cam_idx):
+  if not by_cam:
+    return None
+  keys = []
+  if cam_num is not None:
+    keys.extend([
+      cam_num,
+      str(cam_num),
+      f"Cam{cam_num}",
+      f"cam{cam_num}",
+      f"CAM{cam_num}",
+    ])
+  if isinstance(cam_idx, int) and cam_idx >= 0:
+    keys.extend([cam_idx, str(cam_idx), f"C{cam_idx + 1}"])
+  for key in keys:
+    frame = by_cam.get(key)
+    if isinstance(frame, str) and frame:
+      return frame
+  # Case-insensitive CamN key scan.
+  if cam_num is not None:
+    needle = f"cam{cam_num}"
+    for key, frame in by_cam.items():
+      if not isinstance(frame, str) or not frame:
+        continue
+      if str(key).strip().lower().replace(" ", "") == needle:
+        return frame
+  return None
+
+
+def _plc_roi_frame_from_jpeg_by_sign(payload, cam_num):
+  by_sign = _plc_jpeg_by_sign_map(payload)
+  if not by_sign:
+    return None
+  candidates = []
+  for sid, name, sign_cam, color, state in _plc_sign_entries(payload):
+    if cam_num is not None and sign_cam != cam_num:
+      continue
+    frame = by_sign.get(sid)
+    if not isinstance(frame, str) or not frame:
+      continue
+    priority = _ROI_COLOR_PRIORITY.get(color or "", 50)
+    # Prefer an ON lamp crop when several colors share a camera.
+    on_rank = 0 if _lamp_is_on(state) else 1
+    candidates.append((on_rank, priority, name, frame))
+  if candidates:
+    candidates.sort()
+    return candidates[0][3]
+  # Lab / no Cam labels: use selected signId frame.
+  if cam_num is None:
+    sid = payload.get("signId")
+    frame = by_sign.get(sid) if sid else None
+    if isinstance(frame, str) and frame:
+      return frame
+    for frame in by_sign.values():
+      if isinstance(frame, str) and frame:
+        return frame
+  return None
+
+
+def _plc_roi_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
+  """Pick ROI jpeg for a C-chip from jpeg_by_cam / jpeg_by_sign."""
+  cam_num = _plc_resolve_cam_number(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  by_cam = _plc_jpeg_by_cam_map(payload)
+  if by_cam:
+    frame = _lookup_cam_keyed_frame(by_cam, cam_num, cam_idx)
+    if frame:
+      return frame
+  if _plc_jpeg_by_sign_map(payload):
+    return _plc_roi_frame_from_jpeg_by_sign(payload, cam_num)
+  return None
+
+
+def _lamps_public(lamps):
+  """Drop internal cam index before sending to the UI."""
+  for lamp in lamps:
+    lamp.pop("cam", None)
+  return lamps
+
+
+def _lamp_judgments_from_payload(payload, cam_idx=None, *, pipeline_name=None):
+  """PLC-CV /stream lamp judgments from states (+ optional cam filter)."""
+  states = payload.get("states")
+  if not isinstance(states, dict) or not states:
+    return None
+
+  lamps = []
+  for _sid, name, cam_num, color, state in _plc_sign_entries(payload):
+    if not name and not state:
+      continue
+    on = _lamp_is_on(state)
+    lamps.append({
+      "name": name,
+      "state": state or ("ON" if on else "OFF"),
+      "color": color,
+      "on": on,
+      "cam": cam_num,
+    })
+
+  if not lamps:
+    return []
+
+  # No CamN labels (lab / RND desk): show every sign.
+  if all(lamp.get("cam") is None for lamp in lamps):
+    return _lamps_public(lamps)
+
+  resolved = _plc_resolve_cam_number(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  if resolved is None:
+    return _lamps_public(lamps)
+
+  matched = [lamp for lamp in lamps if lamp.get("cam") == resolved]
+  if matched:
+    return _lamps_public(matched)
+  return _lamps_public(lamps)
+
+
+def _camera_feed_event(payload, cam_idx, *, pipeline_name=None):
+  frame = _camera_frame_from_payload(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  if not frame:
+    return None
+  event = {"jpeg": frame, "fps": payload.get("fps")}
+  lamps = _lamp_judgments_from_payload(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  if lamps is not None:
+    event["lamps"] = lamps
+  return event
 
 
 def load_cfg():
@@ -416,6 +732,7 @@ def _base_status_entry(name, image_cfg):
     "speaker_now": None,
     "is_rtls": False if is_sys else flags["is_rtls"],
     "is_kafka": False if is_sys else flags["is_kafka"],
+    "is_plc_cv": False if is_sys else flags["is_plc_cv"],
     "is_camera_drift": False if is_sys else flags["is_camera_drift"],
     "is_sys_monitor": is_sys,
     "cameras_now": None,
@@ -857,6 +1174,7 @@ def _status_request_item(name, image_cfg):
     "eg_pipeline_path": image_cfg.get("eg_pipeline_path"),
     "is_rtls": flags["is_rtls"],
     "is_kafka": flags["is_kafka"],
+    "is_plc_cv": flags["is_plc_cv"],
     "is_camera_drift": flags["is_camera_drift"],
     "monitor_host_ip": image_cfg.get("monitor_host_ip"),
     "server_ip": image_cfg.get("server_ip"),
@@ -1023,6 +1341,7 @@ def _apply_host_status(ip, host_result):
     flags = pipeline_kind_flags(name=name, cfg=image_cfg)
     entry["is_rtls"] = flags["is_rtls"]
     entry["is_kafka"] = flags["is_kafka"]
+    entry["is_plc_cv"] = flags["is_plc_cv"]
     entry["is_camera_drift"] = flags["is_camera_drift"]
     entry["is_sys_monitor"] = flags["is_sys_monitor"]
     if flags["is_kafka"] and not entry.get("plc_status_url"):
@@ -1741,12 +2060,12 @@ def camera_feed():
                     break
                   continue
                 unresolved_lines = 0
-                frame = _camera_frame_from_payload(
+                event = _camera_feed_event(
                   payload, cam_idx, pipeline_name=pipeline_name,
                 )
-                if frame:
+                if event:
                   got_stream_frame = True
-                  yield f"data: {json.dumps({'jpeg': frame, 'fps': payload.get('fps')})}\n\n"
+                  yield f"data: {json.dumps(event)}\n\n"
           except httpx.HTTPError:
             continue
           if warmup_limit == 0 and not got_stream_frame:

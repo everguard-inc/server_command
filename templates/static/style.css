@@ -894,7 +894,7 @@ body.overlay-scroll-lock {
 }
 
 .metric-sep {
-  margin: 0 2px;
+  margin: 0;
   color: var(--text-dim);
 }
 
@@ -1786,6 +1786,14 @@ body.overlay-scroll-lock {
 .overlay__caption {
   font-size: var(--text-sm);
   color: var(--muted);
+}
+
+.camera-live-lamps:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  justify-content: center;
 }
 
 /* ── Service control ── */

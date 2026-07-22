@@ -372,6 +372,11 @@ function pipelineRuntimeFlags(name, entry) {
 			?? info.is_kafka
 			?? rawKind === "plc_kafka",
 		),
+		isPlcCv: Boolean(
+			entry?.is_plc_cv
+			?? info.is_plc_cv
+			?? rawKind === "plc_cv",
+		),
 		isCameraDrift: Boolean(
 			entry?.is_camera_drift
 			?? info.is_camera_drift
@@ -1180,6 +1185,53 @@ function setCameraLiveImageVisible(visible) {
 	$("camera_live_img").classList.toggle("hidden", !visible);
 }
 
+function clearCameraLiveLamps() {
+	const el = $("camera_live_lamps");
+	if (!el) return;
+	el.innerHTML = "";
+	el.hidden = true;
+}
+
+const LAMP_WARN_COLORS = new Set(["YELLOW", "ORANGE", "AMBER"]);
+
+function lampChipTone(lamp) {
+	if (!lamp || !lamp.on) return "idle";
+	const color = String(lamp.color || "").toUpperCase();
+	if (color === "RED") return "err";
+	if (LAMP_WARN_COLORS.has(color)) return "warn";
+	return "ok";
+}
+
+function lampChipLabel(lamp) {
+	const name = String(lamp?.name || "").trim();
+	if (name) return name;
+	const state = String(lamp?.state || "").trim();
+	const color = String(lamp?.color || "").trim().toUpperCase();
+	if (/^OFF$/i.test(state) && color) return `${color} OFF`;
+	if (state) return state;
+	if (color) return lamp?.on ? `${color} ON` : `${color} OFF`;
+	return lamp?.on ? "ON" : "OFF";
+}
+
+function renderCameraLiveLamps(lamps) {
+	const el = $("camera_live_lamps");
+	if (!el) return;
+	if (!Array.isArray(lamps) || !lamps.length) {
+		clearCameraLiveLamps();
+		return;
+	}
+	el.innerHTML = lamps.map((lamp) => {
+		const label = lampChipLabel(lamp);
+		const state = String(lamp?.state || "").trim();
+		const title = state && label !== state ? `${label}: ${state}` : label;
+		return (
+			`<span class="device-chip device-chip--tag chip-${lampChipTone(lamp)}" `
+			+ `title="${escapeAttr(title)}">${escapeHtml(label)}</span>`
+		);
+	}).join("");
+	el.hidden = false;
+}
+
 function stopCameraLiveStream() {
 	if (cameraLiveSource) {
 		cameraLiveSource.close();
@@ -1188,6 +1240,7 @@ function stopCameraLiveStream() {
 	const img = $("camera_live_img");
 	img.removeAttribute("src");
 	setCameraLiveImageVisible(false);
+	clearCameraLiveLamps();
 }
 
 function closeCameraLive() {
@@ -2004,10 +2057,13 @@ function renderPlcTagMeta(meta) {
 
 let plcTagModalState = null;
 
+function tagValueLower(tag) {
+	return String(tag?.value != null ? tag.value : "").toLowerCase();
+}
+
 function renderPlcTagValue(tag) {
-	const value = tag.value != null ? String(tag.value) : "";
-	const lower = value.toLowerCase();
-	let display = value;
+	const lower = tagValueLower(tag);
+	let display = tag.value != null ? String(tag.value) : "";
 	let tone = "unknown";
 	if (lower === "true" || lower === "false") {
 		display = lower === "true" ? "TRUE" : "FALSE";
@@ -2015,6 +2071,9 @@ function renderPlcTagValue(tag) {
 	} else if (tag.health === "err" || lower === "error" || lower === "drift") {
 		tone = "err";
 		if (lower === "drift") display = "DRIFT";
+	} else if (lower === "off" || lower === "offline") {
+		tone = "idle";
+		display = "OFF";
 	} else if (lower === "ok") {
 		tone = "ok";
 		display = "OK";
@@ -2033,8 +2092,8 @@ function ipv4SortKeyFromText(text) {
 }
 
 function compareDriftCameraTags(a, b) {
-	const aDrift = String(a?.value || "").toLowerCase() === "drift" ? 0 : 1;
-	const bDrift = String(b?.value || "").toLowerCase() === "drift" ? 0 : 1;
+	const aDrift = tagValueLower(a) === "drift" ? 0 : 1;
+	const bDrift = tagValueLower(b) === "drift" ? 0 : 1;
 	if (aDrift !== bDrift) return aDrift - bDrift;
 	const aKey = ipv4SortKeyFromText(a?.name);
 	const bKey = ipv4SortKeyFromText(b?.name);
@@ -2045,22 +2104,44 @@ function compareDriftCameraTags(a, b) {
 	return 0;
 }
 
+function countTagsByValue(list, predicate) {
+	return list.filter((tag) => predicate(tagValueLower(tag))).length;
+}
+
+function formatScopedModalTitle(pipeline, title, fallback) {
+	const group = String(title || "").trim();
+	const pipe = String(pipeline || "").trim();
+	if (pipe && group) {
+		if (
+			group === pipe
+			|| group.startsWith(`${pipe} > `)
+			|| group.startsWith(`${pipe}/`)
+		) {
+			return group;
+		}
+		return `${pipe} > ${group}`;
+	}
+	return group || fallback || "";
+}
+
 function openPlcTagModal({ title, url, tags, meta, pipeline }) {
 	const normalized = normalizePlcTagModalPayload(tags, meta);
 	let list = normalized.tags;
-	const trueN = list.filter((t) => String(t.value).toLowerCase() === "true").length;
-	const falseN = list.filter((t) => String(t.value).toLowerCase() === "false").length;
-	const driftN = list.filter((t) => String(t.value).toLowerCase() === "drift").length;
-	const okN = list.filter((t) => String(t.value).toLowerCase() === "ok").length;
-	const errN = list.filter((t) => t.health === "err" || String(t.value).toLowerCase() === "error").length;
-	const otherN = list.length - trueN - falseN - driftN - okN - errN;
+	const trueN = countTagsByValue(list, (v) => v === "true");
+	const falseN = countTagsByValue(list, (v) => v === "false");
+	const driftN = countTagsByValue(list, (v) => v === "drift");
+	const offN = countTagsByValue(list, (v) => v === "off" || v === "offline");
+	const okN = countTagsByValue(list, (v) => v === "ok");
+	const errN = list.filter((t) => t.health === "err" || tagValueLower(t) === "error").length;
+	const otherN = list.length - trueN - falseN - driftN - offN - okN - errN;
 
-	const isDriftModal = driftN > 0 || okN > 0;
+	const isDriftModal = driftN > 0 || offN > 0 || okN > 0;
 	if (isDriftModal) {
 		list = [...list].sort(compareDriftCameraTags);
 	}
+	const fallback = isDriftModal ? "Drift Cameras" : "PLC Tags";
 	plcTagModalState = {
-		title: title || (isDriftModal ? "Drift Cameras" : "PLC Tags"),
+		title: formatScopedModalTitle(pipeline, title, fallback),
 		url: url || "",
 		tags: list,
 		meta: normalized.meta,
@@ -2069,7 +2150,7 @@ function openPlcTagModal({ title, url, tags, meta, pipeline }) {
 	};
 	$("plc_tag_modal_title").textContent = plcTagModalState.title;
 	const parts = isDriftModal
-		? [`${list.length} cameras`, `${driftN} DRIFT`, `${okN} OK`]
+		? [`${list.length} cameras`, `${driftN} DRIFT`, `${offN} OFF`, `${okN} OK`]
 		: [`${list.length} tags`, `${trueN} true`, `${falseN} false`];
 	if (otherN > 0) parts.push(`${otherN} other`);
 	if (!isDriftModal && errN > 0) parts.push(`${errN} error`);
@@ -2164,8 +2245,12 @@ function openCameraLive(pipeline, camIndex, title) {
 	stopCameraLiveStream();
 	const img = $("camera_live_img");
 	const status = $("camera_live_status");
-	$("camera_live_title").textContent = title || `Camera ${camIndex + 1}`;
+	const fallback = `Camera ${camIndex + 1}`;
+	$("camera_live_title").textContent = formatScopedModalTitle(
+		pipeline, title, fallback,
+	);
 	status.textContent = "Connecting…";
+	clearCameraLiveLamps();
 	setCameraLiveImageVisible(false);
 	setOverlayVisible($("camera_live_modal"), true);
 
@@ -2183,6 +2268,7 @@ function openCameraLive(pipeline, camIndex, title) {
 		if (data.error) {
 			status.textContent = data.error;
 			setCameraLiveImageVisible(false);
+			clearCameraLiveLamps();
 			return;
 		}
 		if (data.jpeg) {
@@ -2195,6 +2281,9 @@ function openCameraLive(pipeline, camIndex, title) {
 				lastFps = fps;
 			}
 			status.textContent = lastFps != null ? `FPS: ${lastFps}` : "Live";
+			if (Object.prototype.hasOwnProperty.call(data, "lamps")) {
+				renderCameraLiveLamps(data.lamps);
+			}
 		} else if (!receivedFrame) {
 			status.textContent = "Waiting for frame…";
 		}
@@ -2408,6 +2497,14 @@ function chipStatusesFromCount(now, set, running) {
 	return statuses;
 }
 
+function isLiveCameraChipPrefix(prefix) {
+	return prefix === "C" || prefix === "Sign";
+}
+
+function usesMetricChipOptions(prefix) {
+	return isLiveCameraChipPrefix(prefix) || prefix === "D" || prefix === "T";
+}
+
 function renderMetricChip({ prefix, index, status, link, liveOptions }) {
 	const fallback = `${prefix}${index + 1}`;
 	// PLC tags: chip text is the state value (true/false/number/error).
@@ -2429,20 +2526,25 @@ function renderMetricChip({ prefix, index, status, link, liveOptions }) {
 		return `<button type="button" class="device-chip-btn" title="Go to ${safeTitle}" aria-label="Go to ${safeTitle}" data-pipeline="${escapeAttr(link.pipeline)}"><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
 	}
 	if (
-		prefix === "C" && status === "ok" && liveOptions
+		isLiveCameraChipPrefix(prefix)
+		&& status === "ok" && liveOptions
 		&& liveOptions.pipeline && liveOptions.streamUrl
 	) {
 		return `<button type="button" class="device-chip-btn device-chip-live" title="View live: ${safeTitle}" aria-label="View live ${escapeAttr(fallback)}" data-pipeline="${escapeAttr(liveOptions.pipeline)}" data-cam="${index}" data-title="${safeTitle}"><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
 	}
 	if (prefix === "T" || (prefix === "D" && link && Array.isArray(link.tags) && link.tags.length)) {
 		const tagsJson = escapeAttr(JSON.stringify(link && link.tags ? link.tags : []));
+		// PLC tags: location/sub (SBC/LineA). Drift areas: just the area (RND), not Drift/RND.
 		const groupTitle = escapeAttr(
-			(link && (link.location ? `${link.location}/${link.value || link.label}` : (link.value || link.label)))
-			|| label,
+			prefix === "D"
+				? ((link && (link.value || link.label)) || label)
+				: ((link && (link.location
+					? `${link.location}/${link.value || link.label}`
+					: (link.value || link.label))) || label),
 		);
 		const metaJson = escapeAttr(JSON.stringify(link && link.meta ? link.meta : {}));
 		const chipBtnClass = prefix === "D" ? "device-chip-drift-tag" : "device-chip-plc-tag";
-		const pipelineAttr = prefix === "D" && liveOptions && liveOptions.pipeline
+		const pipelineAttr = liveOptions && liveOptions.pipeline
 			? ` data-pipeline="${escapeAttr(liveOptions.pipeline)}"`
 			: "";
 		return `<button type="button" class="device-chip-btn ${chipBtnClass}" title="${safeTitle}" aria-label="${safeTitle}" data-plc-title="${groupTitle}" data-plc-url="${escapeAttr(streamUrl)}" data-plc-tags="${tagsJson}" data-plc-meta="${metaJson}"${pipelineAttr}><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
@@ -2460,12 +2562,13 @@ function renderMetricChip({ prefix, index, status, link, liveOptions }) {
 
 function deviceChips(prefix, statuses, links, liveOptions) {
 	if (!statuses || !statuses.length) return "";
+	const opts = usesMetricChipOptions(prefix) ? liveOptions : null;
 	const chips = statuses.map((status, idx) => renderMetricChip({
 		prefix,
 		index: idx,
 		status,
 		link: links && links[idx],
-		liveOptions: (prefix === "C" || prefix === "D") ? liveOptions : null,
+		liveOptions: opts,
 	})).join("");
 	return `<div class="device-chips">${chips}</div>`;
 }
@@ -2476,12 +2579,7 @@ function metricBlock(label, now, set, running, chipPrefix, chipStatuses, links, 
 	const tone = toneOverride || metricTone(now, set);
 	const width = metricBar(now, set);
 	const chips = chipPrefix && chipStatuses && chipStatuses.length
-		? deviceChips(
-			chipPrefix,
-			chipStatuses,
-			links,
-			(chipPrefix === "C" || chipPrefix === "D") ? liveOptions : null,
-		)
+		? deviceChips(chipPrefix, chipStatuses, links, liveOptions)
 		: "";
 	return `<div class="metric-block">
 		<div class="metric-head">
@@ -2516,36 +2614,46 @@ function formatRtlsMetricCell(entry) {
 }
 
 function formatCameraDriftMetricCell(entry, name) {
+	// Head: TOTAL: {total}     {drifted}/{online}
 	const running = !!entry.running;
 	const liveOptions = { pipeline: name || entry.pipeline || "" };
+	const renderDriftBlock = (now, total, online, statuses, links) => {
+		const tone = !running ? "idle" : (now > 0 ? "warn" : "ok");
+		const right = online != null ? online : total;
+		return metricBlock(
+			total != null ? `TOTAL: ${total}` : "TOTAL",
+			now,
+			right,
+			running,
+			"D",
+			statuses,
+			links || [],
+			liveOptions,
+			tone,
+		);
+	};
+
 	const groups = entry.drift_camera_groups;
 	if (Array.isArray(groups) && groups.length) {
 		const blocks = groups.map((group) => {
 			const statuses = (group.chip_status || []).map((status) => (
 				running ? status : "idle"
 			));
-			const tone = !running
-				? "idle"
-				: (group.now > 0 ? "warn" : "ok");
-			return metricBlock(
-				group.label || "Drift",
-				group.now,
-				group.set,
-				running,
-				"D",
-				statuses,
-				group.links || [],
-				liveOptions,
-				tone,
+			const online = group.online != null
+				? group.online
+				: entry.drift_cameras_online;
+			return renderDriftBlock(
+				group.now, group.set, online, statuses, group.links,
 			);
 		}).join("");
 		return `<div class="metric-grid metric-grid--plc">${blocks}</div>`;
 	}
+
 	const now = entry.drift_cameras_now;
-	const set = entry.drift_cameras_set;
-	if (set == null || now == null) {
+	const total = entry.drift_cameras_set;
+	if (total == null || now == null) {
 		return `<div class="metric-grid"><div class="metric-block">
-			<span class="metric-label">Drift</span>
+			<span class="metric-label">TOTAL</span>
 			<span class="metric-nums"><strong class="metric-fill warn">?</strong></span>
 		</div></div>`;
 	}
@@ -2554,35 +2662,43 @@ function formatCameraDriftMetricCell(entry, name) {
 			? entry.drift_camera_status
 			: entry.drift_camera_status.map(() => "idle"))
 		: [];
-	const tone = now > 0 ? "warn" : "ok";
-	return metricBlock(
-		"Drift",
+	return renderDriftBlock(
 		now,
-		set,
-		running,
-		"D",
+		total,
+		entry.drift_cameras_online,
 		statuses,
-		entry.drift_camera_links || [],
-		liveOptions,
-		tone,
+		entry.drift_camera_links,
 	);
 }
 
 function formatEgMetricCell(entry, name) {
 	const running = !!entry.running;
+	const { isPlcCv } = pipelineRuntimeFlags(name, entry);
 	const camSet = entry.cameras_set ?? entry.camera_links?.length ?? 0;
 	const camStatuses = entry.camera_status && entry.camera_status.length
 		? entry.camera_status
 		: chipStatusesFromCount(entry.cameras_now, camSet, running);
-	return metricBlock("Cameras", entry.cameras_now, entry.cameras_set, running, "C", camStatuses, entry.camera_links, {
-		pipeline: name,
-		streamUrl: streamUrlFor(name, entry),
-		streamHealth: !!entry.stream_health,
-	});
+	const metricLabel = isPlcCv ? "Signs" : "Cameras";
+	const chipPrefix = isPlcCv ? "Sign" : "C";
+	return metricBlock(
+		metricLabel,
+		entry.cameras_now,
+		entry.cameras_set,
+		running,
+		chipPrefix,
+		camStatuses,
+		entry.camera_links,
+		{
+			pipeline: name,
+			streamUrl: streamUrlFor(name, entry),
+			streamHealth: !!entry.stream_health,
+		},
+	);
 }
 
-function formatKafkaMetricCell(entry) {
+function formatKafkaMetricCell(entry, name) {
 	const running = !!entry.running;
+	const liveOptions = { pipeline: name || entry.pipeline || "" };
 	const groups = entry.plc_tag_groups;
 	if (Array.isArray(groups) && groups.length) {
 		const blocks = groups.map((group) => {
@@ -2597,6 +2713,7 @@ function formatKafkaMetricCell(entry) {
 				"T",
 				statuses,
 				group.links || [],
+				liveOptions,
 			);
 		}).join("");
 		return `<div class="metric-grid metric-grid--plc">${blocks}</div>`;
@@ -2621,6 +2738,7 @@ function formatKafkaMetricCell(entry) {
 		"T",
 		statuses,
 		entry.plc_tag_links || [],
+		liveOptions,
 	);
 }
 
@@ -2628,7 +2746,7 @@ function formatMetricCell(entry, name) {
 	const { isRtls, isSys, isKafka, isCameraDrift } = pipelineRuntimeFlags(name, entry);
 	if (isSys) return formatSysMetricCell(name, entry);
 	if (isRtls) return formatRtlsMetricCell(entry);
-	if (isKafka) return formatKafkaMetricCell(entry);
+	if (isKafka) return formatKafkaMetricCell(entry, name);
 	if (isCameraDrift) return formatCameraDriftMetricCell(entry, name);
 	return formatEgMetricCell(entry, name);
 }
