@@ -1108,24 +1108,13 @@ body.overlay-scroll-lock {
 }
 
 .drift-reset-btn {
-  appearance: none;
-  border: 1px solid rgba(255, 160, 120, 0.45);
+  border-color: rgba(255, 160, 120, 0.45);
   background: rgba(220, 100, 60, 0.22);
   color: #ffc4a8;
-  font-size: var(--text-sm);
-  line-height: 1;
-  padding: 5px 9px;
-  border-radius: 6px;
-  cursor: pointer;
 }
 
 .drift-reset-btn:hover:not(:disabled) {
   background: rgba(220, 100, 60, 0.35);
-}
-
-.drift-reset-btn:disabled {
-  opacity: 0.55;
-  cursor: wait;
 }
 
 .plc-tag-name-btn {
@@ -1241,8 +1230,86 @@ body.overlay-scroll-lock {
   border-radius: 6px;
 }
 
-.drift-images-footer {
-  justify-content: flex-end;
+.overlay__footer.drift-images-footer {
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.drift-anchor-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin-right: auto;
+}
+
+.drift-images-footer .drift-reset-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.drift-footer-btn {
+  appearance: none;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  line-height: 1;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--text);
+}
+
+.drift-footer-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.drift-footer-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.drift-anchor-toggle {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.45);
+  color: #bfdbfe;
+}
+
+.drift-anchor-toggle[aria-pressed="true"] {
+  background: #1d4ed8;
+  border-color: #3b82f6;
+  color: #fff;
+}
+
+.drift-pinpoint-undo,
+.drift-pinpoint-clear-all {
+  background: rgba(148, 163, 184, 0.14);
+  border-color: rgba(148, 163, 184, 0.4);
+  color: #e2e8f0;
+}
+
+.drift-anchor-count {
+  font-size: var(--text-sm);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.drift-anchor-help {
+  font-size: var(--text-sm);
+  color: #93c5fd;
+  white-space: nowrap;
+}
+
+.drift-images-media.is-anchor-edit {
+  cursor: crosshair;
+}
+
+.drift-images-media.is-anchor-edit .drift-images-arrow {
+  pointer-events: auto;
 }
 
 .drift-images-hint[hidden],
@@ -1258,6 +1325,15 @@ body.overlay-scroll-lock {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+/* OK cameras: reference (Before) only — hide stale After/compare panel */
+.drift-images-grid.is-reference-only {
+  grid-template-columns: 1fr;
+}
+
+.drift-images-grid.is-reference-only .drift-images-panel:last-child {
+  display: none;
 }
 
 .drift-images-panel {

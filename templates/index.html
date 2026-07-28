@@ -196,7 +196,22 @@
 				</div>
 			</div>
 			<div class="overlay__footer drift-images-footer" id="drift_images_footer" hidden>
-				<button type="button" class="btn drift-reset-btn" id="drift_images_reset">Reset</button>
+				<div class="drift-anchor-bar" id="drift_anchor_bar">
+					<button type="button" class="btn drift-footer-btn drift-anchor-toggle" id="drift_anchor_toggle" aria-pressed="false">
+						Add pinpoint
+					</button>
+					<button type="button" class="btn drift-footer-btn drift-pinpoint-undo" id="drift_anchor_clear" hidden>
+						Undo last
+					</button>
+					<button type="button" class="btn drift-footer-btn drift-pinpoint-clear-all" id="drift_anchor_clear_all" hidden>
+						Clear all
+					</button>
+					<span class="drift-anchor-count" id="drift_anchor_count"></span>
+					<span class="drift-anchor-help" id="drift_anchor_help" hidden>
+						Click a fixed spot on Before.
+					</span>
+				</div>
+				<button type="button" class="btn drift-footer-btn drift-reset-btn" id="drift_images_reset">DRIFT Reset</button>
 			</div>
 		</div>
 	</div>
@@ -271,6 +286,7 @@
 				manageServers: {{ url_for('manage_servers') | tojson }},
 				cameraDriftReset: {{ url_for('camera_drift_reset') | tojson }},
 				cameraDriftImages: {{ url_for('camera_drift_images') | tojson }},
+				cameraDriftPersistentPoints: {{ url_for('camera_drift_persistent_points') | tojson }},
 			},
 		};
 	</script>

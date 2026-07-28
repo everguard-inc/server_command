@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from os.path import dirname, join, realpath
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
@@ -70,8 +71,8 @@ img_n_status = {}
 _status_updated_at = 0.0
 REFRESH_INTERVAL = 10
 VIEWER_IDLE_SEC = 45
-HOST_FETCH_TIMEOUT = 50
-HOST_FETCH_RETRY_TIMEOUT = 25
+HOST_FETCH_TIMEOUT = 20
+HOST_FETCH_RETRY_TIMEOUT = 12
 _refreshing = False
 _collect_reset = False
 _pending_reset = False
@@ -88,9 +89,11 @@ _VERSION_KEYS = (
   "version_current", "version_current_date",
   "version_latest", "version_latest_date",
 )
-_fetch_versions_next = False
 _central_latest_cache = {}
 CENTRAL_VERSION_TTL_SEC = 300
+HOST_STATUS_READ_TIMEOUT = 15
+HOST_STATUS_RETRY_READ_TIMEOUT = 10
+HOST_STATUS_CONNECT_TIMEOUT = 5
 RTSP_SNAPSHOT_TIMEOUT = 5
 RTSP_POLL_INTERVAL_SEC = 0.35
 SSE_WARMUP_MAX_LINES = 30
@@ -783,7 +786,9 @@ def run_collect(reset=False):
   _collect_reset = reset
   _refreshing = True
   if reset:
+    version_snap = _snapshot_version_fields(img_n_status)
     img_n_status = preview_from_cfg()
+    _restore_version_fields(img_n_status, version_snap)
   cancelled = False
   try:
     loop = asyncio.new_event_loop()
@@ -816,28 +821,19 @@ def _collect_was_cancelled(collect_gen):
     return collect_gen != _collect_generation
 
 
-def request_force_refresh(*, fetch_versions=False):
+def request_force_refresh():
   global _pending_reset, _rerun_after, img_n_status, _collect_reset
-  global _collect_generation, _fetch_versions_next
+  global _collect_generation
   with _collect_lock:
     _collect_generation += 1
     _pending_reset = True
     _rerun_after = True
     _collect_reset = True
+    # Keep last Current/Latest while rows reset to PENDING.
+    version_snap = _snapshot_version_fields(img_n_status)
     img_n_status = preview_from_cfg()
-    if fetch_versions:
-      _fetch_versions_next = True
+    _restore_version_fields(img_n_status, version_snap)
   _collect_wake.set()
-
-
-def _versions_missing(status_map=None):
-  status_map = status_map if status_map is not None else img_n_status
-  for name, entry in (status_map or {}).items():
-    if name not in cfg:
-      continue
-    if not entry.get("version_current"):
-      return True
-  return False
 
 
 def start_collector():
@@ -1242,6 +1238,32 @@ def _preserve_version_fields(entry, name):
       entry[key] = old[key]
 
 
+def _snapshot_version_fields(status_map=None):
+  """Keep Current/Latest across force-refresh resets (status rows are wiped)."""
+  status_map = status_map if status_map is not None else img_n_status
+  out = {}
+  for name, entry in (status_map or {}).items():
+    if not isinstance(entry, dict):
+      continue
+    snap = {key: entry.get(key) for key in _VERSION_KEYS if entry.get(key)}
+    if snap:
+      out[name] = snap
+  return out
+
+
+def _restore_version_fields(status_map, version_snap):
+  if not status_map or not version_snap:
+    return status_map
+  for name, snap in version_snap.items():
+    entry = status_map.get(name)
+    if not isinstance(entry, dict) or not isinstance(snap, dict):
+      continue
+    for key, value in snap.items():
+      if value and not entry.get(key):
+        entry[key] = value
+  return status_map
+
+
 _DRIFT_METRIC_KEYS = tuple(empty_camera_drift_metrics())
 _PLC_METRIC_KEYS = tuple(empty_plc_tag_metrics())
 
@@ -1308,26 +1330,41 @@ def _fill_central_latest_versions():
     path = repo_path_for_pipeline(name=name, cfg=image_cfg)
     by_path.setdefault(path, []).append(name)
 
-  for path, names in by_path.items():
+  if not by_path:
+    return
+
+  def _lookup(path, names):
     sample = names[0]
     image_cfg = cfg.get(sample)
     latest, latest_date = _cached_central_repo_latest(
       path, name=sample, image_cfg=image_cfg,
     )
-    if not latest:
-      continue
-    for name in names:
-      entry = img_n_status.get(name)
-      if not entry:
+    return path, names, latest, latest_date
+
+  workers = min(8, len(by_path))
+  with ThreadPoolExecutor(max_workers=workers) as pool:
+    futures = [
+      pool.submit(_lookup, path, names) for path, names in by_path.items()
+    ]
+    for future in as_completed(futures):
+      try:
+        _path, names, latest, latest_date = future.result()
+      except Exception:
         continue
-      entry["version_latest"] = latest
-      if latest_date:
-        entry["version_latest_date"] = latest_date
-      else:
-        entry["version_latest_date"] = None
-      current = entry.get("version_current")
-      if current and current == latest and entry.get("version_current_date"):
-        entry["version_latest_date"] = entry["version_current_date"]
+      if not latest:
+        continue
+      for name in names:
+        entry = img_n_status.get(name)
+        if not entry:
+          continue
+        entry["version_latest"] = latest
+        if latest_date:
+          entry["version_latest_date"] = latest_date
+        else:
+          entry["version_latest_date"] = None
+        current = entry.get("version_current")
+        if current and current == latest and entry.get("version_current_date"):
+          entry["version_latest_date"] = entry["version_current_date"]
 
 
 def _apply_host_status(ip, host_result):
@@ -1512,15 +1549,18 @@ async def _enrich_camera_drift_status(ip, host_info, host_result):
     finalize_pipeline_status(entry)
 
 
-async def _fetch_host_status(ip, host_info, read_timeout, *, fetch_versions=False):
+async def _fetch_host_status(ip, host_info, read_timeout):
   url = edge_command_url({"port": host_info["port"]}, host_ip=ip)
   payload = {
     "status": host_info["items"],
     "edge_probe": edge_probe_config(meta),
   }
-  if fetch_versions:
-    payload["fetch_versions"] = True
-  text = await post_edge_command_async(url, data=json.dumps(payload), read_timeout=read_timeout)
+  text = await post_edge_command_async(
+    url,
+    data=json.dumps(payload),
+    read_timeout=read_timeout,
+    connect_timeout=HOST_STATUS_CONNECT_TIMEOUT,
+  )
   host_result = _parse_host_status_response(text, ip)
   if host_result:
     await _enrich_systemd_running(ip, host_info, host_result, read_timeout)
@@ -1529,9 +1569,7 @@ async def _fetch_host_status(ip, host_info, read_timeout, *, fetch_versions=Fals
   return host_result
 
 
-async def _collect_host_ips(
-  ips, by_ip, collect_gen, read_timeout, fetch_timeout, *, fetch_versions=False,
-):
+async def _collect_host_ips(ips, by_ip, collect_gen, read_timeout, fetch_timeout):
   failed_ips = []
 
   async def fetch_host(ip):
@@ -1540,7 +1578,7 @@ async def _collect_host_ips(
     host_info = by_ip[ip]
     try:
       host_result = await asyncio.wait_for(
-        _fetch_host_status(ip, host_info, read_timeout, fetch_versions=fetch_versions),
+        _fetch_host_status(ip, host_info, read_timeout),
         timeout=fetch_timeout,
       )
       return ip, host_result
@@ -1570,13 +1608,9 @@ async def _collect_host_ips(
 
 
 async def collect_status_via_edge(collect_gen):
-  global img_n_status, _fetch_versions_next, _rerun_after
+  global img_n_status, _rerun_after
   if not img_n_status:
     img_n_status = preview_from_cfg()
-
-  with _collect_lock:
-    fetch_versions = _fetch_versions_next
-    _fetch_versions_next = False
 
   _mark_pipelines_without_ip()
 
@@ -1585,37 +1619,28 @@ async def collect_status_via_edge(collect_gen):
 
   failed_ips = await _collect_host_ips(
     ips, by_ip, collect_gen,
-    read_timeout=45, fetch_timeout=HOST_FETCH_TIMEOUT,
-    fetch_versions=fetch_versions,
+    read_timeout=HOST_STATUS_READ_TIMEOUT,
+    fetch_timeout=HOST_FETCH_TIMEOUT,
   )
 
   if failed_ips and not _collect_was_cancelled(collect_gen):
     await asyncio.sleep(0.5)
     await _collect_host_ips(
       failed_ips, by_ip, collect_gen,
-      read_timeout=20, fetch_timeout=HOST_FETCH_RETRY_TIMEOUT,
-      fetch_versions=fetch_versions,
+      read_timeout=HOST_STATUS_RETRY_READ_TIMEOUT,
+      fetch_timeout=HOST_FETCH_RETRY_TIMEOUT,
     )
 
   if _collect_was_cancelled(collect_gen):
     return True
 
-  # Edges report local HEAD only; latest comes from central checkouts (cached).
+  # Edges report Current (local HEAD); Latest comes from central (TTL cache).
   _fill_central_latest_versions()
 
   apply_sys_monitor_host_status(img_n_status, cfg)
 
-  # If current tips are still missing, one background pass reads local HEAD on edges.
-  with _collect_lock:
-    if (not fetch_versions) and _versions_missing():
-      _fetch_versions_next = True
-      _rerun_after = True
-
   ok = _ok_count(img_n_status)
-  print(
-    f"check_status: {len(img_n_status)} pipelines, {ok} OK (via edge)"
-    f"{' +versions' if fetch_versions else ''}"
-  )
+  print(f"check_status: {len(img_n_status)} pipelines, {ok} OK (via edge)")
   return False
 
 
@@ -1947,6 +1972,76 @@ def camera_drift_images_side(side):
   return _proxy_drift_image_stream(edge_url)
 
 
+@app.route("/camera_drift_persistent_points", methods=["GET", "POST"])
+async def camera_drift_persistent_points():
+  """Proxy pinpoint list/add/undo/clear to Camera-Drift.
+
+  GET  ?pipeline=&cam_uid=
+  POST {pipeline, cam_uid, points:[{x,y}]}
+       {pipeline, cam_uid, remove_last_manual:true}
+       {pipeline, cam_uid, remove_points:[...]}
+       {pipeline, cam_uid, clear_manual:true}
+  """
+  note_viewer_activity()
+  if request.method == "GET":
+    cam_uid = str(request.args.get("cam_uid") or "").strip()
+    pipeline_name = str(request.args.get("pipeline") or "").strip()
+    body = {}
+  else:
+    body = request.get_json(silent=True) or {}
+    cam_uid = str(body.get("cam_uid") or request.args.get("cam_uid") or "").strip()
+    pipeline_name = str(body.get("pipeline") or request.args.get("pipeline") or "").strip()
+
+  if not cam_uid:
+    return jsonify({"ok": False, "error": "cam_uid required"}), 400
+
+  pipeline_name, _image_cfg, root, err, code = _resolve_camera_drift_target(pipeline_name)
+  if err:
+    return jsonify({"ok": False, "error": err}), code
+
+  edge_url = f"{root}/camera/{quote(cam_uid, safe='')}/persistent_points"
+  try:
+    timeout = httpx.Timeout(connect=5, read=20, write=10, pool=5)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+      if request.method == "GET":
+        resp = await client.get(edge_url)
+      else:
+        payload = {}
+        if body.get("clear_manual"):
+          payload["clear_manual"] = True
+        if body.get("remove_last_manual"):
+          payload["remove_last_manual"] = True
+        if isinstance(body.get("remove_points"), list):
+          payload["remove_points"] = body.get("remove_points")
+        if isinstance(body.get("points"), list):
+          payload["points"] = body.get("points")
+        resp = await client.post(edge_url, json=payload)
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc), "url": edge_url}), 502
+
+  try:
+    data = resp.json()
+  except ValueError:
+    return jsonify({
+      "ok": False,
+      "error": (resp.text or "").strip()[:500] or f"HTTP {resp.status_code}",
+      "status_code": resp.status_code,
+      "url": edge_url,
+    }), 502
+
+  if not isinstance(data, dict):
+    return jsonify({"ok": False, "error": "invalid persistent points payload"}), 502
+
+  out = dict(data)
+  out["ok"] = bool(data.get("success", resp.status_code < 400))
+  out["pipeline"] = pipeline_name
+  out["cam_uid"] = cam_uid
+  status = 200 if out["ok"] and resp.status_code < 400 else (
+    resp.status_code if resp.status_code >= 400 else 502
+  )
+  return jsonify(out), status
+
+
 def _proxy_drift_image_stream(edge_url):
   """Stream edge image bytes without buffering the full body (sync views only)."""
   timeout = httpx.Timeout(connect=5, read=60, write=10, pool=5)
@@ -2097,7 +2192,7 @@ def camera_feed():
 def get_status():
   note_viewer_activity()
   if request.args.get("force") == "1":
-    request_force_refresh(fetch_versions=True)
+    request_force_refresh()
   return _no_store_json(status_payload())
 
 
@@ -2364,11 +2459,13 @@ async def run_n_update(docker_command, docker_images, by_ip=None, git_refs=None)
   return results
 
 
-async def post_edge_command_async(url, data, read_timeout=20):
+async def post_edge_command_async(url, data, read_timeout=20, connect_timeout=10):
   if read_timeout is None:
     timeout = None
   else:
-    timeout = httpx.Timeout(connect=10, read=read_timeout, write=10, pool=10)
+    timeout = httpx.Timeout(
+      connect=connect_timeout, read=read_timeout, write=10, pool=10,
+    )
   headers = {"Content-Type": "application/json"}
   async with httpx.AsyncClient(timeout=timeout) as client:
     response = await client.post(url, content=data, headers=headers)

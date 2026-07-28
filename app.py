@@ -2630,16 +2630,12 @@ def _populate_stream_metrics(entry, item, probe_cfg):
     _set_camera_status(entry, item)
 
 
-def status_one(
-    item, running_names, version_cache=None, mem_map=None, probe_cfg=None,
-    *, fetch_versions=False,
-):
+def status_one(item, running_names, version_cache=None, mem_map=None, probe_cfg=None):
     probe_cfg = probe_cfg or normalize_edge_probe(None)
     name = item["name"]
     item = load_runtime_meta(item, running_names)
     entry = _status_entry(name, item, running_names)
-    if fetch_versions:
-        _apply_repo_versions(entry, item, version_cache or {})
+    _apply_repo_versions(entry, item, version_cache or {})
     _apply_container_memory(entry, item, mem_map or {})
 
     if entry["is_sys_monitor"]:
@@ -2702,11 +2698,16 @@ def _collect_status_results(future_map, running_names, mem_map):
     return results
 
 
-def status_pipelines(items, probe_config=None, fetch_versions=False):
+def status_pipelines(items, probe_config=None):
+    """Build status for all pipelines on this edge.
+
+    Always includes Current (local HEAD, path-deduped). Latest is filled by the
+    central proxy.
+    """
     probe_cfg = normalize_edge_probe(probe_config)
     running_names = _running_container_names()
     mem_map = _container_memory_map_cached(probe_cfg["docker_stats_interval_sec"])
-    version_cache = _prefetch_repo_versions(items) if fetch_versions else {}
+    version_cache = _prefetch_repo_versions(items)
     workers = _status_worker_count(probe_cfg, len(items))
     future_map = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2718,7 +2719,6 @@ def status_pipelines(items, probe_config=None, fetch_versions=False):
                 version_cache,
                 mem_map,
                 probe_cfg,
-                fetch_versions=fetch_versions,
             )] = item
         results = _collect_status_results(future_map, running_names, mem_map)
 
@@ -2823,7 +2823,6 @@ def handle_command(command):
         return jsonify(status_pipelines(
             command["status"],
             command.get("edge_probe"),
-            fetch_versions=bool(command.get("fetch_versions")),
         ))
     return "200"
 

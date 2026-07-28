@@ -1256,6 +1256,8 @@ let driftImagesState = null;
 
 function closeDriftImagesModal() {
 	driftImagesState = null;
+	setDriftAnchorEditMode(false);
+	updateDriftAnchorBar();
 	const beforeImg = $("drift_images_before");
 	const afterImg = $("drift_images_after");
 	const overlayImg = $("drift_images_overlay");
@@ -1288,17 +1290,32 @@ const DRIFT_I18N = {
 		beforeEmpty: "No before image",
 		afterEmpty: "No after image",
 		threshold: "threshold",
-		matches: "matches",
+		matches: "match points",
 		fpHigh: "High false-positive risk",
 		fpMed: "Possible false positive",
 		fpNote: "Note",
 		loading: "Loading…",
 		unavailable: "Camera drift images unavailable",
 		notFound: "No drift images found",
+		noReference: "No reference image",
 		failed: "Failed to load drift images",
 		timeout: "Timed out loading drift images",
 		title: "Drift Images",
-		reset: "Reset",
+		reset: "DRIFT Reset",
+		pinpointAdd: "Add pinpoint",
+		pinpointUndo: "Undo last",
+		pinpointClearAll: "Clear all",
+		pinpointHelp: "Click a fixed spot on Before.",
+		pinpointCount: (total, manual, active) => (
+			`Pinpoints ${total} (manual ${manual}, active ${active})`
+		),
+		pinpointAddFailed: "Failed to add pinpoint",
+		pinpointAddTimeout: "Timed out adding pinpoint",
+		pinpointUndoFailed: "Failed to undo last pinpoint",
+		pinpointUndoTimeout: "Timed out undoing last pinpoint",
+		pinpointClearFailed: "Failed to clear manual pinpoints",
+		pinpointClearTimeout: "Timed out clearing manual pinpoints",
+		referenceOnly: "Camera OK · reference image (pinpoint edit)",
 	},
 	ko: {
 		fpHigh: "오탐 가능성 높음",
@@ -1337,6 +1354,14 @@ function applyDriftImagesStaticI18n() {
 	if (beforeImg) beforeImg.alt = driftT("before");
 	const afterImg = $("drift_images_after");
 	if (afterImg) afterImg.alt = driftT("after");
+	const pinpointToggle = $("drift_anchor_toggle");
+	if (pinpointToggle) pinpointToggle.textContent = driftT("pinpointAdd");
+	const pinpointUndo = $("drift_anchor_clear");
+	if (pinpointUndo) pinpointUndo.textContent = driftT("pinpointUndo");
+	const pinpointClearAll = $("drift_anchor_clear_all");
+	if (pinpointClearAll) pinpointClearAll.textContent = driftT("pinpointClearAll");
+	const pinpointHelp = $("drift_anchor_help");
+	if (pinpointHelp) pinpointHelp.textContent = driftT("pinpointHelp");
 }
 
 function driftImagesProxyUrl(side, camUid, pipeline, cacheBust) {
@@ -1384,7 +1409,10 @@ function clearDriftPairImages() {
 	const overlayImg = $("drift_images_overlay");
 	if (overlayImg) overlayImg.removeAttribute("src");
 	const grid = $("drift_images_grid");
-	if (grid) grid.hidden = true;
+	if (grid) {
+		grid.hidden = true;
+		grid.classList.remove("is-reference-only");
+	}
 	clearDriftShiftArrow();
 	renderDriftOverlay(null);
 }
@@ -1394,14 +1422,52 @@ function isDriftCameraTag(tag) {
 	return value === "drift" || (tag && tag.health === "err" && value !== "ok");
 }
 
-function prefetchDriftPairImages(camUid, pipeline, cacheBust) {
+function isOfflineCameraTag(tag) {
+	const value = String((tag && tag.value) || "").trim().toLowerCase();
+	return value === "off" || value === "offline";
+}
+
+function isDriftImagesCompareMode() {
+	return Boolean(driftImagesState && driftImagesState.isDrifted);
+}
+
+function setDriftImagesReferenceOnly(referenceOnly) {
+	const grid = $("drift_images_grid");
+	if (grid) grid.classList.toggle("is-reference-only", Boolean(referenceOnly));
+}
+
+function resolveDriftCameraIsDrifted(camUid, explicit) {
+	if (explicit === true || explicit === false) return explicit;
+	if (explicit != null && explicit !== "") {
+		const v = String(explicit).trim().toLowerCase();
+		if (v === "1" || v === "true" || v === "drift") return true;
+		if (v === "0" || v === "false" || v === "ok") return false;
+	}
+	const uid = String(camUid || "").trim();
+	const tags = plcTagModalState && plcTagModalState.tags;
+	if (uid && Array.isArray(tags)) {
+		const tag = tags.find((t) => String(t.id || "").trim() === uid);
+		if (tag) return isDriftCameraTag(tag);
+	}
+	// Unknown entry point: keep compare view.
+	return true;
+}
+
+function prefetchDriftPairImages(camUid, pipeline, cacheBust, compareMode) {
 	const beforeUrl = driftImagesProxyUrl("before", camUid, pipeline, cacheBust);
-	const afterUrl = driftImagesProxyUrl("after", camUid, pipeline, cacheBust);
 	setDriftPanelCaption("before", null, driftT("before"));
-	setDriftPanelCaption("after", null, driftT("after"));
-	$("drift_images_grid").hidden = false;
+	const grid = $("drift_images_grid");
+	if (grid) grid.hidden = false;
+	setDriftImagesReferenceOnly(!compareMode);
 	setDriftSideImage("before", beforeUrl);
-	setDriftSideImage("after", afterUrl);
+	if (compareMode) {
+		const afterUrl = driftImagesProxyUrl("after", camUid, pipeline, cacheBust);
+		setDriftPanelCaption("after", null, driftT("after"));
+		setDriftSideImage("after", afterUrl);
+	} else {
+		setDriftSideImage("after", "");
+		setDriftPanelCaption("after", null, driftT("after"));
+	}
 }
 
 /** Browser local TZ label: KST / UTC / UTC±N */
@@ -1580,12 +1646,296 @@ function mapDriftPoint(layout, x, y) {
 	};
 }
 
+function driftImageCoordsFromEvent(img, clientX, clientY) {
+	if (!img || !img.naturalWidth || !img.naturalHeight) return null;
+	const rect = img.getBoundingClientRect();
+	const w = rect.width;
+	const h = rect.height;
+	if (w < 8 || h < 8) return null;
+	const scale = Math.min(w / img.naturalWidth, h / img.naturalHeight);
+	const drawW = img.naturalWidth * scale;
+	const drawH = img.naturalHeight * scale;
+	const ox = (w - drawW) / 2;
+	const oy = (h - drawH) / 2;
+	const x = clientX - rect.left;
+	const y = clientY - rect.top;
+	if (x < ox || y < oy || x > ox + drawW || y > oy + drawH) return null;
+	return {
+		x: (x - ox) / scale,
+		y: (y - oy) / scale,
+	};
+}
+
+function setDriftAnchorEditMode(enabled) {
+	const on = Boolean(enabled);
+	if (driftImagesState) driftImagesState.anchorEdit = on;
+	const toggle = $("drift_anchor_toggle");
+	const help = $("drift_anchor_help");
+	const beforeMedia = $("drift_images_before")
+		&& $("drift_images_before").closest(".drift-images-media");
+	if (toggle) toggle.setAttribute("aria-pressed", on ? "true" : "false");
+	if (help) help.hidden = !on;
+	if (beforeMedia) beforeMedia.classList.toggle("is-anchor-edit", on);
+	updateDriftAnchorBar();
+}
+
+function manualPersistentPoints(points) {
+	return (points || []).filter((p) => String(p?.source || "") === "manual");
+}
+
+function updateDriftAnchorBar() {
+	const countEl = $("drift_anchor_count");
+	const undoBtn = $("drift_anchor_clear");
+	const clearAllBtn = $("drift_anchor_clear_all");
+	const points = (driftImagesState && driftImagesState.persistentPoints) || [];
+	const manual = manualPersistentPoints(points).length;
+	const active = points.filter((p) => p.active).length;
+	const editing = Boolean(driftImagesState && driftImagesState.anchorEdit);
+	const showManualActions = editing && manual > 0;
+	if (countEl) {
+		const format = DRIFT_I18N.en.pinpointCount;
+		countEl.textContent = points.length
+			? format(points.length, manual, active)
+			: "";
+	}
+	if (undoBtn) {
+		// Beside Add pinpoint while edit mode is on (and there is something to undo).
+		undoBtn.hidden = !showManualActions;
+		undoBtn.disabled = false;
+	}
+	if (clearAllBtn) {
+		clearAllBtn.hidden = !showManualActions;
+		clearAllBtn.disabled = false;
+	}
+}
+
+function applyPersistentPointsResponse(data, loadId) {
+	if (!driftImagesState || driftImagesState.loadId !== loadId) return false;
+	if (!data || data.ok === false || data.success === false) return false;
+	driftImagesState.persistentPoints = Array.isArray(data.points) ? data.points : [];
+	updateDriftAnchorBar();
+	if (driftImagesState.meta) scheduleDriftShiftArrow(driftImagesState.meta);
+	return true;
+}
+
+function drawPersistentAnchors(beforeLayout, beforeCanvas) {
+	const anchors = (driftImagesState && driftImagesState.persistentPoints) || [];
+	if (!beforeLayout || !beforeCanvas || !anchors.length) return;
+	for (const p of anchors) {
+		const x = Number(p.x);
+		const y = Number(p.y);
+		if (![x, y].every(Number.isFinite)) continue;
+		const pt = mapDriftPoint(beforeLayout, x, y);
+		const manual = String(p.source || "") === "manual";
+		beforeLayout.ctx.beginPath();
+		beforeLayout.ctx.arc(pt.x, pt.y, manual ? 5.5 : 4.2, 0, Math.PI * 2);
+		beforeLayout.ctx.fillStyle = manual
+			? "rgba(250, 204, 21, 0.95)"
+			: "rgba(52, 211, 153, 0.9)";
+		beforeLayout.ctx.fill();
+		beforeLayout.ctx.lineWidth = 1.5;
+		beforeLayout.ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+		beforeLayout.ctx.stroke();
+	}
+	beforeCanvas.classList.remove("is-hidden");
+}
+
+function loadDriftPersistentPoints() {
+	if (!driftImagesState || !urls.cameraDriftPersistentPoints) {
+		updateDriftAnchorBar();
+		return;
+	}
+	const { camUid, pipeline, loadId } = driftImagesState;
+	const params = new URLSearchParams({
+		pipeline: pipeline || "",
+		cam_uid: camUid,
+	});
+	fetchJsonGet(`${urls.cameraDriftPersistentPoints}?${params.toString()}`, (data) => {
+		if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+		if (!data || data.ok === false || data.success === false) {
+			driftImagesState.persistentPoints = [];
+			updateDriftAnchorBar();
+			return;
+		}
+		driftImagesState.persistentPoints = Array.isArray(data.points) ? data.points : [];
+		updateDriftAnchorBar();
+		if (driftImagesState.meta) scheduleDriftShiftArrow(driftImagesState.meta);
+	}, {
+		timeout: 15000,
+		onerror() {
+			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+			driftImagesState.persistentPoints = [];
+			updateDriftAnchorBar();
+		},
+	});
+}
+
+function addDriftManualAnchor(x, y) {
+	if (!driftImagesState || !urls.cameraDriftPersistentPoints) return;
+	const { camUid, pipeline, loadId } = driftImagesState;
+	postJson(urls.cameraDriftPersistentPoints, {
+		pipeline: pipeline || "",
+		cam_uid: camUid,
+		points: [{ x, y }],
+	}, 15000, {
+		onload(_status, data) {
+			if (!applyPersistentPointsResponse(data, loadId)) {
+				showAlertModal(
+					(data && (data.error || data.message)) || driftT("pinpointAddFailed"),
+				);
+			}
+		},
+		onerror() {
+			showAlertModal(driftT("pinpointAddFailed"));
+		},
+		ontimeout() {
+			showAlertModal(driftT("pinpointAddTimeout"));
+		},
+	});
+}
+
+function restoreManualPinpoints(keepPoints, loadId, camUid, pipeline) {
+	if (!keepPoints.length) {
+		updateDriftAnchorBar();
+		if (driftImagesState && driftImagesState.meta) {
+			scheduleDriftShiftArrow(driftImagesState.meta);
+		}
+		return;
+	}
+	postJson(urls.cameraDriftPersistentPoints, {
+		pipeline: pipeline || "",
+		cam_uid: camUid,
+		points: keepPoints.map((p) => ({ x: Number(p.x), y: Number(p.y) })),
+	}, 15000, {
+		onload(_status, data) {
+			if (!applyPersistentPointsResponse(data, loadId)) {
+				showAlertModal(
+					(data && (data.error || data.message)) || driftT("pinpointUndoFailed"),
+				);
+			}
+		},
+		onerror() {
+			showAlertModal(driftT("pinpointUndoFailed"));
+		},
+		ontimeout() {
+			showAlertModal(driftT("pinpointUndoTimeout"));
+		},
+	});
+}
+
+function clearAllManualPinpoints() {
+	if (!driftImagesState || !urls.cameraDriftPersistentPoints) return;
+	const { camUid, pipeline, loadId, persistentPoints } = driftImagesState;
+	if (!manualPersistentPoints(persistentPoints).length) return;
+	postJson(urls.cameraDriftPersistentPoints, {
+		pipeline: pipeline || "",
+		cam_uid: camUid,
+		clear_manual: true,
+	}, 15000, {
+		onload(_status, data) {
+			if (!applyPersistentPointsResponse(data, loadId)) {
+				showAlertModal(
+					(data && (data.error || data.message)) || driftT("pinpointClearFailed"),
+				);
+			}
+		},
+		onerror() {
+			showAlertModal(driftT("pinpointClearFailed"));
+		},
+		ontimeout() {
+			showAlertModal(driftT("pinpointClearTimeout"));
+		},
+	});
+}
+
+function undoLastManualPinpoint() {
+	if (!driftImagesState || !urls.cameraDriftPersistentPoints) return;
+	const { camUid, pipeline, loadId, persistentPoints } = driftImagesState;
+	const manuals = manualPersistentPoints(persistentPoints);
+	if (!manuals.length) return;
+	const keep = manuals.slice(0, -1);
+
+	postJson(urls.cameraDriftPersistentPoints, {
+		pipeline: pipeline || "",
+		cam_uid: camUid,
+		remove_last_manual: true,
+	}, 15000, {
+		onload(_status, data) {
+			if (applyPersistentPointsResponse(data, loadId)) return;
+			// Fallback when edge only supports clear_manual: clear all, then re-add keep.
+			postJson(urls.cameraDriftPersistentPoints, {
+				pipeline: pipeline || "",
+				cam_uid: camUid,
+				clear_manual: true,
+			}, 15000, {
+				onload(_clearStatus, clearData) {
+					if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+					if (!clearData || clearData.ok === false || clearData.success === false) {
+						showAlertModal(
+							(clearData && (clearData.error || clearData.message))
+							|| (data && (data.error || data.message))
+							|| driftT("pinpointUndoFailed"),
+						);
+						return;
+					}
+					driftImagesState.persistentPoints = Array.isArray(clearData.points)
+						? clearData.points
+						: [];
+					restoreManualPinpoints(keep, loadId, camUid, pipeline);
+				},
+				onerror() {
+					showAlertModal(driftT("pinpointUndoFailed"));
+				},
+				ontimeout() {
+					showAlertModal(driftT("pinpointUndoTimeout"));
+				},
+			});
+		},
+		onerror() {
+			showAlertModal(driftT("pinpointUndoFailed"));
+		},
+		ontimeout() {
+			showAlertModal(driftT("pinpointUndoTimeout"));
+		},
+	});
+}
+
 function drawDriftMatchOverlays(meta) {
 	const beforeImg = $("drift_images_before");
 	const afterImg = $("drift_images_after");
 	const beforeCanvas = $("drift_images_before_points");
 	const afterCanvas = $("drift_images_after_arrow");
-	if (!meta || !afterImg || !afterCanvas) {
+	const compare = isDriftImagesCompareMode();
+
+	if (!meta) {
+		clearDriftShiftArrow();
+		return false;
+	}
+
+	// OK cameras: show pinpoints on Before only; skip stale After/match overlays.
+	if (!compare) {
+		if (afterCanvas) {
+			const ctx = afterCanvas.getContext && afterCanvas.getContext("2d");
+			if (ctx) ctx.clearRect(0, 0, afterCanvas.width || 0, afterCanvas.height || 0);
+			afterCanvas.classList.add("is-hidden");
+		}
+		const beforeLayout = (beforeImg && beforeCanvas && !beforeImg.classList.contains("hidden"))
+			? prepareDriftOverlayCanvas(beforeImg, beforeCanvas)
+			: null;
+		if (!beforeLayout) return false;
+		drawPersistentAnchors(beforeLayout, beforeCanvas);
+		const observeTarget = beforeLayout.media || beforeImg;
+		if (!driftArrowResizeObserver && typeof ResizeObserver !== "undefined" && observeTarget) {
+			driftArrowResizeObserver = new ResizeObserver(() => {
+				if (!driftImagesState || !driftImagesState.meta) return;
+				drawDriftMatchOverlays(driftImagesState.meta);
+			});
+			driftArrowResizeObserver.observe(observeTarget);
+		}
+		return true;
+	}
+
+	if (!afterImg || !afterCanvas) {
 		clearDriftShiftArrow();
 		return false;
 	}
@@ -1601,7 +1951,7 @@ function drawDriftMatchOverlays(meta) {
 	const dx = Number(meta.delta_x != null ? meta.delta_x : meta.delta_x_display);
 	const dy = Number(meta.delta_y != null ? meta.delta_y : meta.delta_y_display);
 
-	// Draw all judgment match points.
+	// Draw automatic match points (Before↔After correspondences).
 	if (points.length) {
 		for (const p of points) {
 			const x0 = Number(p.x0);
@@ -1634,6 +1984,10 @@ function drawDriftMatchOverlays(meta) {
 		if (beforeLayout) {
 			beforeCanvas.classList.remove("is-hidden");
 		}
+	}
+
+	if (beforeLayout) {
+		drawPersistentAnchors(beforeLayout, beforeCanvas);
 	}
 
 	// Median summary arrow: direction from Δx/Δy; keep subtle vs match overlays.
@@ -1812,15 +2166,24 @@ function setDriftResetVisible(visible) {
 function renderDriftImagesPair() {
 	if (!driftImagesState || !driftImagesState.meta) return;
 	const { pipeline, camUid, meta, cacheBust } = driftImagesState;
+	const compare = isDriftImagesCompareMode();
 	const before = meta.before;
 	const after = meta.after;
 
-	renderDriftHint(meta);
-	renderDriftRawMetrics(meta);
-	renderDriftOverlay(meta);
+	// Stale last-event meta still arrives for OK cameras; hide compare chrome.
+	if (compare) {
+		renderDriftHint(meta);
+		renderDriftRawMetrics(meta);
+		renderDriftOverlay(meta);
+	} else {
+		renderDriftHint(null);
+		renderDriftRawMetrics(null);
+		renderDriftOverlay(null);
+	}
 	setDriftPanelCaption("before", before, driftT("before"));
-	setDriftPanelCaption("after", after, driftT("after"));
+	setDriftPanelCaption("after", compare ? after : null, driftT("after"));
 	setDriftResetVisible(Boolean(camUid));
+	setDriftImagesReferenceOnly(!compare);
 
 	const beforeImg = $("drift_images_before");
 	const afterImg = $("drift_images_after");
@@ -1829,12 +2192,12 @@ function renderDriftImagesPair() {
 		scheduleDriftShiftArrow(meta);
 	};
 	if (beforeImg) beforeImg.onload = onOverlayReady;
-	if (afterImg) afterImg.onload = onOverlayReady;
+	if (afterImg) afterImg.onload = compare ? onOverlayReady : null;
 
 	const beforeUrl = before && before.available
 		? driftImagesProxyUrl("before", camUid, pipeline, cacheBust)
 		: "";
-	const afterUrl = after && after.available
+	const afterUrl = compare && after && after.available
 		? driftImagesProxyUrl("after", camUid, pipeline, cacheBust)
 		: "";
 
@@ -1843,7 +2206,7 @@ function renderDriftImagesPair() {
 	} else {
 		setDriftSideImage("before", "");
 	}
-	if (after && after.available) {
+	if (afterUrl) {
 		setDriftSideImage("after", afterUrl);
 	} else {
 		setDriftSideImage("after", "");
@@ -1860,7 +2223,7 @@ function renderDriftImagesPair() {
 	}
 }
 
-function openDriftImagesModal({ camUid, pipeline, title }) {
+function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 	const uid = String(camUid || "").trim();
 	if (!uid || !urls.cameraDriftImages) {
 		showAlertModal(driftT("unavailable"));
@@ -1868,26 +2231,35 @@ function openDriftImagesModal({ camUid, pipeline, title }) {
 	}
 	applyDriftImagesStaticI18n();
 	const cacheBust = Date.now();
+	const drifted = resolveDriftCameraIsDrifted(uid, isDrifted);
 	driftImagesState = {
 		camUid: uid,
 		pipeline: pipeline || "",
 		title: title || driftT("title"),
 		meta: null,
+		persistentPoints: [],
+		anchorEdit: false,
+		isDrifted: drifted,
 		cacheBust,
 		loadId: (driftImagesState && driftImagesState.loadId || 0) + 1,
 	};
 	const loadId = driftImagesState.loadId;
 	$("drift_images_title").textContent = driftImagesState.title;
 	$("drift_images_status").hidden = false;
-	$("drift_images_status").textContent = driftT("loading");
+	$("drift_images_status").textContent = drifted
+		? driftT("loading")
+		: driftT("referenceOnly");
 	renderDriftHint(null);
 	renderDriftRawMetrics(null);
 	clearDriftPairImages();
 	setDriftResetVisible(false);
+	setDriftAnchorEditMode(false);
+	updateDriftAnchorBar();
 	setOverlayVisible($("drift_images_modal"), true);
+	loadDriftPersistentPoints();
 
 	// Prefetch while meta computes; cache-bust avoids post-reset stale PNGs.
-	prefetchDriftPairImages(uid, driftImagesState.pipeline, cacheBust);
+	prefetchDriftPairImages(uid, driftImagesState.pipeline, cacheBust, drifted);
 
 	const params = new URLSearchParams({
 		pipeline: driftImagesState.pipeline,
@@ -1896,9 +2268,12 @@ function openDriftImagesModal({ camUid, pipeline, title }) {
 	});
 	fetchJsonGet(`${urls.cameraDriftImages}?${params.toString()}`, (data) => {
 		if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+		const emptyMsg = isDriftImagesCompareMode()
+			? driftT("notFound")
+			: driftT("noReference");
 		if (!data || data.ok === false) {
-			$("drift_images_status").textContent =
-				(data && data.error) || driftT("notFound");
+			// Edge may return localized errors (e.g. Korean); UI status stays English.
+			$("drift_images_status").textContent = emptyMsg;
 			clearDriftPairImages();
 			setDriftResetVisible(Boolean(uid));
 			return;
@@ -1906,14 +2281,19 @@ function openDriftImagesModal({ camUid, pipeline, title }) {
 		driftImagesState.meta = data;
 		const hasImage = Boolean(
 			(data.before && data.before.available)
-			|| (data.after && data.after.available)
-			|| (data.overlay && data.overlay.available),
+			|| (isDriftImagesCompareMode() && data.after && data.after.available)
+			|| (isDriftImagesCompareMode() && data.overlay && data.overlay.available),
 		);
 		if (!hasImage) {
-			$("drift_images_status").textContent = driftT("notFound");
+			$("drift_images_status").textContent = emptyMsg;
 			clearDriftPairImages();
-			renderDriftHint(data);
-			renderDriftRawMetrics(data);
+			if (isDriftImagesCompareMode()) {
+				renderDriftHint(data);
+				renderDriftRawMetrics(data);
+			} else {
+				renderDriftHint(null);
+				renderDriftRawMetrics(null);
+			}
 			setDriftResetVisible(true);
 			return;
 		}
@@ -2180,9 +2560,9 @@ function openPlcTagModal({ title, url, tags, meta, pipeline }) {
 		? list.map((tag) => {
 			const camUid = String(tag.id || "").trim();
 			const name = tag.name || "";
-			// Only drifted cameras open the images modal.
-			const nameHtml = isDriftModal && camUid && isDriftCameraTag(tag)
-				? `<button type="button" class="plc-tag-name plc-tag-name-btn drift-images-btn" title="${escapeAttr(name)}" data-cam-uid="${escapeAttr(camUid)}" data-pipeline="${escapeAttr(plcTagModalState.pipeline || "")}" data-cam-name="${escapeAttr(name)}">${escapeHtml(name)}</button>`
+			// Drift/OK cameras open images modal; OFF cameras stay plain text.
+			const nameHtml = isDriftModal && camUid && !isOfflineCameraTag(tag)
+				? `<button type="button" class="plc-tag-name plc-tag-name-btn drift-images-btn" title="${escapeAttr(name)}" data-cam-uid="${escapeAttr(camUid)}" data-pipeline="${escapeAttr(plcTagModalState.pipeline || "")}" data-cam-name="${escapeAttr(name)}" data-cam-drifted="${isDriftCameraTag(tag) ? "1" : "0"}">${escapeHtml(name)}</button>`
 				: `<span class="plc-tag-name" title="${escapeAttr(name)}">${escapeHtml(name)}</span>`;
 			return `<div class="plc-tag-row">
 				${nameHtml}
@@ -2206,16 +2586,22 @@ function resetCameraDrift(camUid, pipeline, btn) {
 			if (!data || !data.ok) {
 				if (btn) {
 					btn.disabled = false;
-					btn.textContent = "Reset";
+					btn.textContent = driftT("reset");
 				}
 				showAlertModal((data && data.error) || "Camera drift reset failed");
 				return;
 			}
 			closeDriftImagesModal();
 			if (plcTagModalState && Array.isArray(plcTagModalState.tags)) {
-				plcTagModalState.tags = plcTagModalState.tags.filter(
-					(tag) => String(tag.id || "") !== uid,
+				// Only drop drifted rows after reset; OK cameras stay in the list.
+				const wasDrift = plcTagModalState.tags.some(
+					(tag) => String(tag.id || "") === uid && isDriftCameraTag(tag),
 				);
+				if (wasDrift) {
+					plcTagModalState.tags = plcTagModalState.tags.filter(
+						(tag) => String(tag.id || "") !== uid,
+					);
+				}
 				if (plcTagModalState.tags.length) {
 					openPlcTagModal(plcTagModalState);
 				} else {
@@ -2227,14 +2613,14 @@ function resetCameraDrift(camUid, pipeline, btn) {
 		onerror() {
 			if (btn) {
 				btn.disabled = false;
-				btn.textContent = "Reset";
+				btn.textContent = driftT("reset");
 			}
 			showAlertModal("Camera drift reset failed");
 		},
 		ontimeout() {
 			if (btn) {
 				btn.disabled = false;
-				btn.textContent = "Reset";
+				btn.textContent = driftT("reset");
 			}
 			showAlertModal("Camera drift reset timed out");
 		},
@@ -4265,6 +4651,7 @@ $("plc_tag_modal_list").addEventListener("click", (event) => {
 			|| (plcTagModalState && plcTagModalState.pipeline)
 			|| "",
 		title: driftImagesBtn.dataset.camName || "Drift Images",
+		isDrifted: driftImagesBtn.dataset.camDrifted,
 	});
 });
 $("drift_images_reset").addEventListener("click", () => {
@@ -4275,6 +4662,31 @@ $("drift_images_reset").addEventListener("click", () => {
 		$("drift_images_reset"),
 	);
 });
+$("drift_anchor_toggle").addEventListener("click", () => {
+	if (!driftImagesState) return;
+	setDriftAnchorEditMode(!driftImagesState.anchorEdit);
+});
+$("drift_anchor_clear").addEventListener("click", () => {
+	if (!driftImagesState) return;
+	undoLastManualPinpoint();
+});
+$("drift_anchor_clear_all").addEventListener("click", () => {
+	if (!driftImagesState) return;
+	clearAllManualPinpoints();
+});
+(() => {
+	const beforeImg = $("drift_images_before");
+	const media = beforeImg && beforeImg.closest(".drift-images-media");
+	if (!media) return;
+	media.addEventListener("click", (event) => {
+		if (!driftImagesState || !driftImagesState.anchorEdit) return;
+		const coords = driftImageCoordsFromEvent(beforeImg, event.clientX, event.clientY);
+		if (!coords) return;
+		event.preventDefault();
+		event.stopPropagation();
+		addDriftManualAnchor(coords.x, coords.y);
+	});
+})();
 bindOverlayDismiss("ping_modal", "ping_modal_close", closePingModal);
 $("ping_modal_open").addEventListener("click", () => {
 	const url = $("ping_modal_open").dataset.url;
