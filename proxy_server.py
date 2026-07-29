@@ -11,7 +11,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from os.path import dirname, join, realpath
-from urllib.parse import quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
 from flask import Flask, Response, jsonify, make_response, render_template, request, stream_with_context
@@ -786,9 +786,7 @@ def run_collect(reset=False):
   _collect_reset = reset
   _refreshing = True
   if reset:
-    version_snap = _snapshot_version_fields(img_n_status)
-    img_n_status = preview_from_cfg()
-    _restore_version_fields(img_n_status, version_snap)
+    _reset_status_keeping_cache()
   cancelled = False
   try:
     loop = asyncio.new_event_loop()
@@ -829,10 +827,7 @@ def request_force_refresh():
     _pending_reset = True
     _rerun_after = True
     _collect_reset = True
-    # Keep last Current/Latest while rows reset to PENDING.
-    version_snap = _snapshot_version_fields(img_n_status)
-    img_n_status = preview_from_cfg()
-    _restore_version_fields(img_n_status, version_snap)
+    _reset_status_keeping_cache()
   _collect_wake.set()
 
 
@@ -1266,6 +1261,54 @@ def _restore_version_fields(status_map, version_snap):
 
 _DRIFT_METRIC_KEYS = tuple(empty_camera_drift_metrics())
 _PLC_METRIC_KEYS = tuple(empty_plc_tag_metrics())
+# Keep row healthy across wipe while systemd / probes re-run.
+_PROBE_RUNTIME_KEYS = (
+  "running", "status", "mem_usage", "mem_usage_percent",
+  "drift_service_url", "plc_status_url", "url",
+)
+
+
+def _copy_entry_keys(dst, src, keys):
+  for key in keys:
+    if key in src:
+      dst[key] = src[key]
+
+
+def _probe_metric_keys_for(entry):
+  if entry.get("is_camera_drift") and not _drift_metrics_incomplete(entry):
+    return _DRIFT_METRIC_KEYS
+  if entry.get("is_kafka") and not _kafka_metrics_incomplete(entry):
+    return _PLC_METRIC_KEYS
+  return ()
+
+
+def _snapshot_probe_metrics(status_map=None):
+  """Keep last good drift/PLC chips across force-refresh row wipes."""
+  status_map = status_map if status_map is not None else img_n_status
+  out = {}
+  for name, entry in (status_map or {}).items():
+    if not isinstance(entry, dict):
+      continue
+    metric_keys = _probe_metric_keys_for(entry)
+    if not metric_keys:
+      continue
+    snap = {}
+    _copy_entry_keys(snap, entry, metric_keys)
+    _copy_entry_keys(snap, entry, _PROBE_RUNTIME_KEYS)
+    out[name] = snap
+  return out
+
+
+def _restore_probe_metrics(status_map, probe_snap):
+  if not status_map or not probe_snap:
+    return status_map
+  for name, snap in probe_snap.items():
+    entry = status_map.get(name)
+    if not isinstance(entry, dict) or not isinstance(snap, dict):
+      continue
+    entry.update(snap)
+    finalize_pipeline_status(entry)
+  return status_map
 
 
 def _preserve_probe_metrics(entry, name):
@@ -1275,14 +1318,20 @@ def _preserve_probe_metrics(entry, name):
     return
   if entry.get("is_camera_drift") and _drift_metrics_incomplete(entry):
     if not _drift_metrics_incomplete(old):
-      for key in _DRIFT_METRIC_KEYS:
-        if key in old:
-          entry[key] = old[key]
+      _copy_entry_keys(entry, old, _DRIFT_METRIC_KEYS)
   if entry.get("is_kafka") and _kafka_metrics_incomplete(entry):
     if not _kafka_metrics_incomplete(old):
-      for key in _PLC_METRIC_KEYS:
-        if key in old:
-          entry[key] = old[key]
+      _copy_entry_keys(entry, old, _PLC_METRIC_KEYS)
+
+
+def _reset_status_keeping_cache():
+  """Wipe rows to PENDING but keep versions + last-good probe chips."""
+  global img_n_status
+  version_snap = _snapshot_version_fields(img_n_status)
+  probe_snap = _snapshot_probe_metrics(img_n_status)
+  img_n_status = preview_from_cfg()
+  _restore_version_fields(img_n_status, version_snap)
+  _restore_probe_metrics(img_n_status, probe_snap)
 
 
 def _central_git_cmd(repo_path, *args, timeout=None):
@@ -1479,10 +1528,21 @@ def _kafka_metrics_incomplete(entry):
 
 
 def _drift_metrics_incomplete(entry):
-  """True when the edge did not return usable Camera-Drift metrics."""
-  return not (
-    entry.get("drift_api_ok") is True and entry.get("drift_cameras_set") is not None
-  )
+  """True when Camera-Drift metrics/chips are missing or unusable."""
+  if entry.get("drift_api_ok") is not True or entry.get("drift_cameras_set") is None:
+    return True
+  try:
+    set_n = int(entry.get("drift_cameras_set"))
+  except (TypeError, ValueError):
+    return True
+  if set_n <= 0:
+    return False
+  groups = entry.get("drift_camera_groups") or []
+  first = groups[0] if groups and isinstance(groups[0], dict) else {}
+  if first.get("links") or first.get("chip_status"):
+    return False
+  # Flat fallback when area groups are absent.
+  return not (entry.get("drift_camera_links") or entry.get("drift_camera_status"))
 
 
 async def _enrich_kafka_status(ip, host_info, host_result):
@@ -1878,16 +1938,37 @@ def _rewrite_drift_image_side(side_info, *, pipeline_name, cam_uid, side, lang="
   }
   if lang:
     params["lang"] = lang
+  # Keep edge query from meta.url (preview, batch, …) — do not drop batch.
+  raw_url = str(out.get("url") or "").strip()
+  if raw_url:
+    for key, value in parse_qsl(urlparse(raw_url).query, keep_blank_values=True):
+      if key in ("pipeline", "cam_uid"):
+        continue
+      params[key] = value
+  if side in ("before", "after") and "preview" not in params:
+    params["preview"] = "1"
   out["url"] = f"/camera_drift_images/{side}?{urlencode(params)}"
   return out
 
 
-def _drift_edge_images_url(root, cam_uid, side_name=None, lang=""):
+def _drift_edge_images_url(root, cam_uid, side_name=None, lang="", query=None):
+  """Build edge drift_images URL, forwarding query params (preview/batch/…)."""
   edge_url = f"{root}/camera/{quote(cam_uid, safe='')}/drift_images"
   if side_name:
     edge_url = f"{edge_url}/{side_name}"
-  if lang:
-    edge_url = f"{edge_url}?{urlencode({'lang': lang})}"
+  params = {}
+  if isinstance(query, dict):
+    for key, value in query.items():
+      if value is None:
+        continue
+      key_s = str(key)
+      if key_s in ("pipeline", "cam_uid"):
+        continue
+      params[key_s] = value if isinstance(value, str) else str(value)
+  if lang and "lang" not in params:
+    params["lang"] = lang
+  if params:
+    edge_url = f"{edge_url}?{urlencode(params)}"
   return edge_url
 
 
@@ -1895,7 +1976,7 @@ def _drift_edge_images_url(root, cam_uid, side_name=None, lang=""):
 async def camera_drift_images():
   """Proxy Camera-Drift image metadata.
 
-  Meta: GET /camera_drift_images?pipeline=&cam_uid=
+  Meta: GET /camera_drift_images?pipeline=&cam_uid=&phase=ref|compare|full
   """
   note_viewer_activity()
   cam_uid = str(request.args.get("cam_uid") or "").strip()
@@ -1908,10 +1989,19 @@ async def camera_drift_images():
     return jsonify({"ok": False, "error": err}), code
 
   lang = str(request.args.get("lang") or request.headers.get("Accept-Language") or "").strip()
-  edge_url = _drift_edge_images_url(root, cam_uid, lang=lang)
+  # Forward phase/lang/… to edge; pipeline/cam_uid stay central-only.
+  forward = {
+    key: request.args.get(key)
+    for key in request.args
+    if key not in ("pipeline", "cam_uid")
+  }
+  if lang and not str(forward.get("lang") or "").strip():
+    forward["lang"] = lang
+  edge_url = _drift_edge_images_url(root, cam_uid, query=forward)
 
   try:
-    timeout = httpx.Timeout(connect=5, read=30, write=10, pool=5)
+    # compare/full may run illumination match; ref should be faster.
+    timeout = httpx.Timeout(connect=5, read=55, write=10, pool=5)
     async with httpx.AsyncClient(timeout=timeout) as client:
       resp = await client.get(edge_url)
   except Exception as exc:
@@ -1967,8 +2057,18 @@ def camera_drift_images_side(side):
   if err:
     return jsonify({"ok": False, "error": err}), code
 
-  lang = str(request.args.get("lang") or request.headers.get("Accept-Language") or "").strip()
-  edge_url = _drift_edge_images_url(root, cam_uid, side_name=side_name, lang=lang)
+  # Forward edge-relevant query (preview, batch, lang, …).
+  # "_" is browser cache-bust only — never send it to edge (breaks batch cache).
+  forward = {
+    key: request.args.get(key)
+    for key in request.args
+    if key not in ("pipeline", "cam_uid", "_")
+  }
+  if side_name in ("before", "after") and not str(forward.get("preview") or "").strip():
+    forward["preview"] = "1"
+  edge_url = _drift_edge_images_url(
+    root, cam_uid, side_name=side_name, query=forward,
+  )
   return _proxy_drift_image_stream(edge_url)
 
 
@@ -2084,7 +2184,8 @@ def _proxy_drift_image_stream(edge_url):
     generate(),
     mimetype=content_type,
     headers={
-      "Cache-Control": "private, no-cache",
+      # Browser may reuse bytes across modal reopens; UI cache-busts after Reset.
+      "Cache-Control": "private, max-age=300",
       "X-Accel-Buffering": "no",
     },
   )

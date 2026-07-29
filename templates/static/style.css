@@ -1327,13 +1327,9 @@ body.overlay-scroll-lock {
   gap: 14px;
 }
 
-/* OK cameras: reference (Before) only — hide stale After/compare panel */
+/* Kept for backwards compatibility; UI no longer hides the right panel. */
 .drift-images-grid.is-reference-only {
-  grid-template-columns: 1fr;
-}
-
-.drift-images-grid.is-reference-only .drift-images-panel:last-child {
-  display: none;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .drift-images-panel {

@@ -1278,17 +1278,20 @@ function closeDriftImagesModal() {
 	renderDriftHint(null);
 	renderDriftOverlay(null);
 	renderDriftRawMetrics(null);
-	setDriftResetVisible(false);
+	syncDriftFooterChrome({ forceHide: true });
 	setOverlayVisible($("drift_images_modal"), false);
 }
 
 const DRIFT_I18N = {
 	en: {
 		overlayCaption: "Explanation",
-		before: "Before",
-		after: "After",
-		beforeEmpty: "No before image",
-		afterEmpty: "No after image",
+		before: "Reference",
+		after: "Compare",
+		afterLast: "Last",
+		beforeEmpty: "No reference image",
+		afterEmpty: "No last image",
+		afterEmptyCompare: "No compare image",
+		afterEmptyNoIllum: "No illumination-matched compare image",
 		threshold: "threshold",
 		matches: "match points",
 		fpHigh: "High false-positive risk",
@@ -1305,7 +1308,7 @@ const DRIFT_I18N = {
 		pinpointAdd: "Add pinpoint",
 		pinpointUndo: "Undo last",
 		pinpointClearAll: "Clear all",
-		pinpointHelp: "Click a fixed spot on Before.",
+		pinpointHelp: "Click a fixed spot on Reference.",
 		pinpointCount: (total, manual, active) => (
 			`Pinpoints ${total} (manual ${manual}, active ${active})`
 		),
@@ -1315,12 +1318,44 @@ const DRIFT_I18N = {
 		pinpointUndoTimeout: "Timed out undoing last pinpoint",
 		pinpointClearFailed: "Failed to clear manual pinpoints",
 		pinpointClearTimeout: "Timed out clearing manual pinpoints",
-		referenceOnly: "Camera OK · reference image (pinpoint edit)",
+		referenceOnly: "Camera OK · reference / illumination-matched compare",
 	},
 	ko: {
+		overlayCaption: "설명",
+		before: "기준",
+		after: "비교",
+		afterLast: "최근",
+		beforeEmpty: "기준 이미지 없음",
+		afterEmpty: "최근 이미지 없음",
+		afterEmptyCompare: "비교 이미지 없음",
+		afterEmptyNoIllum: "조도 유사 비교 이미지 없음",
+		threshold: "임계값",
+		matches: "매칭 포인트",
 		fpHigh: "오탐 가능성 높음",
 		fpMed: "오탐 가능성 있음",
 		fpNote: "참고",
+		loading: "로딩 중…",
+		unavailable: "카메라 드리프트 이미지를 사용할 수 없습니다",
+		notFound: "드리프트 이미지가 없습니다",
+		noReference: "기준 이미지 없음",
+		failed: "드리프트 이미지를 불러오지 못했습니다",
+		timeout: "드리프트 이미지 로딩 시간이 초과되었습니다",
+		title: "드리프트 이미지",
+		reset: "드리프트 리셋",
+		pinpointAdd: "핀포인트 추가",
+		pinpointUndo: "마지막 취소",
+		pinpointClearAll: "전체 삭제",
+		pinpointHelp: "기준 이미지에서 고정 지점을 클릭하세요.",
+		pinpointCount: (total, manual, active) => (
+			`핀포인트 ${total} (수동 ${manual}, 활성 ${active})`
+		),
+		pinpointAddFailed: "핀포인트 추가에 실패했습니다",
+		pinpointAddTimeout: "핀포인트 추가 시간이 초과되었습니다",
+		pinpointUndoFailed: "마지막 핀포인트 취소에 실패했습니다",
+		pinpointUndoTimeout: "마지막 핀포인트 취소 시간이 초과되었습니다",
+		pinpointClearFailed: "수동 핀포인트 삭제에 실패했습니다",
+		pinpointClearTimeout: "수동 핀포인트 삭제 시간이 초과되었습니다",
+		referenceOnly: "정상 · 기준 / 조도 유사 비교 이미지",
 	},
 };
 
@@ -1331,29 +1366,27 @@ function uiLang() {
 	return raw.startsWith("ko") ? "ko" : "en";
 }
 
-function driftT(key) {
-	// Chrome labels stay English; hint banner follows browser language.
-	return DRIFT_I18N.en[key] || key;
+function driftT(key, ...args) {
+	const lang = uiLang();
+	const val = (DRIFT_I18N[lang] && DRIFT_I18N[lang][key])
+		|| DRIFT_I18N.en[key]
+		|| key;
+	return typeof val === "function" ? val(...args) : val;
 }
 
 function driftHintT(key) {
-	const lang = uiLang();
-	return (DRIFT_I18N[lang] && DRIFT_I18N[lang][key])
-		|| DRIFT_I18N.en[key]
-		|| key;
+	return driftT(key);
 }
 
 function applyDriftImagesStaticI18n() {
 	const overlayCap = $("drift_images_overlay_caption");
 	if (overlayCap) overlayCap.textContent = driftT("overlayCaption");
-	const beforeEmpty = $("drift_images_before_empty");
-	if (beforeEmpty) beforeEmpty.textContent = driftT("beforeEmpty");
-	const afterEmpty = $("drift_images_after_empty");
-	if (afterEmpty) afterEmpty.textContent = driftT("afterEmpty");
+	// Do not touch before/after empty text here — open/load flow owns
+	// Loading… vs empty copy; overwriting causes a "No reference" flash.
 	const beforeImg = $("drift_images_before");
 	if (beforeImg) beforeImg.alt = driftT("before");
 	const afterImg = $("drift_images_after");
-	if (afterImg) afterImg.alt = driftT("after");
+	if (afterImg) afterImg.alt = driftT("afterLast");
 	const pinpointToggle = $("drift_anchor_toggle");
 	if (pinpointToggle) pinpointToggle.textContent = driftT("pinpointAdd");
 	const pinpointUndo = $("drift_anchor_clear");
@@ -1364,7 +1397,57 @@ function applyDriftImagesStaticI18n() {
 	if (pinpointHelp) pinpointHelp.textContent = driftT("pinpointHelp");
 }
 
-function driftImagesProxyUrl(side, camUid, pipeline, cacheBust) {
+/** Per-camera image cache epoch — bump only on DRIFT Reset (not every modal open). */
+const driftImageCacheEpoch = Object.create(null);
+/** Short-lived meta cache — avoids re-waiting on illumination match when reopening. */
+const driftMetaCache = Object.create(null);
+const DRIFT_META_CACHE_TTL_MS = 180000;
+
+function driftImageCacheBustFor(camUid, { forceNew = false } = {}) {
+	const uid = String(camUid || "").trim();
+	if (!uid) return Date.now();
+	if (forceNew || driftImageCacheEpoch[uid] == null) {
+		driftImageCacheEpoch[uid] = Date.now();
+	}
+	return driftImageCacheEpoch[uid];
+}
+
+function bustDriftImageCache(camUid) {
+	const uid = String(camUid || "").trim();
+	if (uid) driftImageCacheEpoch[uid] = Date.now();
+}
+
+function driftMetaCacheKey(camUid, pipeline) {
+	return `${String(pipeline || "")}\0${String(camUid || "")}`;
+}
+
+function getCachedDriftMeta(camUid, pipeline) {
+	const ent = driftMetaCache[driftMetaCacheKey(camUid, pipeline)];
+	if (!ent) return null;
+	if (Date.now() - ent.at > DRIFT_META_CACHE_TTL_MS) {
+		delete driftMetaCache[driftMetaCacheKey(camUid, pipeline)];
+		return null;
+	}
+	return ent.data;
+}
+
+function setCachedDriftMeta(camUid, pipeline, data) {
+	if (!data || data.ok === false) return;
+	driftMetaCache[driftMetaCacheKey(camUid, pipeline)] = {
+		at: Date.now(),
+		data,
+	};
+}
+
+function bustDriftMetaCache(camUid) {
+	const uid = String(camUid || "").trim();
+	if (!uid) return;
+	Object.keys(driftMetaCache).forEach((key) => {
+		if (key.endsWith(`\0${uid}`)) delete driftMetaCache[key];
+	});
+}
+
+function driftImagesProxyUrl(side, camUid, pipeline, cacheBust, extraQuery) {
 	const base = urls.cameraDriftImages;
 	if (!base) return "";
 	const params = new URLSearchParams({
@@ -1372,40 +1455,192 @@ function driftImagesProxyUrl(side, camUid, pipeline, cacheBust) {
 		cam_uid: camUid || "",
 		lang: uiLang(),
 	});
+	if (extraQuery && typeof extraQuery === "object") {
+		Object.keys(extraQuery).forEach((key) => {
+			const value = extraQuery[key];
+			if (value == null || value === "") return;
+			if (key === "pipeline" || key === "cam_uid") return;
+			params.set(key, String(value));
+		});
+	}
+	const sideName = String(side || "").toLowerCase();
+	if ((sideName === "before" || sideName === "after") && !params.has("preview")) {
+		params.set("preview", "1");
+	}
 	if (cacheBust != null && cacheBust !== "") {
 		params.set("_", String(cacheBust));
 	}
 	return `${base}/${encodeURIComponent(side)}?${params.toString()}`;
 }
 
-function setDriftSideImage(side, url) {
+/** Prefer meta side.url (proxy-rewritten, keeps preview/batch); fallback to built URL. */
+function driftImagesSideUrl(side, sideInfo, camUid, pipeline, cacheBust) {
+	const metaUrl = sideInfo && typeof sideInfo.url === "string"
+		? sideInfo.url.trim()
+		: "";
+	if (metaUrl) {
+		// batch= already uniquely versions the asset — do not append "_" (proxy
+		// strips it for edge, but it still busts the browser cache entry).
+		if (/[?&]batch=/.test(metaUrl)) return metaUrl;
+		if (cacheBust == null || cacheBust === "" || /[?&]_=/.test(metaUrl)) {
+			return metaUrl;
+		}
+		return `${metaUrl}${metaUrl.includes("?") ? "&" : "?"}_=${encodeURIComponent(String(cacheBust))}`;
+	}
+	const extra = {};
+	const batch = sideInfo && sideInfo.batch_name;
+	if (batch) extra.batch = batch;
+	// When batch is known, skip "_" so edge/browser cache can hit.
+	const bust = batch ? "" : cacheBust;
+	return driftImagesProxyUrl(side, camUid, pipeline, bust, extra);
+}
+
+function driftSideImageLoaded(img) {
+	return Boolean(
+		img
+		&& img.getAttribute("src")
+		&& img.complete
+		&& img.naturalWidth > 0,
+	);
+}
+
+function driftSideFallbackMessage(side, empty) {
+	const saved = empty && empty.dataset.fallbackMsg;
+	if (saved) return saved;
+	if (side === "before") return driftT("beforeEmpty");
+	return isDriftImagesCompareMode()
+		? driftT("afterEmpty")
+		: driftT("afterEmptyNoIllum");
+}
+
+function setDriftSidePlaceholder(side, message) {
 	const img = $(`drift_images_${side}`);
 	const empty = $(`drift_images_${side}_empty`);
 	if (!img || !empty) return;
+	img.onload = null;
+	img.onerror = null;
+	img.removeAttribute("src");
+	img.dataset.driftUrl = "";
+	img.classList.add("hidden");
+	empty.dataset.fallbackMsg = message;
+	empty.textContent = message;
+	empty.classList.remove("hidden");
+	if (side === "before") updateDriftAnchorBar();
+}
+
+function driftSideEmptyMessage(side) {
+	if (side === "before") return driftT("beforeEmpty");
+	return isDriftImagesCompareMode()
+		? driftT("afterEmpty")
+		: driftT("afterEmptyNoIllum");
+}
+
+function setDriftSideImage(side, url, { emptyOnFail = null } = {}) {
+	const img = $(`drift_images_${side}`);
+	const empty = $(`drift_images_${side}_empty`);
+	if (!img || !empty) return;
+	const failMsg = emptyOnFail || driftSideEmptyMessage(side);
 	if (!url) {
+		setDriftSidePlaceholder(side, failMsg);
+		return;
+	}
+	const loadingMsg = driftT("loading");
+	empty.dataset.fallbackMsg = failMsg;
+
+	const reveal = () => {
+		if (img.dataset.driftUrl !== url) return;
+		empty.classList.add("hidden");
+		img.classList.remove("hidden");
+		if (side === "before") updateDriftAnchorBar();
+	};
+	const fail = () => {
+		if (img.dataset.driftUrl !== url) return;
 		img.onload = null;
 		img.onerror = null;
 		img.removeAttribute("src");
 		img.dataset.driftUrl = "";
 		img.classList.add("hidden");
+		empty.textContent = failMsg;
 		empty.classList.remove("hidden");
-		return;
-	}
+		if (side === "before") updateDriftAnchorBar();
+	};
+
+	const bindLoadHandlers = () => {
+		const prevOnload = img.onload;
+		img.onload = (ev) => {
+			reveal();
+			if (typeof prevOnload === "function") prevOnload.call(img, ev);
+		};
+		img.onerror = fail;
+	};
+
 	// Skip restarting a download already in flight / completed for the same URL.
 	if (img.dataset.driftUrl === url && (img.complete || img.getAttribute("src"))) {
-		empty.classList.add("hidden");
-		img.classList.remove("hidden");
+		if (img.complete && img.naturalWidth > 0) {
+			reveal();
+			return;
+		}
+		if (img.complete && img.naturalWidth === 0) {
+			fail();
+			return;
+		}
+		empty.textContent = loadingMsg;
+		empty.classList.remove("hidden");
+		img.classList.add("hidden");
+		bindLoadHandlers();
 		return;
 	}
-	empty.classList.add("hidden");
-	img.classList.remove("hidden");
+
+	empty.textContent = loadingMsg;
+	empty.classList.remove("hidden");
+	img.classList.add("hidden");
 	img.dataset.driftUrl = url;
+	bindLoadHandlers();
 	img.src = url;
 }
 
+/** After compare phase ends, never leave a panel stuck on Loading… */
+function settleDriftPanelsFromMeta() {
+	if (!driftImagesState) return;
+	const { pipeline, camUid, cacheBust, meta } = driftImagesState;
+	const before = meta && meta.before;
+	const after = meta && meta.after;
+	const afterEmptyMsg = driftSideEmptyMessage("after");
+
+	if (before && before.available) {
+		setDriftPanelCaption("before", before, driftT("before"));
+		setDriftSideImage(
+			"before",
+			driftImagesSideUrl("before", before, camUid, pipeline, cacheBust),
+			{ emptyOnFail: driftT("beforeEmpty") },
+		);
+	} else if (!driftSideImageLoaded($("drift_images_before"))) {
+		setDriftSidePlaceholder("before", driftT("beforeEmpty"));
+	}
+
+	if (after && after.available) {
+		const afterLabel = (meta && meta.illumination_matched) || !isDriftImagesCompareMode()
+			? driftT("after")
+			: driftT("afterLast");
+		setDriftPanelCaption("after", after, afterLabel);
+		setDriftSideImage(
+			"after",
+			driftImagesSideUrl("after", after, camUid, pipeline, cacheBust),
+			{ emptyOnFail: afterEmptyMsg },
+		);
+	} else if (!driftSideImageLoaded($("drift_images_after"))) {
+		const afterLabel = isDriftImagesCompareMode()
+			? driftT("afterLast")
+			: driftT("after");
+		setDriftPanelCaption("after", null, afterLabel);
+		setDriftSidePlaceholder("after", afterEmptyMsg);
+	}
+	syncDriftFooterChrome();
+}
+
 function clearDriftPairImages() {
-	setDriftSideImage("before", "");
-	setDriftSideImage("after", "");
+	setDriftSidePlaceholder("before", driftT("loading"));
+	setDriftSidePlaceholder("after", driftT("loading"));
 	const overlayImg = $("drift_images_overlay");
 	if (overlayImg) overlayImg.removeAttribute("src");
 	const grid = $("drift_images_grid");
@@ -1436,6 +1671,53 @@ function setDriftImagesReferenceOnly(referenceOnly) {
 	if (grid) grid.classList.toggle("is-reference-only", Boolean(referenceOnly));
 }
 
+/** Keep both panels visible with guidance copy; preserve any already-loaded images. */
+function showDriftImagesPlaceholderPair({ preserveLoaded = true } = {}) {
+	const drifted = isDriftImagesCompareMode();
+	const afterLabel = drifted ? driftT("afterLast") : driftT("after");
+	const afterEmptyMsg = drifted
+		? driftT("afterEmpty")
+		: driftT("afterEmptyNoIllum");
+	setDriftPanelCaption("before", null, driftT("before"));
+	setDriftPanelCaption("after", null, afterLabel);
+	const afterImg = $("drift_images_after");
+	if (afterImg) afterImg.alt = afterLabel;
+	setDriftImagesReferenceOnly(false);
+	const grid = $("drift_images_grid");
+	if (grid) grid.hidden = false;
+	const beforeImg = $("drift_images_before");
+	if (!(preserveLoaded && driftSideImageLoaded(beforeImg))) {
+		setDriftSidePlaceholder("before", driftT("beforeEmpty"));
+	}
+	if (!(preserveLoaded && driftSideImageLoaded(afterImg))) {
+		setDriftSidePlaceholder("after", afterEmptyMsg);
+	}
+}
+
+function setDriftImagesStatusMessage(text, { hide = false } = {}) {
+	const el = $("drift_images_status");
+	if (!el) return;
+	el.hidden = Boolean(hide);
+	if (text != null) el.textContent = text;
+}
+
+/** OK cams keep the status banner; drift cams hide it once content is ready. */
+function syncDriftImagesStatus({ ready = false, errorText = null } = {}) {
+	if (errorText) {
+		setDriftImagesStatusMessage(errorText, { hide: false });
+		return;
+	}
+	if (!isDriftImagesCompareMode()) {
+		setDriftImagesStatusMessage(driftT("referenceOnly"), { hide: false });
+		return;
+	}
+	if (ready) {
+		setDriftImagesStatusMessage("", { hide: true });
+		return;
+	}
+	setDriftImagesStatusMessage(driftT("loading"), { hide: false });
+}
+
 function resolveDriftCameraIsDrifted(camUid, explicit) {
 	if (explicit === true || explicit === false) return explicit;
 	if (explicit != null && explicit !== "") {
@@ -1453,21 +1735,129 @@ function resolveDriftCameraIsDrifted(camUid, explicit) {
 	return true;
 }
 
-function prefetchDriftPairImages(camUid, pipeline, cacheBust, compareMode) {
-	const beforeUrl = driftImagesProxyUrl("before", camUid, pipeline, cacheBust);
+/** Show loading chrome for both panels (images wait for phased meta URLs). */
+function prepareDriftPairLoadingChrome(isDrifted) {
+	const afterLabel = isDrifted ? driftT("afterLast") : driftT("after");
 	setDriftPanelCaption("before", null, driftT("before"));
+	setDriftPanelCaption("after", null, afterLabel);
+	const afterImg = $("drift_images_after");
+	if (afterImg) afterImg.alt = afterLabel;
 	const grid = $("drift_images_grid");
 	if (grid) grid.hidden = false;
-	setDriftImagesReferenceOnly(!compareMode);
-	setDriftSideImage("before", beforeUrl);
-	if (compareMode) {
-		const afterUrl = driftImagesProxyUrl("after", camUid, pipeline, cacheBust);
-		setDriftPanelCaption("after", null, driftT("after"));
-		setDriftSideImage("after", afterUrl);
-	} else {
-		setDriftSideImage("after", "");
-		setDriftPanelCaption("after", null, driftT("after"));
+	setDriftImagesReferenceOnly(false);
+	// Both panels stay on Loading… until meta confirms availability.
+	setDriftSidePlaceholder("before", driftT("loading"));
+	setDriftSidePlaceholder("after", driftT("loading"));
+}
+
+function mergeDriftImagesMeta(prev, next) {
+	const base = prev && typeof prev === "object" ? { ...prev } : {};
+	if (!next || typeof next !== "object") return base;
+	const out = { ...base, ...next };
+	if (next.before) out.before = next.before;
+	else if (base.before) out.before = base.before;
+	if (Object.prototype.hasOwnProperty.call(next, "after")) out.after = next.after;
+	else if (base.after) out.after = base.after;
+	if (Object.prototype.hasOwnProperty.call(next, "overlay")) out.overlay = next.overlay;
+	else if (base.overlay) out.overlay = base.overlay;
+	return out;
+}
+
+function driftMetaSideAvailable(meta, side) {
+	const info = meta && meta[side];
+	return Boolean(info && info.available);
+}
+
+function syncDriftNoImageStatus({ errorText = null } = {}) {
+	const drifted = isDriftImagesCompareMode();
+	syncDriftImagesStatus({
+		ready: !drifted,
+		errorText: errorText || (drifted ? driftT("notFound") : null),
+	});
+}
+
+/**
+ * phase=ref: load Reference from meta.before.url immediately.
+ * @returns {boolean} true when compare phase can be skipped (no images at all).
+ */
+function applyDriftImagesMetaRef(data) {
+	if (!driftImagesState) return true;
+	if (!data || data.ok === false) {
+		// Edge already said no images — drop TTL cache + any warm snapshot.
+		bustDriftMetaCache(driftImagesState.camUid);
+		driftImagesState.meta = (data && typeof data === "object")
+			? { ...data, before: null, after: null, overlay: null }
+			: { ok: false, before: null, after: null, overlay: null };
+		syncDriftNoImageStatus();
+		showDriftImagesPlaceholderPair({ preserveLoaded: false });
+		syncDriftFooterChrome();
+		return true;
 	}
+	driftImagesState.meta = mergeDriftImagesMeta(driftImagesState.meta, data);
+	const { pipeline, camUid, cacheBust, meta } = driftImagesState;
+	const before = meta && meta.before;
+	setDriftPanelCaption("before", before, driftT("before"));
+	const grid = $("drift_images_grid");
+	if (grid) grid.hidden = false;
+	if (before && before.available) {
+		setDriftSideImage(
+			"before",
+			driftImagesSideUrl("before", before, camUid, pipeline, cacheBust),
+			{ emptyOnFail: driftT("beforeEmpty") },
+		);
+		syncDriftImagesStatus({ ready: true });
+	} else if (!driftSideImageLoaded($("drift_images_before"))) {
+		setDriftSidePlaceholder("before", driftT("beforeEmpty"));
+	}
+	syncDriftFooterChrome();
+	return false;
+}
+
+function applyDriftImagesMeta(data) {
+	if (!driftImagesState || !data) return;
+	driftImagesState.meta = mergeDriftImagesMeta(driftImagesState.meta, data);
+	const meta = driftImagesState.meta;
+	const driftedNow = isDriftImagesCompareMode();
+	const hasImage = (
+		driftMetaSideAvailable(meta, "before")
+		|| driftMetaSideAvailable(meta, "after")
+		|| (driftedNow && driftMetaSideAvailable(meta, "overlay"))
+	);
+	if (!hasImage) {
+		syncDriftNoImageStatus();
+		showDriftImagesPlaceholderPair({ preserveLoaded: true });
+		renderDriftHint(driftedNow ? meta : null);
+		renderDriftRawMetrics(driftedNow ? meta : null);
+		syncDriftFooterChrome();
+		return;
+	}
+	syncDriftImagesStatus({ ready: true });
+	renderDriftImagesPair();
+	settleDriftPanelsFromMeta();
+}
+
+function fetchDriftImagesMetaPhase(phase, { loadId, timeout }, handlers) {
+	if (!driftImagesState || !urls.cameraDriftImages) return;
+	const params = new URLSearchParams({
+		pipeline: driftImagesState.pipeline || "",
+		cam_uid: driftImagesState.camUid || "",
+		lang: uiLang(),
+		phase: phase || "full",
+	});
+	fetchJsonGet(`${urls.cameraDriftImages}?${params.toString()}`, (data) => {
+		if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+		if (handlers && typeof handlers.onsuccess === "function") handlers.onsuccess(data);
+	}, {
+		timeout: timeout || 60000,
+		onerror() {
+			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+			if (handlers && typeof handlers.onerror === "function") handlers.onerror();
+		},
+		ontimeout() {
+			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
+			if (handlers && typeof handlers.ontimeout === "function") handlers.ontimeout();
+		},
+	});
 }
 
 /** Browser local TZ label: KST / UTC / UTC±N */
@@ -1666,8 +2056,13 @@ function driftImageCoordsFromEvent(img, clientX, clientY) {
 	};
 }
 
+function hasDriftReferenceImage() {
+	// Pinpoints are drawn on Reference only — count/actions require a loaded image.
+	return driftSideImageLoaded($("drift_images_before"));
+}
+
 function setDriftAnchorEditMode(enabled) {
-	const on = Boolean(enabled);
+	const on = Boolean(enabled) && hasDriftReferenceImage();
 	if (driftImagesState) driftImagesState.anchorEdit = on;
 	const toggle = $("drift_anchor_toggle");
 	const help = $("drift_anchor_help");
@@ -1687,16 +2082,30 @@ function updateDriftAnchorBar() {
 	const countEl = $("drift_anchor_count");
 	const undoBtn = $("drift_anchor_clear");
 	const clearAllBtn = $("drift_anchor_clear_all");
+	const toggle = $("drift_anchor_toggle");
+	const hasRef = hasDriftReferenceImage();
 	const points = (driftImagesState && driftImagesState.persistentPoints) || [];
 	const manual = manualPersistentPoints(points).length;
 	const active = points.filter((p) => p.active).length;
+	if (!hasRef && driftImagesState && driftImagesState.anchorEdit) {
+		driftImagesState.anchorEdit = false;
+		if (toggle) toggle.setAttribute("aria-pressed", "false");
+		const help = $("drift_anchor_help");
+		if (help) help.hidden = true;
+		const beforeMedia = $("drift_images_before")
+			&& $("drift_images_before").closest(".drift-images-media");
+		if (beforeMedia) beforeMedia.classList.remove("is-anchor-edit");
+	}
 	const editing = Boolean(driftImagesState && driftImagesState.anchorEdit);
-	const showManualActions = editing && manual > 0;
+	const showManualActions = hasRef && editing && manual > 0;
 	if (countEl) {
-		const format = DRIFT_I18N.en.pinpointCount;
-		countEl.textContent = points.length
-			? format(points.length, manual, active)
+		// No reference image → no drawable pinpoints; hide stale server counts.
+		countEl.textContent = (hasRef && points.length)
+			? driftT("pinpointCount", points.length, manual, active)
 			: "";
+	}
+	if (toggle) {
+		toggle.disabled = !hasRef;
 	}
 	if (undoBtn) {
 		// Beside Add pinpoint while edit mode is on (and there is something to undo).
@@ -2106,8 +2515,9 @@ function renderDriftOverlay(meta) {
 		wrap.hidden = true;
 		return;
 	}
-	const url = driftImagesProxyUrl(
+	const url = driftImagesSideUrl(
 		"overlay",
+		meta.overlay,
 		driftImagesState && driftImagesState.camUid,
 		driftImagesState && driftImagesState.pipeline,
 		driftImagesState && driftImagesState.cacheBust,
@@ -2153,11 +2563,15 @@ function renderDriftRawMetrics(meta) {
 	box.hidden = false;
 }
 
-function setDriftResetVisible(visible) {
+/** Footer stays for pinpoints; DRIFT Reset only when the camera is drifted. */
+function syncDriftFooterChrome({ forceHide = false } = {}) {
 	const footer = $("drift_images_footer");
 	const btn = $("drift_images_reset");
-	if (footer) footer.hidden = !visible;
+	const hasCam = Boolean(driftImagesState && driftImagesState.camUid);
+	const drifted = isDriftImagesCompareMode();
+	if (footer) footer.hidden = Boolean(forceHide) || !hasCam;
 	if (btn) {
+		btn.hidden = Boolean(forceHide) || !hasCam || !drifted;
 		btn.disabled = false;
 		btn.textContent = driftT("reset");
 	}
@@ -2166,12 +2580,21 @@ function setDriftResetVisible(visible) {
 function renderDriftImagesPair() {
 	if (!driftImagesState || !driftImagesState.meta) return;
 	const { pipeline, camUid, meta, cacheBust } = driftImagesState;
-	const compare = isDriftImagesCompareMode();
+	const drifted = isDriftImagesCompareMode();
 	const before = meta.before;
 	const after = meta.after;
+	const showAfter = Boolean(after && after.available);
+	// Illumination-matched / OK empty → "Compare"; saved alarm current → "Last".
+	const expectingIllumCompare = !drifted && !showAfter;
+	const afterLabel = (meta.illumination_matched || expectingIllumCompare)
+		? driftT("after")
+		: driftT("afterLast");
+	const afterEmptyMsg = (expectingIllumCompare || (meta.illumination_matched && !showAfter))
+		? driftT("afterEmptyNoIllum")
+		: driftT("afterEmpty");
 
-	// Stale last-event meta still arrives for OK cameras; hide compare chrome.
-	if (compare) {
+	// Drift-only chrome (hint/metrics/arrows) when drifted.
+	if (drifted) {
 		renderDriftHint(meta);
 		renderDriftRawMetrics(meta);
 		renderDriftOverlay(meta);
@@ -2181,41 +2604,41 @@ function renderDriftImagesPair() {
 		renderDriftOverlay(null);
 	}
 	setDriftPanelCaption("before", before, driftT("before"));
-	setDriftPanelCaption("after", compare ? after : null, driftT("after"));
-	setDriftResetVisible(Boolean(camUid));
-	setDriftImagesReferenceOnly(!compare);
+	setDriftPanelCaption("after", showAfter ? after : null, afterLabel);
+	syncDriftFooterChrome();
+	// Always keep the right panel; empty state shows guidance when no pair.
+	setDriftImagesReferenceOnly(false);
 
 	const beforeImg = $("drift_images_before");
 	const afterImg = $("drift_images_after");
+	if (afterImg) afterImg.alt = afterLabel;
 	const onOverlayReady = () => {
 		if (!driftImagesState || driftImagesState.camUid !== camUid) return;
 		scheduleDriftShiftArrow(meta);
 	};
 	if (beforeImg) beforeImg.onload = onOverlayReady;
-	if (afterImg) afterImg.onload = compare ? onOverlayReady : null;
+	if (afterImg) afterImg.onload = showAfter ? onOverlayReady : null;
 
 	const beforeUrl = before && before.available
-		? driftImagesProxyUrl("before", camUid, pipeline, cacheBust)
+		? driftImagesSideUrl("before", before, camUid, pipeline, cacheBust)
 		: "";
-	const afterUrl = compare && after && after.available
-		? driftImagesProxyUrl("after", camUid, pipeline, cacheBust)
+	const afterUrl = showAfter
+		? driftImagesSideUrl("after", after, camUid, pipeline, cacheBust)
 		: "";
 
-	if (before && before.available) {
-		setDriftSideImage("before", beforeUrl);
+	if (beforeUrl) {
+		setDriftSideImage("before", beforeUrl, { emptyOnFail: driftT("beforeEmpty") });
 	} else {
-		setDriftSideImage("before", "");
+		setDriftSidePlaceholder("before", driftT("beforeEmpty"));
 	}
 	if (afterUrl) {
-		setDriftSideImage("after", afterUrl);
+		setDriftSideImage("after", afterUrl, { emptyOnFail: afterEmptyMsg });
 	} else {
-		setDriftSideImage("after", "");
+		setDriftSidePlaceholder("after", afterEmptyMsg);
 	}
 
 	const grid = $("drift_images_grid");
-	if (grid) {
-		grid.hidden = !(beforeUrl || afterUrl);
-	}
+	if (grid) grid.hidden = false;
 	if (beforeUrl || afterUrl) {
 		scheduleDriftShiftArrow(meta);
 	} else {
@@ -2230,7 +2653,8 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 		return;
 	}
 	applyDriftImagesStaticI18n();
-	const cacheBust = Date.now();
+	// Reuse cache epoch across opens; only Reset bumps it (avoids re-downloading ~7MB).
+	const cacheBust = driftImageCacheBustFor(uid);
 	const drifted = resolveDriftCameraIsDrifted(uid, isDrifted);
 	driftImagesState = {
 		camUid: uid,
@@ -2245,74 +2669,83 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 	};
 	const loadId = driftImagesState.loadId;
 	$("drift_images_title").textContent = driftImagesState.title;
-	$("drift_images_status").hidden = false;
-	$("drift_images_status").textContent = drifted
-		? driftT("loading")
-		: driftT("referenceOnly");
+	syncDriftImagesStatus({ ready: false });
 	renderDriftHint(null);
 	renderDriftRawMetrics(null);
 	clearDriftPairImages();
-	setDriftResetVisible(false);
+	syncDriftFooterChrome();
 	setDriftAnchorEditMode(false);
 	updateDriftAnchorBar();
 	setOverlayVisible($("drift_images_modal"), true);
 	loadDriftPersistentPoints();
 
-	// Prefetch while meta computes; cache-bust avoids post-reset stale PNGs.
-	prefetchDriftPairImages(uid, driftImagesState.pipeline, cacheBust, drifted);
+	const cachedMeta = getCachedDriftMeta(uid, driftImagesState.pipeline);
+	prepareDriftPairLoadingChrome(drifted);
+	if (cachedMeta) {
+		// Show last compare snapshot immediately; still refresh ref→compare.
+		applyDriftImagesMeta(cachedMeta);
+	}
 
-	const params = new URLSearchParams({
-		pipeline: driftImagesState.pipeline,
-		cam_uid: uid,
-		lang: uiLang(),
-	});
-	fetchJsonGet(`${urls.cameraDriftImages}?${params.toString()}`, (data) => {
-		if (!driftImagesState || driftImagesState.loadId !== loadId) return;
-		const emptyMsg = isDriftImagesCompareMode()
-			? driftT("notFound")
-			: driftT("noReference");
-		if (!data || data.ok === false) {
-			// Edge may return localized errors (e.g. Korean); UI status stays English.
-			$("drift_images_status").textContent = emptyMsg;
-			clearDriftPairImages();
-			setDriftResetVisible(Boolean(uid));
-			return;
+	const finishCompareFailure = (errorText, failedData) => {
+		if (!driftImagesState) return;
+		if (failedData && typeof failedData === "object") {
+			driftImagesState.meta = mergeDriftImagesMeta(driftImagesState.meta, failedData);
 		}
-		driftImagesState.meta = data;
-		const hasImage = Boolean(
-			(data.before && data.before.available)
-			|| (isDriftImagesCompareMode() && data.after && data.after.available)
-			|| (isDriftImagesCompareMode() && data.overlay && data.overlay.available),
-		);
-		if (!hasImage) {
-			$("drift_images_status").textContent = emptyMsg;
-			clearDriftPairImages();
-			if (isDriftImagesCompareMode()) {
-				renderDriftHint(data);
-				renderDriftRawMetrics(data);
-			} else {
-				renderDriftHint(null);
-				renderDriftRawMetrics(null);
-			}
-			setDriftResetVisible(true);
-			return;
+		// Fresh compare did not succeed — drop stale after/overlay from warm cache.
+		if (driftImagesState.meta) {
+			driftImagesState.meta.after = null;
+			driftImagesState.meta.overlay = null;
+			driftImagesState.meta.illumination_matched = false;
 		}
-		$("drift_images_status").hidden = true;
-		renderDriftImagesPair();
-	}, {
-		timeout: 20000,
-		onerror() {
-			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
-			$("drift_images_status").textContent = driftT("failed");
-			clearDriftPairImages();
-			setDriftResetVisible(Boolean(uid));
+		const meta = driftImagesState.meta;
+		const hasBefore = driftMetaSideAvailable(meta, "before");
+		if (hasBefore && meta) {
+			setCachedDriftMeta(uid, driftImagesState.pipeline, { ...meta, ok: true });
+		} else {
+			bustDriftMetaCache(uid);
+		}
+		if (errorText) {
+			syncDriftImagesStatus({ errorText });
+		} else if (!hasBefore) {
+			syncDriftNoImageStatus();
+		}
+		settleDriftPanelsFromMeta();
+	};
+
+	const loadComparePhase = () => {
+		fetchDriftImagesMetaPhase("compare", { loadId, timeout: 60000 }, {
+			onsuccess(data) {
+				if (!data || data.ok === false) {
+					finishCompareFailure(null, data);
+					return;
+				}
+				setCachedDriftMeta(uid, driftImagesState.pipeline, mergeDriftImagesMeta(
+					driftImagesState.meta,
+					data,
+				));
+				applyDriftImagesMeta(data);
+			},
+			onerror() { finishCompareFailure(driftT("failed")); },
+			ontimeout() { finishCompareFailure(driftT("timeout")); },
+		});
+	};
+
+	const continueAfterRefMiss = () => {
+		if (!driftSideImageLoaded($("drift_images_before"))) {
+			setDriftSidePlaceholder("before", driftT("beforeEmpty"));
+		}
+		loadComparePhase();
+	};
+
+	// 1) phase=ref → Reference ASAP (or empty immediately if none)
+	// 2) phase=compare → after + illumination_matched (skipped when ref says no images)
+	fetchDriftImagesMetaPhase("ref", { loadId, timeout: 30000 }, {
+		onsuccess(data) {
+			if (applyDriftImagesMetaRef(data)) return;
+			loadComparePhase();
 		},
-		ontimeout() {
-			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
-			$("drift_images_status").textContent = driftT("timeout");
-			clearDriftPairImages();
-			setDriftResetVisible(Boolean(uid));
-		},
+		onerror: continueAfterRefMiss,
+		ontimeout: continueAfterRefMiss,
 	});
 }
 
@@ -2591,6 +3024,8 @@ function resetCameraDrift(camUid, pipeline, btn) {
 				showAlertModal((data && data.error) || "Camera drift reset failed");
 				return;
 			}
+			bustDriftImageCache(uid);
+			bustDriftMetaCache(uid);
 			closeDriftImagesModal();
 			if (plcTagModalState && Array.isArray(plcTagModalState.tags)) {
 				// Only drop drifted rows after reset; OK cameras stay in the list.

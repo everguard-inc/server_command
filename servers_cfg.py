@@ -549,7 +549,7 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     })
     flat_statuses.append(chip_state)
 
-	# Empty /api/cameras: surface drifted IDs from /get_drift only.
+  # Empty /api/cameras: surface drifted IDs from /get_drift only.
   if not cameras:
     for cid in sorted(drifted_ids):
       flat_links.append({
@@ -968,17 +968,19 @@ def finalize_pipeline_status(entry):
     if not entry.get("running"):
       entry["status"] = "ERR"
       return entry
-    if entry.get("drift_api_ok") is False or entry.get("drift_cameras_set") is None:
+    if entry.get("drift_api_ok") is False:
       entry["status"] = "WARN"
       return entry
-    drift_count = entry.get("drift_cameras_now")
-    if drift_count is None:
-      drift_count = 0
+    # Incomplete metrics: keep PENDING (avoid chip-less false WARN).
+    if entry.get("drift_cameras_set") is None:
+      if entry.get("status") not in ("OK", "WARN", "ERR"):
+        entry["status"] = "PENDING"
+      return entry
+    drift_count = entry.get("drift_cameras_now") or 0
     drift_status = str(entry.get("drift_status") or "").upper()
-    if drift_count > 0 or drift_status not in ("", "OK"):
-      entry["status"] = "WARN"
-    else:
-      entry["status"] = "OK"
+    entry["status"] = (
+      "WARN" if drift_count > 0 or drift_status not in ("", "OK") else "OK"
+    )
     return entry
 
   # Kafka consumer: systemd running + PLC tag API health.
