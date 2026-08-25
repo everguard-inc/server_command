@@ -15,6 +15,7 @@ Then deploy from the proxy:
   python3 deploy_clients.py --hosts 10.0.0.10
   python3 deploy_clients.py --dry-run
 
+--local rsyncs the working tree and .git so edge Current (git HEAD) matches this host.
 --deps runs setup_client.py remotely (git credentials, pip, systemd, sudoers, restart).
 Set ~/.git-credentials (or GITHUB_TOKEN) on the deploy host when edges lack git credentials.
 Daily mode syncs code then restarts server_command_client.service (passwordless sudo).
@@ -44,7 +45,8 @@ DEFAULT_SSH_USER = getpass.getuser()
 DEFAULT_REPO_PATH = os.path.join(os.path.expanduser("~"), "server_command")
 GITHUB_TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".eg", "github_token")
 GIT_CREDENTIALS_FILE = os.path.join(os.path.expanduser("~"), ".git-credentials")
-LOCAL_SYNC_EXCLUDES = (".git", "__pycache__", "*.pyc", "nohup.out", "servers.json")
+# Keep .git so --local updates edge HEAD / UI Current to match this host.
+LOCAL_SYNC_EXCLUDES = ("__pycache__", "*.pyc", "nohup.out", "servers.json")
 _ENV_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -308,7 +310,10 @@ def deploy_host(host, args, runner):
 
 def describe_mode(args):
   if args.local:
-    deploy = "rsync + setup_client.py" if args.deps else "rsync + service restart"
+    deploy = (
+      "rsync(+.git) + setup_client.py" if args.deps
+      else "rsync(+.git) + service restart"
+    )
   elif args.deps:
     deploy = "git pull + setup_client.py"
   else:
@@ -338,7 +343,7 @@ def validate_args(args):
 def build_parser():
   p = argparse.ArgumentParser(description="Deploy server_command agent to edge hosts via SSH.")
   p.add_argument("--local", action="store_true",
-                 help="rsync the whole local folder instead of git pull")
+                 help="rsync local folder + .git (updates edge Current/HEAD) instead of git pull")
   p.add_argument("--hosts", nargs="+", metavar="IP",
                  help="target IPs (default: all in servers.json)")
   p.add_argument("--user", default=DEFAULT_SSH_USER)

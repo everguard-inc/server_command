@@ -3,6 +3,7 @@ const {
 	pipelineGroups,
 	pipelineStatic,
 	statusDisplay,
+	proxyHostIps,
 	urls,
 } = window.APP_CONFIG;
 const cameraFeedBase = urls.cameraFeed;
@@ -1274,7 +1275,7 @@ function closeDriftImagesModal() {
 		afterImg.dataset.driftUrl = "";
 	}
 	if (overlayImg) overlayImg.removeAttribute("src");
-	clearDriftShiftArrow();
+	clearDriftShiftArrow({ teardown: true });
 	renderDriftHint(null);
 	renderDriftOverlay(null);
 	renderDriftRawMetrics(null);
@@ -1290,8 +1291,8 @@ const DRIFT_I18N = {
 		afterLast: "Last",
 		beforeEmpty: "No reference image",
 		afterEmpty: "No last image",
-		afterEmptyCompare: "No compare image",
 		afterEmptyNoIllum: "No illumination-matched compare image",
+		distance: "distance",
 		threshold: "threshold",
 		matches: "match points",
 		fpHigh: "High false-positive risk",
@@ -1300,7 +1301,6 @@ const DRIFT_I18N = {
 		loading: "Loading…",
 		unavailable: "Camera drift images unavailable",
 		notFound: "No drift images found",
-		noReference: "No reference image",
 		failed: "Failed to load drift images",
 		timeout: "Timed out loading drift images",
 		title: "Drift Images",
@@ -1312,6 +1312,7 @@ const DRIFT_I18N = {
 		pinpointCount: (total, manual, active) => (
 			`Pinpoints ${total} (manual ${manual}, active ${active})`
 		),
+		gateMatchCount: (n) => `Gate matches ${n}`,
 		pinpointAddFailed: "Failed to add pinpoint",
 		pinpointAddTimeout: "Timed out adding pinpoint",
 		pinpointUndoFailed: "Failed to undo last pinpoint",
@@ -1319,6 +1320,11 @@ const DRIFT_I18N = {
 		pinpointClearFailed: "Failed to clear manual pinpoints",
 		pinpointClearTimeout: "Timed out clearing manual pinpoints",
 		referenceOnly: "Camera OK · reference / illumination-matched compare",
+		evalPending: "Evaluation pending · waiting for the first compare pair",
+		evalDeferred: "Evaluation deferred · drift judgment skipped",
+		evalDeferredIllum: "Evaluation deferred · no illumination-similar reference",
+		evalDeferredWarmup: "Evaluation deferred · waiting for a reliable compare pair",
+		evalDeferredGlobalShift: "Evaluation deferred · global shift seen; awaiting consecutive confirm",
 	},
 	ko: {
 		overlayCaption: "설명",
@@ -1327,8 +1333,8 @@ const DRIFT_I18N = {
 		afterLast: "최근",
 		beforeEmpty: "기준 이미지 없음",
 		afterEmpty: "최근 이미지 없음",
-		afterEmptyCompare: "비교 이미지 없음",
 		afterEmptyNoIllum: "조도 유사 비교 이미지 없음",
+		distance: "거리",
 		threshold: "임계값",
 		matches: "매칭 포인트",
 		fpHigh: "오탐 가능성 높음",
@@ -1337,7 +1343,6 @@ const DRIFT_I18N = {
 		loading: "로딩 중…",
 		unavailable: "카메라 드리프트 이미지를 사용할 수 없습니다",
 		notFound: "드리프트 이미지가 없습니다",
-		noReference: "기준 이미지 없음",
 		failed: "드리프트 이미지를 불러오지 못했습니다",
 		timeout: "드리프트 이미지 로딩 시간이 초과되었습니다",
 		title: "드리프트 이미지",
@@ -1349,6 +1354,7 @@ const DRIFT_I18N = {
 		pinpointCount: (total, manual, active) => (
 			`핀포인트 ${total} (수동 ${manual}, 활성 ${active})`
 		),
+		gateMatchCount: (n) => `유효 매칭 ${n}`,
 		pinpointAddFailed: "핀포인트 추가에 실패했습니다",
 		pinpointAddTimeout: "핀포인트 추가 시간이 초과되었습니다",
 		pinpointUndoFailed: "마지막 핀포인트 취소에 실패했습니다",
@@ -1356,8 +1362,56 @@ const DRIFT_I18N = {
 		pinpointClearFailed: "수동 핀포인트 삭제에 실패했습니다",
 		pinpointClearTimeout: "수동 핀포인트 삭제 시간이 초과되었습니다",
 		referenceOnly: "정상 · 기준 / 조도 유사 비교 이미지",
+		evalPending: "평가 대기 · 첫 비교 페어를 기다리는 중",
+		evalDeferred: "평가 보류 · 드리프트 판정 건너뜀",
+		evalDeferredIllum: "평가 보류 · 조도 유사 기준 없음",
+		evalDeferredWarmup: "평가 보류 · 신뢰할 비교 페어 대기 중",
+		evalDeferredGlobalShift: "평가 보류 · 전역 이동 감지, 연속 확인 대기 중",
 	},
 };
+
+/** Map backend reason / skip codes to DRIFT_I18N keys (avoid raw English copy). */
+const DRIFT_EVAL_REASON_MATCHERS = [
+	{ key: "evalDeferredIllum", code: /illumination_(mismatch|unknown)/i, text: /illumination/i },
+	{ key: "evalDeferredWarmup", code: /persistent_warmup|warmup/i, text: /warmup|reliable compare/i },
+	{
+		key: "evalDeferredGlobalShift",
+		code: /global_shift|consecutive_confirm|awaiting_confirm/i,
+		text: /global\s*shift|consecutive\s*confirm/i,
+	},
+	{ key: "evalDeferred", code: /judgment_skipped|eval_deferred|deferred/i, text: /judgment skipped|evaluation deferred/i },
+];
+
+function driftEvalSkip(meta) {
+	return String((meta && (meta.skip_reason || meta.reason_code)) || "").toLowerCase();
+}
+
+function isDriftEvalDeferred(meta) {
+	if (!meta) return false;
+	const skip = driftEvalSkip(meta);
+	const reason = String(meta.reason || "");
+	return String(meta.eval_status || "").toLowerCase() === "deferred"
+		|| skip === "illumination_mismatch"
+		|| skip === "illumination_unknown"
+		|| skip === "persistent_warmup"
+		|| /evaluation deferred|global\s*shift|consecutive\s*confirm/i.test(reason);
+}
+
+function driftEvalStatusBanner(meta) {
+	if (String((meta && meta.eval_status) || "").toLowerCase() === "pending") {
+		return driftT("evalPending");
+	}
+	if (!isDriftEvalDeferred(meta)) return driftT("referenceOnly");
+	const skip = driftEvalSkip(meta);
+	const reasonText = String(meta.reason || "");
+	for (const rule of DRIFT_EVAL_REASON_MATCHERS) {
+		if ((skip && rule.code.test(skip)) || (reasonText && rule.text.test(reasonText))) {
+			return driftT(rule.key);
+		}
+	}
+	if (reasonText && uiLang() !== "ko") return reasonText;
+	return driftT("evalDeferred");
+}
 
 function uiLang() {
 	const raw = String(
@@ -1374,27 +1428,22 @@ function driftT(key, ...args) {
 	return typeof val === "function" ? val(...args) : val;
 }
 
-function driftHintT(key) {
-	return driftT(key);
-}
-
 function applyDriftImagesStaticI18n() {
-	const overlayCap = $("drift_images_overlay_caption");
-	if (overlayCap) overlayCap.textContent = driftT("overlayCaption");
-	// Do not touch before/after empty text here — open/load flow owns
-	// Loading… vs empty copy; overwriting causes a "No reference" flash.
+	const textIds = [
+		["drift_images_overlay_caption", "overlayCaption"],
+		["drift_anchor_toggle", "pinpointAdd"],
+		["drift_anchor_clear", "pinpointUndo"],
+		["drift_anchor_clear_all", "pinpointClearAll"],
+		["drift_anchor_help", "pinpointHelp"],
+	];
+	for (const [id, key] of textIds) {
+		const el = $(id);
+		if (el) el.textContent = driftT(key);
+	}
 	const beforeImg = $("drift_images_before");
 	if (beforeImg) beforeImg.alt = driftT("before");
 	const afterImg = $("drift_images_after");
 	if (afterImg) afterImg.alt = driftT("afterLast");
-	const pinpointToggle = $("drift_anchor_toggle");
-	if (pinpointToggle) pinpointToggle.textContent = driftT("pinpointAdd");
-	const pinpointUndo = $("drift_anchor_clear");
-	if (pinpointUndo) pinpointUndo.textContent = driftT("pinpointUndo");
-	const pinpointClearAll = $("drift_anchor_clear_all");
-	if (pinpointClearAll) pinpointClearAll.textContent = driftT("pinpointClearAll");
-	const pinpointHelp = $("drift_anchor_help");
-	if (pinpointHelp) pinpointHelp.textContent = driftT("pinpointHelp");
 }
 
 /** Per-camera image cache epoch — bump only on DRIFT Reset (not every modal open). */
@@ -1479,9 +1528,8 @@ function driftImagesSideUrl(side, sideInfo, camUid, pipeline, cacheBust) {
 		? sideInfo.url.trim()
 		: "";
 	if (metaUrl) {
-		// batch= already uniquely versions the asset — do not append "_" (proxy
-		// strips it for edge, but it still busts the browser cache entry).
-		if (/[?&]batch=/.test(metaUrl)) return metaUrl;
+		// Prefer server `v=` (preview mtime). Still append session "_" so a
+		// rebuilt preview is not stuck behind Cache-Control: immutable.
 		if (cacheBust == null || cacheBust === "" || /[?&]_=/.test(metaUrl)) {
 			return metaUrl;
 		}
@@ -1490,9 +1538,7 @@ function driftImagesSideUrl(side, sideInfo, camUid, pipeline, cacheBust) {
 	const extra = {};
 	const batch = sideInfo && sideInfo.batch_name;
 	if (batch) extra.batch = batch;
-	// When batch is known, skip "_" so edge/browser cache can hit.
-	const bust = batch ? "" : cacheBust;
-	return driftImagesProxyUrl(side, camUid, pipeline, bust, extra);
+	return driftImagesProxyUrl(side, camUid, pipeline, cacheBust, extra);
 }
 
 function driftSideImageLoaded(img) {
@@ -1504,13 +1550,13 @@ function driftSideImageLoaded(img) {
 	);
 }
 
-function driftSideFallbackMessage(side, empty) {
-	const saved = empty && empty.dataset.fallbackMsg;
-	if (saved) return saved;
+function driftSideEmptyMessage(side) {
 	if (side === "before") return driftT("beforeEmpty");
-	return isDriftImagesCompareMode()
-		? driftT("afterEmpty")
-		: driftT("afterEmptyNoIllum");
+	return driftT(isDriftImagesJudgmentMode() ? "afterEmpty" : "afterEmptyNoIllum");
+}
+
+function driftAfterLabel() {
+	return driftT(isDriftImagesJudgmentMode() ? "afterLast" : "after");
 }
 
 function setDriftSidePlaceholder(side, message) {
@@ -1526,13 +1572,6 @@ function setDriftSidePlaceholder(side, message) {
 	empty.textContent = message;
 	empty.classList.remove("hidden");
 	if (side === "before") updateDriftAnchorBar();
-}
-
-function driftSideEmptyMessage(side) {
-	if (side === "before") return driftT("beforeEmpty");
-	return isDriftImagesCompareMode()
-		? driftT("afterEmpty")
-		: driftT("afterEmptyNoIllum");
 }
 
 function setDriftSideImage(side, url, { emptyOnFail = null } = {}) {
@@ -1552,6 +1591,11 @@ function setDriftSideImage(side, url, { emptyOnFail = null } = {}) {
 		empty.classList.add("hidden");
 		img.classList.remove("hidden");
 		if (side === "before") updateDriftAnchorBar();
+		// Images often finish from HTTP cache before onload is wired, or the
+		// same URL early-returns without firing onload — always redraw overlays.
+		if (driftImagesState && driftImagesState.meta) {
+			scheduleDriftShiftArrow(driftImagesState.meta);
+		}
 	};
 	const fail = () => {
 		if (img.dataset.driftUrl !== url) return;
@@ -1566,11 +1610,7 @@ function setDriftSideImage(side, url, { emptyOnFail = null } = {}) {
 	};
 
 	const bindLoadHandlers = () => {
-		const prevOnload = img.onload;
-		img.onload = (ev) => {
-			reveal();
-			if (typeof prevOnload === "function") prevOnload.call(img, ev);
-		};
+		img.onload = reveal;
 		img.onerror = fail;
 	};
 
@@ -1584,70 +1624,36 @@ function setDriftSideImage(side, url, { emptyOnFail = null } = {}) {
 			fail();
 			return;
 		}
-		empty.textContent = loadingMsg;
-		empty.classList.remove("hidden");
-		img.classList.add("hidden");
 		bindLoadHandlers();
 		return;
 	}
 
-	empty.textContent = loadingMsg;
-	empty.classList.remove("hidden");
-	img.classList.add("hidden");
+	const keepVisible = img.complete && img.naturalWidth > 0 && !img.classList.contains("hidden");
+	if (!keepVisible) {
+		empty.textContent = loadingMsg;
+		empty.classList.remove("hidden");
+		img.classList.add("hidden");
+	}
 	img.dataset.driftUrl = url;
 	bindLoadHandlers();
 	img.src = url;
+	if (img.complete && img.naturalWidth > 0 && img.dataset.driftUrl === url) {
+		reveal();
+	}
 }
 
-/** After compare phase ends, never leave a panel stuck on Loading… */
-function settleDriftPanelsFromMeta() {
-	if (!driftImagesState) return;
-	const { pipeline, camUid, cacheBust, meta } = driftImagesState;
-	const before = meta && meta.before;
-	const after = meta && meta.after;
-	const afterEmptyMsg = driftSideEmptyMessage("after");
-
-	if (before && before.available) {
-		setDriftPanelCaption("before", before, driftT("before"));
-		setDriftSideImage(
-			"before",
-			driftImagesSideUrl("before", before, camUid, pipeline, cacheBust),
-			{ emptyOnFail: driftT("beforeEmpty") },
-		);
-	} else if (!driftSideImageLoaded($("drift_images_before"))) {
-		setDriftSidePlaceholder("before", driftT("beforeEmpty"));
-	}
-
-	if (after && after.available) {
-		const afterLabel = (meta && meta.illumination_matched) || !isDriftImagesCompareMode()
-			? driftT("after")
-			: driftT("afterLast");
-		setDriftPanelCaption("after", after, afterLabel);
-		setDriftSideImage(
-			"after",
-			driftImagesSideUrl("after", after, camUid, pipeline, cacheBust),
-			{ emptyOnFail: afterEmptyMsg },
-		);
-	} else if (!driftSideImageLoaded($("drift_images_after"))) {
-		const afterLabel = isDriftImagesCompareMode()
-			? driftT("afterLast")
-			: driftT("after");
-		setDriftPanelCaption("after", null, afterLabel);
-		setDriftSidePlaceholder("after", afterEmptyMsg);
-	}
-	syncDriftFooterChrome();
-}
-
-function clearDriftPairImages() {
+function resetDriftPairLoading() {
+	const afterLabel = driftAfterLabel();
+	setDriftPanelCaption("before", null, driftT("before"));
+	setDriftPanelCaption("after", null, afterLabel);
+	const afterImg = $("drift_images_after");
+	if (afterImg) afterImg.alt = afterLabel;
 	setDriftSidePlaceholder("before", driftT("loading"));
 	setDriftSidePlaceholder("after", driftT("loading"));
 	const overlayImg = $("drift_images_overlay");
 	if (overlayImg) overlayImg.removeAttribute("src");
 	const grid = $("drift_images_grid");
-	if (grid) {
-		grid.hidden = true;
-		grid.classList.remove("is-reference-only");
-	}
+	if (grid) grid.hidden = false;
 	clearDriftShiftArrow();
 	renderDriftOverlay(null);
 }
@@ -1662,27 +1668,31 @@ function isOfflineCameraTag(tag) {
 	return value === "off" || value === "offline";
 }
 
-function isDriftImagesCompareMode() {
+/** True only for a real drift alarm (Reset button). */
+function isDriftImagesAlarmMode() {
 	return Boolean(driftImagesState && driftImagesState.isDrifted);
 }
 
-function setDriftImagesReferenceOnly(referenceOnly) {
-	const grid = $("drift_images_grid");
-	if (grid) grid.classList.toggle("is-reference-only", Boolean(referenceOnly));
+/**
+ * Drift alarm or evaluation-deferred: show algo judgment pair (Last/Compare).
+ * True OK uses illumination-matched Compare instead.
+ */
+function isDriftImagesJudgmentMode() {
+	if (!driftImagesState) return false;
+	if (driftImagesState.isDrifted) return true;
+	const meta = driftImagesState.meta;
+	if (!meta) return false;
+	if (meta.judgment_view === true) return true;
+	return String(meta.eval_status || "").toLowerCase() === "deferred";
 }
 
-/** Keep both panels visible with guidance copy; preserve any already-loaded images. */
 function showDriftImagesPlaceholderPair({ preserveLoaded = true } = {}) {
-	const drifted = isDriftImagesCompareMode();
-	const afterLabel = drifted ? driftT("afterLast") : driftT("after");
-	const afterEmptyMsg = drifted
-		? driftT("afterEmpty")
-		: driftT("afterEmptyNoIllum");
+	const afterLabel = driftAfterLabel();
+	const afterEmptyMsg = driftSideEmptyMessage("after");
 	setDriftPanelCaption("before", null, driftT("before"));
 	setDriftPanelCaption("after", null, afterLabel);
 	const afterImg = $("drift_images_after");
 	if (afterImg) afterImg.alt = afterLabel;
-	setDriftImagesReferenceOnly(false);
 	const grid = $("drift_images_grid");
 	if (grid) grid.hidden = false;
 	const beforeImg = $("drift_images_before");
@@ -1694,28 +1704,22 @@ function showDriftImagesPlaceholderPair({ preserveLoaded = true } = {}) {
 	}
 }
 
-function setDriftImagesStatusMessage(text, { hide = false } = {}) {
+function syncDriftImagesStatus({ ready = false, errorText = null } = {}) {
 	const el = $("drift_images_status");
 	if (!el) return;
-	el.hidden = Boolean(hide);
-	if (text != null) el.textContent = text;
-}
-
-/** OK cams keep the status banner; drift cams hide it once content is ready. */
-function syncDriftImagesStatus({ ready = false, errorText = null } = {}) {
+	const meta = driftImagesState && driftImagesState.meta;
 	if (errorText) {
-		setDriftImagesStatusMessage(errorText, { hide: false });
+		el.hidden = false;
+		el.textContent = errorText;
 		return;
 	}
-	if (!isDriftImagesCompareMode()) {
-		setDriftImagesStatusMessage(driftT("referenceOnly"), { hide: false });
+	if (isDriftEvalDeferred(meta) || !isDriftImagesAlarmMode()) {
+		el.hidden = false;
+		el.textContent = driftEvalStatusBanner(meta);
 		return;
 	}
-	if (ready) {
-		setDriftImagesStatusMessage("", { hide: true });
-		return;
-	}
-	setDriftImagesStatusMessage(driftT("loading"), { hide: false });
+	el.hidden = Boolean(ready);
+	el.textContent = ready ? "" : driftT("loading");
 }
 
 function resolveDriftCameraIsDrifted(camUid, explicit) {
@@ -1735,19 +1739,23 @@ function resolveDriftCameraIsDrifted(camUid, explicit) {
 	return true;
 }
 
-/** Show loading chrome for both panels (images wait for phased meta URLs). */
-function prepareDriftPairLoadingChrome(isDrifted) {
-	const afterLabel = isDrifted ? driftT("afterLast") : driftT("after");
-	setDriftPanelCaption("before", null, driftT("before"));
-	setDriftPanelCaption("after", null, afterLabel);
-	const afterImg = $("drift_images_after");
-	if (afterImg) afterImg.alt = afterLabel;
-	const grid = $("drift_images_grid");
-	if (grid) grid.hidden = false;
-	setDriftImagesReferenceOnly(false);
-	// Both panels stay on Loading… until meta confirms availability.
-	setDriftSidePlaceholder("before", driftT("loading"));
-	setDriftSidePlaceholder("after", driftT("loading"));
+function mergeDriftMetaSide(baseSide, nextSide) {
+	// Prefer an already-available side over phase=ref null stubs.
+	if (nextSide && nextSide.available) return nextSide;
+	if (baseSide && baseSide.available) return baseSide;
+	if (nextSide !== undefined) return nextSide;
+	return baseSide;
+}
+
+function copyDriftMatchPoints(out, src) {
+	if (!src || !Array.isArray(src.match_points)) return;
+	out.match_points = src.match_points;
+	out.match_points_count = src.match_points_count != null
+		? src.match_points_count
+		: src.match_points.length;
+	if (src.match_points_source != null) {
+		out.match_points_source = src.match_points_source;
+	}
 }
 
 function mergeDriftImagesMeta(prev, next) {
@@ -1756,10 +1764,18 @@ function mergeDriftImagesMeta(prev, next) {
 	const out = { ...base, ...next };
 	if (next.before) out.before = next.before;
 	else if (base.before) out.before = base.before;
-	if (Object.prototype.hasOwnProperty.call(next, "after")) out.after = next.after;
-	else if (base.after) out.after = base.after;
-	if (Object.prototype.hasOwnProperty.call(next, "overlay")) out.overlay = next.overlay;
-	else if (base.overlay) out.overlay = base.overlay;
+	out.after = mergeDriftMetaSide(base.after, next.after);
+	out.overlay = mergeDriftMetaSide(base.overlay, next.overlay);
+	if (Array.isArray(next.persistent_points)) {
+		out.persistent_points = next.persistent_points;
+	} else if (Array.isArray(base.persistent_points)) {
+		out.persistent_points = base.persistent_points;
+	}
+	if (Array.isArray(next.match_points) && (next.match_points.length || String(next.phase || "") !== "ref")) {
+		copyDriftMatchPoints(out, next);
+	} else {
+		copyDriftMatchPoints(out, base);
+	}
 	return out;
 }
 
@@ -1769,10 +1785,10 @@ function driftMetaSideAvailable(meta, side) {
 }
 
 function syncDriftNoImageStatus({ errorText = null } = {}) {
-	const drifted = isDriftImagesCompareMode();
+	const judgment = isDriftImagesJudgmentMode();
 	syncDriftImagesStatus({
-		ready: !drifted,
-		errorText: errorText || (drifted ? driftT("notFound") : null),
+		ready: !judgment,
+		errorText: errorText || (judgment ? driftT("notFound") : null),
 	});
 }
 
@@ -1794,9 +1810,15 @@ function applyDriftImagesMetaRef(data) {
 		return true;
 	}
 	driftImagesState.meta = mergeDriftImagesMeta(driftImagesState.meta, data);
+	if (data && data.is_drift === true) driftImagesState.isDrifted = true;
+	applyPersistentPointsFromMeta(driftImagesState.meta);
 	const { pipeline, camUid, cacheBust, meta } = driftImagesState;
 	const before = meta && meta.before;
-	setDriftPanelCaption("before", before, driftT("before"));
+	const afterLabel = driftAfterLabel();
+	// Ref owns Reference only — never clear Compare date under parallel fetch.
+	syncDriftPanelCaptionsFromMeta(meta);
+	const afterImg = $("drift_images_after");
+	if (afterImg) afterImg.alt = afterLabel;
 	const grid = $("drift_images_grid");
 	if (grid) grid.hidden = false;
 	if (before && before.available) {
@@ -1816,24 +1838,26 @@ function applyDriftImagesMetaRef(data) {
 function applyDriftImagesMeta(data) {
 	if (!driftImagesState || !data) return;
 	driftImagesState.meta = mergeDriftImagesMeta(driftImagesState.meta, data);
+	if (data && data.is_drift === true) driftImagesState.isDrifted = true;
+	applyPersistentPointsFromMeta(driftImagesState.meta);
+	updateDriftAnchorBar();
 	const meta = driftImagesState.meta;
-	const driftedNow = isDriftImagesCompareMode();
+	const judgmentNow = isDriftImagesJudgmentMode();
 	const hasImage = (
 		driftMetaSideAvailable(meta, "before")
 		|| driftMetaSideAvailable(meta, "after")
-		|| (driftedNow && driftMetaSideAvailable(meta, "overlay"))
+		|| (isDriftImagesAlarmMode() && driftMetaSideAvailable(meta, "overlay"))
 	);
 	if (!hasImage) {
 		syncDriftNoImageStatus();
 		showDriftImagesPlaceholderPair({ preserveLoaded: true });
-		renderDriftHint(driftedNow ? meta : null);
-		renderDriftRawMetrics(driftedNow ? meta : null);
+		renderDriftHint(judgmentNow ? meta : null);
+		renderDriftRawMetrics(judgmentNow ? meta : null);
 		syncDriftFooterChrome();
 		return;
 	}
 	syncDriftImagesStatus({ ready: true });
 	renderDriftImagesPair();
-	settleDriftPanelsFromMeta();
 }
 
 function fetchDriftImagesMetaPhase(phase, { loadId, timeout }, handlers) {
@@ -1921,6 +1945,38 @@ function setDriftPanelCaption(side, sideInfo, fallbackLabel) {
 	el.textContent = when ? `${fallbackLabel}  ·  ${when}` : fallbackLabel;
 }
 
+/** Warm browser cache for before/after URLs (parallel with paint). */
+function prefetchDriftSideImages(meta) {
+	if (!driftImagesState || !meta) return;
+	const { pipeline, camUid, cacheBust } = driftImagesState;
+	["before", "after"].forEach((side) => {
+		const info = meta[side];
+		if (!info || !info.available) return;
+		const url = driftImagesSideUrl(side, info, camUid, pipeline, cacheBust);
+		if (!url) return;
+		const img = new Image();
+		img.decoding = "async";
+		img.src = url;
+	});
+}
+
+/** Sync before/after captions from current meta (batch dates). */
+function syncDriftPanelCaptionsFromMeta(meta) {
+	if (!meta) return;
+	const judgment = isDriftImagesJudgmentMode();
+	const afterLabel = (meta.illumination_matched || !judgment)
+		? driftT("after")
+		: driftT("afterLast");
+	const before = meta.before;
+	const after = meta.after;
+	if (before && before.available) {
+		setDriftPanelCaption("before", before, driftT("before"));
+	}
+	if (after && after.available) {
+		setDriftPanelCaption("after", after, afterLabel);
+	}
+}
+
 function formatDriftMetricValue(value) {
 	if (value == null || value === "") return "—";
 	const n = Number(value);
@@ -1958,8 +2014,8 @@ function renderDriftHint(meta) {
 	const risk = Boolean(meta.false_positive_risk);
 	const conf = String(meta.confidence || "").toLowerCase();
 	const label = risk
-		? (conf === "low" ? driftHintT("fpHigh") : driftHintT("fpMed"))
-		: driftHintT("fpNote");
+		? (conf === "low" ? driftT("fpHigh") : driftT("fpMed"))
+		: driftT("fpNote");
 	const sentences = splitDriftHintSentences(hint);
 	box.classList.toggle("drift-images-hint--risk", risk);
 	box.classList.toggle("drift-images-hint--ok", !risk);
@@ -1971,8 +2027,30 @@ function renderDriftHint(meta) {
 }
 
 let driftArrowResizeObserver = null;
+let driftArrowRedrawTimer = 0;
 
-function clearDriftShiftArrow() {
+function ensureDriftArrowResizeObserver() {
+	if (driftArrowResizeObserver || typeof ResizeObserver === "undefined") return;
+	const grid = $("drift_images_grid");
+	const beforeMedia = $("drift_images_before")
+		&& $("drift_images_before").closest(".drift-images-media");
+	const afterMedia = $("drift_images_after")
+		&& $("drift_images_after").closest(".drift-images-media");
+	driftArrowResizeObserver = new ResizeObserver(() => {
+		if (!driftImagesState || !driftImagesState.meta) return;
+		if (driftArrowRedrawTimer) clearTimeout(driftArrowRedrawTimer);
+		driftArrowRedrawTimer = setTimeout(() => {
+			driftArrowRedrawTimer = 0;
+			if (!driftImagesState || !driftImagesState.meta) return;
+			drawDriftMatchOverlays(driftImagesState.meta);
+		}, 50);
+	});
+	[grid, beforeMedia, afterMedia].forEach((el) => {
+		if (el) driftArrowResizeObserver.observe(el);
+	});
+}
+
+function clearDriftShiftArrow({ teardown = false } = {}) {
 	["drift_images_before_points", "drift_images_after_arrow"].forEach((id) => {
 		const canvas = $(id);
 		if (!canvas) return;
@@ -1980,24 +2058,55 @@ function clearDriftShiftArrow() {
 		if (ctx) ctx.clearRect(0, 0, canvas.width || 0, canvas.height || 0);
 		canvas.classList.add("is-hidden");
 	});
-	if (driftArrowResizeObserver) {
-		driftArrowResizeObserver.disconnect();
-		driftArrowResizeObserver = null;
+	if (teardown) {
+		if (driftArrowRedrawTimer) {
+			clearTimeout(driftArrowRedrawTimer);
+			driftArrowRedrawTimer = 0;
+		}
+		if (driftArrowResizeObserver) {
+			driftArrowResizeObserver.disconnect();
+			driftArrowResizeObserver = null;
+		}
 	}
 }
 
-function scheduleDriftShiftArrow(meta, attempt = 0) {
+function scheduleDriftShiftArrow(attempt = 0) {
+	if (typeof attempt !== "number") attempt = 0;
 	requestAnimationFrame(() => {
 		requestAnimationFrame(() => {
-			const ok = drawDriftMatchOverlays(meta);
-			if (!ok && attempt < 8) {
-				setTimeout(() => scheduleDriftShiftArrow(meta, attempt + 1), 50 * (attempt + 1));
+			if (!driftImagesState || !driftImagesState.meta) return;
+			const ok = drawDriftMatchOverlays(driftImagesState.meta);
+			if (!ok && attempt < 24) {
+				setTimeout(() => scheduleDriftShiftArrow(attempt + 1), 80);
+				return;
 			}
+			if (ok && attempt === 0) setTimeout(() => scheduleDriftShiftArrow(1), 120);
 		});
 	});
 }
 
-function prepareDriftOverlayCanvas(img, canvas) {
+function driftSideSourceSize(meta, side, { naturalW = 0, naturalH = 0 } = {}) {
+	const info = meta && meta[side];
+	const w = Number(info && info.source_width);
+	const h = Number(info && info.source_height);
+	if (w > 0 && h > 0) return { w, h };
+	// Stale meta cache / older proxy: infer from pin coords vs preview pixels.
+	const pins = (driftImagesState && driftImagesState.persistentPoints) || [];
+	let maxX = 0;
+	let maxY = 0;
+	for (const p of pins) {
+		const x = Number(p.x);
+		const y = Number(p.y);
+		if (Number.isFinite(x)) maxX = Math.max(maxX, x);
+		if (Number.isFinite(y)) maxY = Math.max(maxY, y);
+	}
+	if (maxX > (naturalW || 0) * 1.05 || maxY > (naturalH || 0) * 1.05) {
+		return { w: 1920, h: 1080 };
+	}
+	return null;
+}
+
+function prepareDriftOverlayCanvas(img, canvas, { meta = null, side = null } = {}) {
 	if (!img || !canvas || img.classList.contains("hidden")) return null;
 	if (!img.complete || !img.naturalWidth || !img.naturalHeight) return null;
 	const media = img.closest ? img.closest(".drift-images-media") : null;
@@ -2013,8 +2122,12 @@ function prepareDriftOverlayCanvas(img, canvas) {
 	canvas.style.width = `${w}px`;
 	canvas.style.height = `${h}px`;
 	const dpr = window.devicePixelRatio || 1;
-	canvas.width = Math.round(w * dpr);
-	canvas.height = Math.round(h * dpr);
+	const bw = Math.round(w * dpr);
+	const bh = Math.round(h * dpr);
+	if (canvas.width !== bw || canvas.height !== bh) {
+		canvas.width = bw;
+		canvas.height = bh;
+	}
 	const ctx = canvas.getContext("2d");
 	if (!ctx) return null;
 	ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -2026,13 +2139,22 @@ function prepareDriftOverlayCanvas(img, canvas) {
 	const drawH = nh * scale;
 	const ox = (w - drawW) / 2;
 	const oy = (h - drawH) / 2;
-	return { ctx, w, h, scale, ox, oy, drawW, drawH, media };
+	// Pinpoints / match points are in native frame coords; preview may be smaller.
+	const src = driftSideSourceSize(meta, side, { naturalW: nw, naturalH: nh });
+	const sourceScaleX = (src && src.w > 0) ? (nw / src.w) : 1;
+	const sourceScaleY = (src && src.h > 0) ? (nh / src.h) : 1;
+	return {
+		ctx, w, h, scale, ox, oy, drawW, drawH, media, nw, nh,
+		sourceScaleX, sourceScaleY,
+	};
 }
 
 function mapDriftPoint(layout, x, y) {
+	const sx = layout && layout.sourceScaleX != null ? layout.sourceScaleX : 1;
+	const sy = layout && layout.sourceScaleY != null ? layout.sourceScaleY : 1;
 	return {
-		x: layout.ox + Number(x) * layout.scale,
-		y: layout.oy + Number(y) * layout.scale,
+		x: layout.ox + Number(x) * sx * layout.scale,
+		y: layout.oy + Number(y) * sy * layout.scale,
 	};
 }
 
@@ -2050,10 +2172,15 @@ function driftImageCoordsFromEvent(img, clientX, clientY) {
 	const x = clientX - rect.left;
 	const y = clientY - rect.top;
 	if (x < ox || y < oy || x > ox + drawW || y > oy + drawH) return null;
-	return {
-		x: (x - ox) / scale,
-		y: (y - oy) / scale,
-	};
+	// Click is in preview pixel space; store pinpoints in native frame space.
+	let fx = (x - ox) / scale;
+	let fy = (y - oy) / scale;
+	const src = driftSideSourceSize(driftImagesState && driftImagesState.meta, "before");
+	if (src) {
+		fx *= src.w / img.naturalWidth;
+		fy *= src.h / img.naturalHeight;
+	}
+	return { x: fx, y: fy };
 }
 
 function hasDriftReferenceImage() {
@@ -2099,10 +2226,19 @@ function updateDriftAnchorBar() {
 	const editing = Boolean(driftImagesState && driftImagesState.anchorEdit);
 	const showManualActions = hasRef && editing && manual > 0;
 	if (countEl) {
-		// No reference image → no drawable pinpoints; hide stale server counts.
-		countEl.textContent = (hasRef && points.length)
-			? driftT("pinpointCount", points.length, manual, active)
-			: "";
+		// Simple drift: alarm uses gate matches; auto persistent pins are View-only.
+		const meta = driftImagesState && driftImagesState.meta;
+		const gateN = Number(
+			(meta && (meta.match_points_count
+				|| (meta.match_points && meta.match_points.length))) || 0,
+		);
+		if (hasRef && isDriftImagesJudgmentMode() && !editing && gateN > 0) {
+			countEl.textContent = driftT("gateMatchCount", gateN);
+		} else if (hasRef && points.length) {
+			countEl.textContent = driftT("pinpointCount", points.length, manual, active);
+		} else {
+			countEl.textContent = "";
+		}
 	}
 	if (toggle) {
 		toggle.disabled = !hasRef;
@@ -2121,14 +2257,43 @@ function updateDriftAnchorBar() {
 function applyPersistentPointsResponse(data, loadId) {
 	if (!driftImagesState || driftImagesState.loadId !== loadId) return false;
 	if (!data || data.ok === false || data.success === false) return false;
-	driftImagesState.persistentPoints = Array.isArray(data.points) ? data.points : [];
+	const points = Array.isArray(data.points) ? data.points : [];
+	driftImagesState.pinGen = Number(driftImagesState.pinGen || 0) + 1;
+	driftImagesState.persistentPoints = points;
+	if (driftImagesState.meta) {
+		driftImagesState.meta.persistent_points = points;
+		driftImagesState.meta.persistent_manual_count = points.filter(
+			(p) => String(p?.source || "") === "manual",
+		).length;
+		driftImagesState.meta.persistent_active_count = points.filter((p) => p.active).length;
+		driftImagesState.meta.pin_gen = driftImagesState.pinGen;
+	}
 	updateDriftAnchorBar();
-	if (driftImagesState.meta) scheduleDriftShiftArrow(driftImagesState.meta);
+	scheduleDriftShiftArrow(driftImagesState.meta);
 	return true;
 }
 
-function drawPersistentAnchors(beforeLayout, beforeCanvas) {
-	const anchors = (driftImagesState && driftImagesState.persistentPoints) || [];
+function drawPersistentAnchors(
+	beforeLayout,
+	beforeCanvas,
+	{ manualsOnly = false, activeOnly = false, maxDraw = 0 } = {},
+) {
+	let anchors = (driftImagesState && driftImagesState.persistentPoints) || [];
+	if (manualsOnly) {
+		anchors = manualPersistentPoints(anchors);
+	} else if (activeOnly) {
+		// Manuals + autos (incl. warmup hits < min_hits). Cap keeps View sparse.
+		anchors = anchors.filter(
+			(p) => String(p?.source || "") === "manual" || p.source === "auto" || !p.source,
+		);
+	}
+	if (maxDraw > 0 && anchors.length > maxDraw) {
+		const manuals = manualPersistentPoints(anchors);
+		const autos = anchors
+			.filter((p) => String(p?.source || "") !== "manual")
+			.sort((a, b) => Number(b.hits || 0) - Number(a.hits || 0));
+		anchors = manuals.concat(autos.slice(0, Math.max(0, maxDraw - manuals.length)));
+	}
 	if (!beforeLayout || !beforeCanvas || !anchors.length) return;
 	for (const p of anchors) {
 		const x = Number(p.x);
@@ -2136,11 +2301,12 @@ function drawPersistentAnchors(beforeLayout, beforeCanvas) {
 		if (![x, y].every(Number.isFinite)) continue;
 		const pt = mapDriftPoint(beforeLayout, x, y);
 		const manual = String(p.source || "") === "manual";
+		const active = Boolean(p.active);
 		beforeLayout.ctx.beginPath();
-		beforeLayout.ctx.arc(pt.x, pt.y, manual ? 5.5 : 4.2, 0, Math.PI * 2);
+		beforeLayout.ctx.arc(pt.x, pt.y, manual ? 5.5 : (active ? 3.8 : 3.0), 0, Math.PI * 2);
 		beforeLayout.ctx.fillStyle = manual
 			? "rgba(250, 204, 21, 0.95)"
-			: "rgba(52, 211, 153, 0.9)";
+			: (active ? "rgba(52, 211, 153, 0.85)" : "rgba(52, 211, 153, 0.40)");
 		beforeLayout.ctx.fill();
 		beforeLayout.ctx.lineWidth = 1.5;
 		beforeLayout.ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
@@ -2149,8 +2315,37 @@ function drawPersistentAnchors(beforeLayout, beforeCanvas) {
 	beforeCanvas.classList.remove("is-hidden");
 }
 
+/** Apply pinpoints embedded in drift_images meta (preferred over a 2nd hop). */
+function applyPersistentPointsFromMeta(meta) {
+	if (!driftImagesState || !meta) return false;
+	const points = meta.persistent_points;
+	if (!Array.isArray(points)) return false;
+	// Respect explicit empty list after clear_manual / prune.
+	const pinGen = Number(driftImagesState.pinGen || 0);
+	const metaGen = Number(meta.pin_gen || 0);
+	if (pinGen > 0 && metaGen < pinGen) {
+		// Stale meta from a request started before a local pin edit.
+		return false;
+	}
+	driftImagesState.persistentPoints = points;
+	if (driftImagesState.meta) {
+		driftImagesState.meta.persistent_points = points;
+	}
+	updateDriftAnchorBar();
+	scheduleDriftShiftArrow(meta);
+	return true;
+}
+
 function loadDriftPersistentPoints() {
-	if (!driftImagesState || !urls.cameraDriftPersistentPoints) {
+	if (!driftImagesState) {
+		updateDriftAnchorBar();
+		return;
+	}
+	// Meta may already carry pinpoints (ref/compare) — draw immediately.
+	if (applyPersistentPointsFromMeta(driftImagesState.meta)) {
+		// Still refresh from dedicated endpoint when available.
+	}
+	if (!urls.cameraDriftPersistentPoints) {
 		updateDriftAnchorBar();
 		return;
 	}
@@ -2162,18 +2357,22 @@ function loadDriftPersistentPoints() {
 	fetchJsonGet(`${urls.cameraDriftPersistentPoints}?${params.toString()}`, (data) => {
 		if (!driftImagesState || driftImagesState.loadId !== loadId) return;
 		if (!data || data.ok === false || data.success === false) {
-			driftImagesState.persistentPoints = [];
+			// Keep meta-embedded points if the dedicated call failed.
+			if (!(driftImagesState.persistentPoints || []).length) {
+				driftImagesState.persistentPoints = [];
+			}
 			updateDriftAnchorBar();
 			return;
 		}
-		driftImagesState.persistentPoints = Array.isArray(data.points) ? data.points : [];
-		updateDriftAnchorBar();
-		if (driftImagesState.meta) scheduleDriftShiftArrow(driftImagesState.meta);
+		// Dedicated endpoint is authoritative (including empty after clear).
+		applyPersistentPointsResponse(data, loadId);
 	}, {
 		timeout: 15000,
 		onerror() {
 			if (!driftImagesState || driftImagesState.loadId !== loadId) return;
-			driftImagesState.persistentPoints = [];
+			if (!(driftImagesState.persistentPoints || []).length) {
+				driftImagesState.persistentPoints = [];
+			}
 			updateDriftAnchorBar();
 		},
 	});
@@ -2314,14 +2513,14 @@ function drawDriftMatchOverlays(meta) {
 	const afterImg = $("drift_images_after");
 	const beforeCanvas = $("drift_images_before_points");
 	const afterCanvas = $("drift_images_after_arrow");
-	const compare = isDriftImagesCompareMode();
+	const compare = isDriftImagesJudgmentMode();
 
 	if (!meta) {
 		clearDriftShiftArrow();
 		return false;
 	}
 
-	// OK cameras: show pinpoints on Before only; skip stale After/match overlays.
+	// OK cameras: show sparse active static autos (+ manuals). Edit mode emphasizes manuals.
 	if (!compare) {
 		if (afterCanvas) {
 			const ctx = afterCanvas.getContext && afterCanvas.getContext("2d");
@@ -2329,38 +2528,41 @@ function drawDriftMatchOverlays(meta) {
 			afterCanvas.classList.add("is-hidden");
 		}
 		const beforeLayout = (beforeImg && beforeCanvas && !beforeImg.classList.contains("hidden"))
-			? prepareDriftOverlayCanvas(beforeImg, beforeCanvas)
+			? prepareDriftOverlayCanvas(beforeImg, beforeCanvas, { meta, side: "before" })
 			: null;
 		if (!beforeLayout) return false;
-		drawPersistentAnchors(beforeLayout, beforeCanvas);
-		const observeTarget = beforeLayout.media || beforeImg;
-		if (!driftArrowResizeObserver && typeof ResizeObserver !== "undefined" && observeTarget) {
-			driftArrowResizeObserver = new ResizeObserver(() => {
-				if (!driftImagesState || !driftImagesState.meta) return;
-				drawDriftMatchOverlays(driftImagesState.meta);
-			});
-			driftArrowResizeObserver.observe(observeTarget);
-		}
+		const editing = Boolean(driftImagesState && driftImagesState.anchorEdit);
+		drawPersistentAnchors(beforeLayout, beforeCanvas, {
+			manualsOnly: editing,
+			activeOnly: !editing,
+			maxDraw: 40,
+		});
+		const drawn = (driftImagesState && driftImagesState.persistentPoints) || [];
+		const hasDraw = editing
+			? manualPersistentPoints(drawn).length > 0
+			: drawn.length > 0;
+		if (hasDraw) beforeCanvas.classList.remove("is-hidden");
+		else beforeCanvas.classList.add("is-hidden");
+		ensureDriftArrowResizeObserver();
 		return true;
 	}
 
 	if (!afterImg || !afterCanvas) {
-		clearDriftShiftArrow();
 		return false;
 	}
 
 	const points = Array.isArray(meta.match_points) ? meta.match_points : [];
-	const afterLayout = prepareDriftOverlayCanvas(afterImg, afterCanvas);
+	const afterLayout = prepareDriftOverlayCanvas(afterImg, afterCanvas, { meta, side: "after" });
 	if (!afterLayout) return false;
 
 	const beforeLayout = (beforeImg && beforeCanvas && !beforeImg.classList.contains("hidden"))
-		? prepareDriftOverlayCanvas(beforeImg, beforeCanvas)
+		? prepareDriftOverlayCanvas(beforeImg, beforeCanvas, { meta, side: "before" })
 		: null;
 
 	const dx = Number(meta.delta_x != null ? meta.delta_x : meta.delta_x_display);
 	const dy = Number(meta.delta_y != null ? meta.delta_y : meta.delta_y_display);
 
-	// Draw automatic match points (Before↔After correspondences).
+	// Judgment: draw gate match points only (not all 400 persistent pins).
 	if (points.length) {
 		for (const p of points) {
 			const x0 = Number(p.x0);
@@ -2373,7 +2575,7 @@ function drawDriftMatchOverlays(meta) {
 				const a = mapDriftPoint(beforeLayout, x0, y0);
 				beforeLayout.ctx.fillStyle = "rgba(80, 220, 255, 0.95)";
 				beforeLayout.ctx.beginPath();
-				beforeLayout.ctx.arc(a.x, a.y, 3.2, 0, Math.PI * 2);
+				beforeLayout.ctx.arc(a.x, a.y, 3.8, 0, Math.PI * 2);
 				beforeLayout.ctx.fill();
 			}
 
@@ -2387,7 +2589,7 @@ function drawDriftMatchOverlays(meta) {
 			afterLayout.ctx.stroke();
 			afterLayout.ctx.fillStyle = "rgba(255, 80, 80, 0.95)";
 			afterLayout.ctx.beginPath();
-			afterLayout.ctx.arc(b.x, b.y, 3.2, 0, Math.PI * 2);
+			afterLayout.ctx.arc(b.x, b.y, 3.8, 0, Math.PI * 2);
 			afterLayout.ctx.fill();
 		}
 		if (beforeLayout) {
@@ -2395,8 +2597,23 @@ function drawDriftMatchOverlays(meta) {
 		}
 	}
 
+	// Judgment: match points on the pair. Persistent pins stay on Reference
+	// unless a real drift alarm already has gate matches (avoids 400→13 flash).
 	if (beforeLayout) {
-		drawPersistentAnchors(beforeLayout, beforeCanvas);
+		const editing = Boolean(driftImagesState && driftImagesState.anchorEdit);
+		const alarm = isDriftImagesAlarmMode();
+		if (editing) {
+			drawPersistentAnchors(beforeLayout, beforeCanvas, {
+				manualsOnly: points.length > 0,
+			});
+		} else if (!alarm || !points.length) {
+			drawPersistentAnchors(beforeLayout, beforeCanvas, {
+				activeOnly: true,
+				maxDraw: 40,
+			});
+		}
+		const drawn = (driftImagesState && driftImagesState.persistentPoints) || [];
+		if (points.length || drawn.length) beforeCanvas.classList.remove("is-hidden");
 	}
 
 	// Median summary arrow: direction from Δx/Δy; keep subtle vs match overlays.
@@ -2488,17 +2705,7 @@ function drawDriftMatchOverlays(meta) {
 
 	afterCanvas.classList.remove("is-hidden");
 	afterCanvas.removeAttribute("hidden");
-
-	const observeTarget = afterLayout.media
-		|| (beforeLayout && beforeLayout.media)
-		|| afterImg;
-	if (!driftArrowResizeObserver && typeof ResizeObserver !== "undefined" && observeTarget) {
-		driftArrowResizeObserver = new ResizeObserver(() => {
-			if (!driftImagesState || !driftImagesState.meta) return;
-			drawDriftMatchOverlays(driftImagesState.meta);
-		});
-		driftArrowResizeObserver.observe(observeTarget);
-	}
+	ensureDriftArrowResizeObserver();
 	return true;
 }
 
@@ -2551,7 +2758,7 @@ function renderDriftRawMetrics(meta) {
 	const thr = formatDriftMetricValue(meta.threshold);
 	const matchCount = Number(meta.match_points_count || (meta.match_points && meta.match_points.length) || 0);
 	const bits = [
-		`<span>distance <strong>${escapeHtml(dist)}px</strong></span>`,
+		`<span>${escapeHtml(driftT("distance"))} <strong>${escapeHtml(dist)}px</strong></span>`,
 		`<span>${escapeHtml(driftT("threshold"))} <strong>${escapeHtml(thr)}px</strong></span>`,
 		`<span>Δx <strong>${escapeHtml(dx)}px</strong></span>`,
 		`<span>Δy <strong>${escapeHtml(dy)}px</strong></span>`,
@@ -2563,15 +2770,15 @@ function renderDriftRawMetrics(meta) {
 	box.hidden = false;
 }
 
-/** Footer stays for pinpoints; DRIFT Reset only when the camera is drifted. */
+/** Footer stays for pinpoints; DRIFT Reset only for a real drift alarm. */
 function syncDriftFooterChrome({ forceHide = false } = {}) {
 	const footer = $("drift_images_footer");
 	const btn = $("drift_images_reset");
 	const hasCam = Boolean(driftImagesState && driftImagesState.camUid);
-	const drifted = isDriftImagesCompareMode();
+	const alarm = isDriftImagesAlarmMode();
 	if (footer) footer.hidden = Boolean(forceHide) || !hasCam;
 	if (btn) {
-		btn.hidden = Boolean(forceHide) || !hasCam || !drifted;
+		btn.hidden = Boolean(forceHide) || !hasCam || !alarm;
 		btn.disabled = false;
 		btn.textContent = driftT("reset");
 	}
@@ -2580,12 +2787,12 @@ function syncDriftFooterChrome({ forceHide = false } = {}) {
 function renderDriftImagesPair() {
 	if (!driftImagesState || !driftImagesState.meta) return;
 	const { pipeline, camUid, meta, cacheBust } = driftImagesState;
-	const drifted = isDriftImagesCompareMode();
+	const judgment = isDriftImagesJudgmentMode();
 	const before = meta.before;
 	const after = meta.after;
 	const showAfter = Boolean(after && after.available);
-	// Illumination-matched / OK empty → "Compare"; saved alarm current → "Last".
-	const expectingIllumCompare = !drifted && !showAfter;
+	// Illumination-matched / OK empty → "Compare"; judgment current → "Last".
+	const expectingIllumCompare = !judgment && !showAfter;
 	const afterLabel = (meta.illumination_matched || expectingIllumCompare)
 		? driftT("after")
 		: driftT("afterLast");
@@ -2593,31 +2800,22 @@ function renderDriftImagesPair() {
 		? driftT("afterEmptyNoIllum")
 		: driftT("afterEmpty");
 
-	// Drift-only chrome (hint/metrics/arrows) when drifted.
-	if (drifted) {
+	// Judgment chrome (hint/metrics/arrows) for drift + deferred.
+	if (judgment) {
 		renderDriftHint(meta);
 		renderDriftRawMetrics(meta);
-		renderDriftOverlay(meta);
+		renderDriftOverlay(isDriftImagesAlarmMode() ? meta : null);
 	} else {
 		renderDriftHint(null);
 		renderDriftRawMetrics(null);
 		renderDriftOverlay(null);
 	}
-	setDriftPanelCaption("before", before, driftT("before"));
-	setDriftPanelCaption("after", showAfter ? after : null, afterLabel);
+	syncDriftPanelCaptionsFromMeta(meta);
+	if (!showAfter) setDriftPanelCaption("after", null, afterLabel);
 	syncDriftFooterChrome();
-	// Always keep the right panel; empty state shows guidance when no pair.
-	setDriftImagesReferenceOnly(false);
 
-	const beforeImg = $("drift_images_before");
 	const afterImg = $("drift_images_after");
 	if (afterImg) afterImg.alt = afterLabel;
-	const onOverlayReady = () => {
-		if (!driftImagesState || driftImagesState.camUid !== camUid) return;
-		scheduleDriftShiftArrow(meta);
-	};
-	if (beforeImg) beforeImg.onload = onOverlayReady;
-	if (afterImg) afterImg.onload = showAfter ? onOverlayReady : null;
 
 	const beforeUrl = before && before.available
 		? driftImagesSideUrl("before", before, camUid, pipeline, cacheBust)
@@ -2662,6 +2860,7 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 		title: title || driftT("title"),
 		meta: null,
 		persistentPoints: [],
+		pinGen: 0,
 		anchorEdit: false,
 		isDrifted: drifted,
 		cacheBust,
@@ -2672,18 +2871,20 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 	syncDriftImagesStatus({ ready: false });
 	renderDriftHint(null);
 	renderDriftRawMetrics(null);
-	clearDriftPairImages();
 	syncDriftFooterChrome();
 	setDriftAnchorEditMode(false);
 	updateDriftAnchorBar();
 	setOverlayVisible($("drift_images_modal"), true);
+	ensureDriftArrowResizeObserver();
 	loadDriftPersistentPoints();
 
 	const cachedMeta = getCachedDriftMeta(uid, driftImagesState.pipeline);
-	prepareDriftPairLoadingChrome(drifted);
 	if (cachedMeta) {
-		// Show last compare snapshot immediately; still refresh ref→compare.
+		// Instant paint from TTL meta + browser HTTP cache — skip Loading wipe.
 		applyDriftImagesMeta(cachedMeta);
+		prefetchDriftSideImages(cachedMeta);
+	} else {
+		resetDriftPairLoading();
 	}
 
 	const finishCompareFailure = (errorText, failedData) => {
@@ -2709,7 +2910,8 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 		} else if (!hasBefore) {
 			syncDriftNoImageStatus();
 		}
-		settleDriftPanelsFromMeta();
+		if (hasBefore) renderDriftImagesPair();
+		else showDriftImagesPlaceholderPair({ preserveLoaded: false });
 	};
 
 	const loadComparePhase = () => {
@@ -2719,11 +2921,10 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 					finishCompareFailure(null, data);
 					return;
 				}
-				setCachedDriftMeta(uid, driftImagesState.pipeline, mergeDriftImagesMeta(
-					driftImagesState.meta,
-					data,
-				));
+				const merged = mergeDriftImagesMeta(driftImagesState.meta, data);
+				setCachedDriftMeta(uid, driftImagesState.pipeline, merged);
 				applyDriftImagesMeta(data);
+				prefetchDriftSideImages(merged);
 			},
 			onerror() { finishCompareFailure(driftT("failed")); },
 			ontimeout() { finishCompareFailure(driftT("timeout")); },
@@ -2734,15 +2935,14 @@ function openDriftImagesModal({ camUid, pipeline, title, isDrifted }) {
 		if (!driftSideImageLoaded($("drift_images_before"))) {
 			setDriftSidePlaceholder("before", driftT("beforeEmpty"));
 		}
-		loadComparePhase();
 	};
 
-	// 1) phase=ref → Reference ASAP (or empty immediately if none)
-	// 2) phase=compare → after + illumination_matched (skipped when ref says no images)
+	// 1) phase=ref → Reference ASAP
+	// 2) phase=compare in parallel (do not wait for ref) so After URL is ready sooner
+	loadComparePhase();
 	fetchDriftImagesMetaPhase("ref", { loadId, timeout: 30000 }, {
 		onsuccess(data) {
-			if (applyDriftImagesMetaRef(data)) return;
-			loadComparePhase();
+			applyDriftImagesMetaRef(data);
 		},
 		onerror: continueAfterRefMiss,
 		ontimeout: continueAfterRefMiss,
@@ -2826,8 +3026,7 @@ function renderPlcTagMeta(meta) {
 		box.innerHTML = "";
 		return;
 	}
-	const statusClass =
-		status === "ERROR" ? "is-error" : status === "WARN" ? "is-warn" : "is-ok";
+	const statusTone = plcStatusChipTone(status) || "ok";
 	const rows = [];
 	if (meta.group) {
 		rows.push(`
@@ -2840,7 +3039,9 @@ function renderPlcTagMeta(meta) {
 		rows.push(`
 		<div class="plc-tag-meta-row">
 			<span class="plc-tag-meta-label">Status</span>
-			<span class="plc-tag-meta-value plc-tag-meta-status ${statusClass}">${escapeHtml(status)}</span>
+			<span class="plc-tag-meta-value">
+				<span class="device-chip device-chip--tag chip-${statusTone} plc-tag-meta-status is-${statusTone === "err" ? "error" : statusTone}">${escapeHtml(status)}</span>
+			</span>
 		</div>`);
 	}
 	if (hasDriftCounts) {
@@ -2872,6 +3073,15 @@ let plcTagModalState = null;
 
 function tagValueLower(tag) {
 	return String(tag?.value != null ? tag.value : "").toLowerCase();
+}
+
+/** Map PLC/Drift modal Status (OK/WARN/ERROR) → device-chip tone. */
+function plcStatusChipTone(status) {
+	const raw = String(status || "").trim().toUpperCase();
+	if (raw === "ERROR" || raw === "ERR") return "err";
+	if (raw === "WARN") return "warn";
+	if (raw === "OK") return "ok";
+	return null;
 }
 
 function renderPlcTagValue(tag) {
@@ -3394,6 +3604,33 @@ function deviceChips(prefix, statuses, links, liveOptions) {
 	return `<div class="device-chips">${chips}</div>`;
 }
 
+/** Stacked bar from chip tones: OK green / WARN yellow / ERR red / OFF gray. */
+function metricBarSegmentsHtml(chipStatuses) {
+	const list = Array.isArray(chipStatuses) ? chipStatuses : [];
+	if (!list.length) return "";
+	const counts = { ok: 0, warn: 0, err: 0, idle: 0 };
+	for (const status of list) {
+		if (status === "ok") counts.ok += 1;
+		else if (status === "err") counts.err += 1;
+		else if (status === "warn" || status === "unknown") counts.warn += 1;
+		else counts.idle += 1;
+	}
+	const total = list.length;
+	const order = [
+		["ok", counts.ok],
+		["warn", counts.warn],
+		["err", counts.err],
+		["idle", counts.idle],
+	];
+	return order
+		.filter(([, n]) => n > 0)
+		.map(([tone, n]) => {
+			const pct = (n / total) * 100;
+			return `<div class="metric-fill metric-fill-seg ${tone}" style="width:${pct}%"></div>`;
+		})
+		.join("");
+}
+
 function metricBlock(label, now, set, running, chipPrefix, chipStatuses, links, liveOptions, toneOverride) {
 	const displayNow = now != null ? now : (running ? "?" : "-");
 	const displaySet = set != null ? set : "?";
@@ -3402,12 +3639,18 @@ function metricBlock(label, now, set, running, chipPrefix, chipStatuses, links, 
 	const chips = chipPrefix && chipStatuses && chipStatuses.length
 		? deviceChips(chipPrefix, chipStatuses, links, liveOptions)
 		: "";
+	const segments = chipStatuses && chipStatuses.length
+		? metricBarSegmentsHtml(chipStatuses)
+		: "";
+	const barInner = segments
+		|| `<div class="metric-fill ${tone}" style="width:${width}%"></div>`;
+	const barClass = segments ? "metric-bar metric-bar--stacked" : "metric-bar";
 	return `<div class="metric-block">
 		<div class="metric-head">
 			<span class="metric-label">${label}</span>
 			<span class="metric-nums"><strong>${displayNow}</strong><span class="metric-sep">/</span>${displaySet}</span>
 		</div>
-		<div class="metric-bar" aria-hidden="true"><div class="metric-fill ${tone}" style="width:${width}%"></div></div>
+		<div class="${barClass}" aria-hidden="true">${barInner}</div>
 		${chips}
 	</div>`;
 }
@@ -3517,15 +3760,36 @@ function formatEgMetricCell(entry, name) {
 	);
 }
 
+/** List chip tone: prefer link.meta.status (WARN/ERROR) over probe chip_status. */
+function plcLinkChipStatus(link, fallbackStatus, running) {
+	if (!running) return "idle";
+	const metaTone = plcStatusChipTone(link && link.meta && link.meta.status);
+	if (metaTone === "err" || metaTone === "warn") return metaTone;
+	return fallbackStatus || "unknown";
+}
+
+function worstPlcChipTone(statuses, running) {
+	if (!running) return "idle";
+	const list = statuses || [];
+	if (list.some((s) => s === "err")) return "err";
+	if (list.some((s) => s === "warn" || s === "unknown")) return "warn";
+	if (list.length) return "ok";
+	return "idle";
+}
+
 function formatKafkaMetricCell(entry, name) {
 	const running = !!entry.running;
 	const liveOptions = { pipeline: name || entry.pipeline || "" };
 	const groups = entry.plc_tag_groups;
 	if (Array.isArray(groups) && groups.length) {
 		const blocks = groups.map((group) => {
-			const statuses = (group.chip_status || []).map((status) => (
-				running ? status : "idle"
-			));
+			const links = group.links || [];
+			const rawStatuses = group.chip_status || [];
+			const statuses = links.length
+				? links.map((link, idx) => plcLinkChipStatus(
+					link, running ? (rawStatuses[idx] || "unknown") : "idle", running,
+				))
+				: rawStatuses.map((status) => (running ? status : "idle"));
 			return metricBlock(
 				group.label || "PLC",
 				group.now,
@@ -3533,8 +3797,9 @@ function formatKafkaMetricCell(entry, name) {
 				running,
 				"T",
 				statuses,
-				group.links || [],
+				links,
 				liveOptions,
+				worstPlcChipTone(statuses, running),
 			);
 		}).join("");
 		return `<div class="metric-grid metric-grid--plc">${blocks}</div>`;
@@ -4477,6 +4742,20 @@ function getSelectedServers() {
 	)];
 }
 
+/** Keep this proxy host last so Shutdown/Reboot can finish dispatching elsewhere first. */
+function orderServersSelfLast(servers) {
+	const self = new Set(
+		(Array.isArray(proxyHostIps) ? proxyHostIps : []).map((ip) => String(ip || "").trim()).filter(Boolean),
+	);
+	if (!self.size) return servers;
+	const others = [];
+	const local = [];
+	for (const ip of servers) {
+		(self.has(ip) ? local : others).push(ip);
+	}
+	return others.concat(local);
+}
+
 function uniqueServerIps() {
 	return [...new Set(
 		[...document.querySelectorAll(".server-cb")].map((cb) => cb.value),
@@ -4546,7 +4825,7 @@ function renderServerCommandResults(command, results) {
 }
 
 async function sendServerCommand(command) {
-	const servers = getSelectedServers();
+	const servers = orderServersSelfLast(getSelectedServers());
 	if (!servers.length) {
 		showAlertModal("Select at least one server.", { title: "Server Control" });
 		return;

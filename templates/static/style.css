@@ -905,6 +905,12 @@ body.overlay-scroll-lock {
   overflow: hidden;
 }
 
+.metric-bar--stacked {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+
 .metric-fill {
   height: 100%;
   border-radius: inherit;
@@ -915,6 +921,26 @@ body.overlay-scroll-lock {
 .metric-fill.warn { background: linear-gradient(90deg, var(--warn), var(--warn-deep)); }
 .metric-fill.err { background: linear-gradient(90deg, var(--err), var(--err-deep)); }
 .metric-fill.idle { background: var(--text-dim); }
+
+.metric-fill-seg {
+  border-radius: 0;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.metric-bar--stacked > .metric-fill-seg:first-child {
+  border-top-left-radius: 999px;
+  border-bottom-left-radius: 999px;
+}
+
+.metric-bar--stacked > .metric-fill-seg:last-child {
+  border-top-right-radius: 999px;
+  border-bottom-right-radius: 999px;
+}
+
+.metric-bar--stacked > .metric-fill-seg:only-child {
+  border-radius: 999px;
+}
 
 .device-chips {
   display: flex;
@@ -1057,18 +1083,22 @@ body.overlay-scroll-lock {
 }
 
 .plc-tag-meta-status.is-ok {
-  color: #7ec8ff;
+  color: var(--ok);
   font-weight: 600;
 }
 
 .plc-tag-meta-status.is-warn {
-  color: #c9a0ff;
+  color: var(--warn);
   font-weight: 600;
 }
 
 .plc-tag-meta-status.is-error {
-  color: #ff8a8a;
+  color: var(--err);
   font-weight: 600;
+}
+
+.plc-tag-meta-status.device-chip {
+  font-weight: 700;
 }
 
 .plc-tag-list {
@@ -1327,14 +1357,10 @@ body.overlay-scroll-lock {
   gap: 14px;
 }
 
-/* Kept for backwards compatibility; UI no longer hides the right panel. */
-.drift-images-grid.is-reference-only {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
 .drift-images-panel {
   margin: 0;
   min-width: 0;
+  height: 100%;
   background: rgba(0, 0, 0, 0.28);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
@@ -1349,12 +1375,16 @@ body.overlay-scroll-lock {
   font-weight: 600;
   color: var(--text);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex: 0 0 auto;
 }
 
 .drift-images-media {
   position: relative;
   background: #0b0d10;
   min-height: 120px;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .drift-images-panel img {
@@ -1379,10 +1409,15 @@ body.overlay-scroll-lock {
 }
 
 .drift-images-empty {
-  padding: 48px 16px;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
   text-align: center;
   color: var(--muted);
   font-size: var(--text-sm);
+  box-sizing: border-box;
 }
 
 @media (max-width: 720px) {

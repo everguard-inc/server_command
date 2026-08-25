@@ -139,7 +139,8 @@ pip install -r requirements.txt
    `server_command_client.service`만 재시작합니다 (passwordless sudo).
 
    `--local`은 원격 `~/server_command`를 로컬 트리와 맞춥니다 (`rsync --delete`).
-   `.git`과 `servers.json`은 제외됩니다. `rsync`와 `sshpass`가 필요합니다.
+   `.git`도 포함되어 엣지 Current(git HEAD)가 이 호스트와 같아집니다.
+   `servers.json`만 제외됩니다. `rsync`와 `sshpass`가 필요합니다.
 
    기타 옵션:
 

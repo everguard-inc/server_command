@@ -138,7 +138,8 @@ as the proxy host and edge hosts of a site share the same username.
    (passwordless sudo).
 
    `--local` mirrors the remote `~/server_command` to match the local tree (`rsync
-   --delete`). `.git` and `servers.json` are excluded. Requires `rsync` and `sshpass`.
+   --delete`). `.git` is included so edge Current (git HEAD) matches this host;
+   only `servers.json` is excluded. Requires `rsync` and `sshpass`.
 
    Other options:
 

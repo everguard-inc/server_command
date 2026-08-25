@@ -856,9 +856,38 @@ def _cached_probe_local_stream(item, interval_sec):
     return health_ok, cameras_now
 
 
-def _container_name_for_item(item, running_names):
+def _matching_camera_drift_container(running_names, mem_map=None):
+    """Resolve Camera-Drift docker name (e.g. camera_drift_service_optimized).
+
+    server_id is a UUID and does not match the container; systemd eg_camera_drift
+    only tracks the wrapper, so memory must come from the drift container itself.
+    """
+    names = [
+        name for name in running_names
+        if name and "camera_drift" in name.lower()
+    ]
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+    if mem_map:
+        def used_bytes(name):
+            usage = mem_map.get(name) or ""
+            used_s = usage.split("/", 1)[0].strip()
+            return _parse_memory_size(used_s) or 0.0
+        return max(names, key=used_bytes)
+    preferred = [name for name in names if "service" in name.lower()]
+    return max(preferred or names, key=len)
+
+
+def _container_name_for_item(item, running_names, mem_map=None):
     if item.get("is_kafka"):
         return None
+    explicit = (item.get("container_name") or "").strip()
+    if explicit and explicit in running_names:
+        return explicit
+    if item.get("is_camera_drift"):
+        return _matching_camera_drift_container(running_names, mem_map)
     server_id = item.get("server_id")
     if item.get("is_sys_monitor"):
         return _matching_container_name(server_id, "sys", running_names)
@@ -1032,13 +1061,13 @@ def _apply_container_memory(entry, item, mem_map):
         entry["mem_usage"] = usage
         entry["mem_usage_percent"] = None
         return
-    container = _container_name_for_item(item, set(mem_map))
+    container = _container_name_for_item(item, set(mem_map), mem_map)
     usage = mem_map.get(container) if container else None
     if usage:
         entry["mem_usage"] = usage
         entry["mem_usage_percent"] = _mem_usage_percent(usage)
         return
-    # systemd-only pipelines (e.g. Camera-Drift / eg_camera_drift).
+    # Fallback when no matching docker container (wrapper unit only).
     service = _pipeline_service_name(item)
     if service and _is_service_active(service):
         entry["mem_usage"] = _systemd_memory_usage(service)

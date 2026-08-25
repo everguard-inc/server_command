@@ -180,7 +180,7 @@
 					<figure class="drift-images-panel">
 						<figcaption id="drift_images_before_caption">Reference</figcaption>
 						<div class="drift-images-media">
-							<img id="drift_images_before" alt="Reference image" />
+							<img id="drift_images_before" alt="Reference image" decoding="async" />
 							<canvas id="drift_images_before_points" class="drift-images-arrow is-hidden" aria-hidden="true"></canvas>
 							<div id="drift_images_before_empty" class="drift-images-empty hidden">No reference image</div>
 						</div>
@@ -188,7 +188,7 @@
 					<figure class="drift-images-panel">
 						<figcaption id="drift_images_after_caption">Last</figcaption>
 						<div class="drift-images-media">
-							<img id="drift_images_after" alt="Last image" />
+							<img id="drift_images_after" alt="Last image" decoding="async" />
 							<canvas id="drift_images_after_arrow" class="drift-images-arrow is-hidden" aria-hidden="true"></canvas>
 							<div id="drift_images_after_empty" class="drift-images-empty hidden">No illumination-matched compare image</div>
 						</div>
@@ -275,6 +275,7 @@
 			pipelineGroups: {{ pipeline_groups | tojson }},
 			pipelineStatic: {{ pipeline_static | tojson }},
 			statusDisplay: {{ status_display | tojson }},
+			proxyHostIps: {{ proxy_host_ips | tojson }},
 			urls: {
 				cameraFeed: {{ url_for('camera_feed') | tojson }},
 				getUpdateStatus: {{ url_for('get_update_status') | tojson }},

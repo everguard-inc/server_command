@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -906,12 +907,53 @@ def pipeline_static():
   return result
 
 
+def _local_ipv4_addrs():
+  """IPv4 addresses on this proxy host (used to power self last)."""
+  ips = {"127.0.0.1"}
+  try:
+    for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+      ip = info[4][0]
+      if ip:
+        ips.add(ip)
+  except OSError:
+    pass
+  try:
+    out = subprocess.check_output(
+      ["hostname", "-I"], text=True, timeout=2,
+    )
+    for token in out.split():
+      if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", token):
+        ips.add(token)
+  except (OSError, subprocess.SubprocessError):
+    pass
+  try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.connect(("8.8.8.8", 80))
+    ips.add(sock.getsockname()[0])
+    sock.close()
+  except OSError:
+    pass
+  return ips
+
+
+def _partition_servers_self_last(server_ips):
+  """Return (others, self_ips) so this proxy host is powered last."""
+  local = _local_ipv4_addrs()
+  others, selves = [], []
+  for ip in server_ips:
+    (selves if ip in local else others).append(ip)
+  return others, selves
+
+
 def render_context():
   return {
     "pipeline_static": pipeline_static(),
     "pipeline_order": list(cfg.keys()),
     "pipeline_groups": pipeline_groups(),
     "status_display": status_display_config(meta),
+    "proxy_host_ips": sorted(
+      ip for ip in _local_ipv4_addrs() if ip and not ip.startswith("127.")
+    ),
   }
 
 
@@ -1003,9 +1045,16 @@ async def manage_servers():
   unique_servers = list(dict.fromkeys(
     str(ip).strip() for ip in servers if str(ip or "").strip()
   ))
-  results = await asyncio.gather(*[
-    _run_host_power(server_ip, action) for server_ip in unique_servers
-  ])
+  # Schedule every other host first; power this proxy host last so it can
+  # finish dispatching before its own reboot/shutdown.
+  others, selves = _partition_servers_self_last(unique_servers)
+  results = []
+  if others:
+    results.extend(await asyncio.gather(*[
+      _run_host_power(server_ip, action) for server_ip in others
+    ]))
+  for server_ip in selves:
+    results.append(await _run_host_power(server_ip, action))
   ok = all(entry.get("ok") for entry in results)
   return jsonify({"ok": ok, "results": results}), 200 if ok else 409
 
@@ -1180,6 +1229,9 @@ def _status_request_item(name, image_cfg):
     item["drift_service_url"] = image_cfg.get("drift_service_url") or ""
     item["drift_service_port"] = image_cfg.get("drift_service_port")
     item["drift_service_path"] = image_cfg.get("drift_service_path")
+    # Optional override when auto-match (name contains camera_drift) is wrong.
+    if image_cfg.get("container_name"):
+      item["container_name"] = image_cfg["container_name"]
     return item
 
   primary, secondary = stream_feed_paths_for(name=name, cfg=image_cfg)

@@ -630,6 +630,37 @@ def empty_plc_tag_metrics():
   }
 
 
+def _sync_plc_chip_status_from_meta(entry):
+  """Align list chip_status with each link's meta.status (stale → WARN)."""
+  if not isinstance(entry, dict):
+    return entry
+  groups = entry.get("plc_tag_groups")
+  if not isinstance(groups, list):
+    return entry
+  flat = []
+  for group in groups:
+    if not isinstance(group, dict):
+      continue
+    links = group.get("links") or []
+    statuses = list(group.get("chip_status") or [])
+    while len(statuses) < len(links):
+      statuses.append("ok")
+    for idx, link in enumerate(links):
+      if not isinstance(link, dict):
+        continue
+      meta = link.get("meta") or {}
+      meta_status = str(meta.get("status") or "").strip().upper()
+      if meta_status in ("ERROR", "ERR"):
+        statuses[idx] = "err"
+      elif meta_status == "WARN" and statuses[idx] == "ok":
+        statuses[idx] = "warn"
+      flat.append(statuses[idx])
+    group["chip_status"] = statuses[:len(links)] if links else statuses
+  if flat:
+    entry["plc_tag_status"] = flat
+  return entry
+
+
 def fetch_plc_tag_metrics(base_url, *, timeout=5.0):
   """Probe /plc and group chips by location/sub (ok / warn / err)."""
   empty = empty_plc_tag_metrics()
@@ -699,17 +730,26 @@ def fetch_plc_tag_metrics(base_url, *, timeout=5.0):
       if tag_preview:
         title = f"{title} — {tag_preview}"
 
-      chip_status.append(health)
       meta = {}
       if isinstance(leaf, dict):
         if "stale" in leaf:
           # API field is boolean `stale`; expose as status for the UI.
           meta["status"] = "WARN" if bool(leaf.get("stale")) else "OK"
+        raw_status = str(leaf.get("status") or "").strip().upper()
+        if raw_status in ("OK", "WARN", "ERROR", "ERR"):
+          meta["status"] = "ERROR" if raw_status == "ERR" else raw_status
         if leaf.get("updated_at_ms") is not None:
           try:
             meta["updated_at_ms"] = int(leaf["updated_at_ms"])
           except (TypeError, ValueError):
             pass
+      # List chip (EAF4, …) must match modal Status — not tag true/false alone.
+      meta_status = str(meta.get("status") or "").upper()
+      if meta_status in ("ERROR", "ERR"):
+        health = "err"
+      elif meta_status == "WARN" and health == "ok":
+        health = "warn"
+      chip_status.append(health)
       chip_links.append({
         "label": sub_name,
         "title": title,
@@ -991,9 +1031,17 @@ def finalize_pipeline_status(entry):
     if entry.get("plc_tags_set") is None:
       entry["status"] = "WARN"
       return entry
+    _sync_plc_chip_status_from_meta(entry)
+    chip_bad = any(
+      status in ("warn", "err")
+      for group in entry.get("plc_tag_groups") or []
+      for status in (group.get("chip_status") or [])
+    )
     entry["status"] = (
-      "OK" if device_counts_ok(entry.get("plc_tags_set"), entry.get("plc_tags_now"))
-      else "WARN"
+      "OK" if (
+        device_counts_ok(entry.get("plc_tags_set"), entry.get("plc_tags_now"))
+        and not chip_bad
+      ) else "WARN"
     )
     return entry
 
