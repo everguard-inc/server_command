@@ -2631,10 +2631,20 @@ def _populate_rtls_metrics(entry, item):
 
 
 def _populate_kafka_metrics(entry, item):
-    base = plc_status_url_for(item, prefer_localhost=True)
-    if not base:
-      base = plc_status_url_for(item, host_ip=item.get("server_ip"))
-    entry.update(fetch_plc_tag_metrics(base, timeout=PROBE_TIMEOUT))
+    # Probe locally on the edge; expose server_ip URLs for Open API in the browser.
+    probe_base = plc_status_url_for(item, prefer_localhost=True)
+    public_base = plc_status_url_for(item, host_ip=item.get("server_ip"))
+    if not probe_base:
+      probe_base = public_base
+    link_base = public_base or probe_base
+    entry.update(
+      fetch_plc_tag_metrics(
+        probe_base, timeout=PROBE_TIMEOUT, link_base_url=link_base,
+      )
+    )
+    if link_base:
+        entry["plc_status_url"] = link_base
+        entry["url"] = link_base
 
 
 def _populate_camera_drift_metrics(entry, item):

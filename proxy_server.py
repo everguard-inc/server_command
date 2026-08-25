@@ -37,6 +37,7 @@ from servers_cfg import (
   empty_plc_tag_metrics,
   fetch_plc_tag_metrics,
   fetch_camera_drift_metrics,
+  rewrite_plc_tag_link_urls,
   finalize_pipeline_status,
   group_by_server_ip,
   drift_service_root_url,
@@ -1618,6 +1619,8 @@ async def _enrich_kafka_status(ip, host_info, host_result):
     if plc_url:
       entry["plc_status_url"] = plc_url
       entry["url"] = plc_url
+      # Edge often probes via 127.0.0.1; rewrite Open API links for the browser.
+      rewrite_plc_tag_link_urls(entry, plc_url)
 
     if plc_url and _kafka_metrics_incomplete(entry):
       try:

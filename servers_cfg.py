@@ -661,12 +661,51 @@ def _sync_plc_chip_status_from_meta(entry):
   return entry
 
 
-def fetch_plc_tag_metrics(base_url, *, timeout=5.0):
-  """Probe /plc and group chips by location/sub (ok / warn / err)."""
+def _plc_leaf_url(base_url, loc_name, sub_name):
+  base = str(base_url or "").rstrip("/")
+  if not base:
+    return ""
+  return f"{base}/{quote(str(loc_name), safe='')}/{quote(str(sub_name), safe='')}"
+
+
+def rewrite_plc_tag_link_urls(entry, public_base_url):
+  """Point Open API / chip links at a browser-reachable host (not 127.0.0.1)."""
+  if not isinstance(entry, dict):
+    return entry
+  base = str(public_base_url or "").rstrip("/")
+  if not base:
+    return entry
+
+  def _rewrite_link(link):
+    if not isinstance(link, dict):
+      return
+    loc = link.get("location")
+    sub = link.get("value") if link.get("value") is not None else link.get("label")
+    if loc is None or sub is None:
+      return
+    link["url"] = _plc_leaf_url(base, loc, sub)
+
+  for link in entry.get("plc_tag_links") or []:
+    _rewrite_link(link)
+  for group in entry.get("plc_tag_groups") or []:
+    if not isinstance(group, dict):
+      continue
+    for link in group.get("links") or []:
+      _rewrite_link(link)
+  return entry
+
+
+def fetch_plc_tag_metrics(base_url, *, timeout=5.0, link_base_url=None):
+  """Probe /plc and group chips by location/sub (ok / warn / err).
+
+  base_url: used for HTTP probes (may be http://127.0.0.1:…).
+  link_base_url: optional browser-facing base for chip / Open API URLs.
+  """
   empty = empty_plc_tag_metrics()
   if not base_url:
     return empty
   base = str(base_url).rstrip("/")
+  link_base = str(link_base_url or base).rstrip("/") or base
   try:
     root = _http_get_json(base, timeout)
   except _HTTP_JSON_ERRORS:
@@ -690,9 +729,9 @@ def fetch_plc_tag_metrics(base_url, *, timeout=5.0):
     chip_links = []
     for sub in subs:
       sub_name = str(sub)
-      leaf_url = f"{base}/{quote(loc_name, safe='')}/{quote(sub_name, safe='')}"
+      probe_url = _plc_leaf_url(base, loc_name, sub_name)
       try:
-        leaf = _http_get_json(leaf_url, timeout)
+        leaf = _http_get_json(probe_url, timeout)
       except _HTTP_JSON_ERRORS:
         continue
       entries = _plc_tag_entries(leaf)
@@ -753,7 +792,7 @@ def fetch_plc_tag_metrics(base_url, *, timeout=5.0):
       chip_links.append({
         "label": sub_name,
         "title": title,
-        "url": leaf_url,
+        "url": _plc_leaf_url(link_base, loc_name, sub_name),
         "value": sub_name,
         "location": loc_name,
         "meta": meta,
