@@ -37,6 +37,7 @@ from servers_cfg import (
   empty_plc_tag_metrics,
   fetch_plc_tag_metrics,
   fetch_camera_drift_metrics,
+  fetch_plc_cv_checker_metrics,
   rewrite_plc_tag_link_urls,
   finalize_pipeline_status,
   group_by_server_ip,
@@ -51,6 +52,7 @@ from servers_cfg import (
   pipeline_git_url,
   pipeline_service_name,
   plc_status_url_for,
+  plc_cv_checkers_url_for,
   read_servers_file,
   repo_path_for_pipeline,
   server_cfg_for_ip,
@@ -390,11 +392,11 @@ def _stream_feed_paths_for_pipeline(pipeline_name):
   return list(dict.fromkeys(path for path in (primary, secondary) if path))
 
 
-def _camera_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
+def _camera_frame_from_payload(payload, cam_idx, *, pipeline_name=None, sign_ids=None):
   # Prefer PLC-CV per-camera / per-sign ROI maps when present.
   if _plc_has_per_cam_frames(payload):
     frame = _plc_roi_frame_from_payload(
-      payload, cam_idx, pipeline_name=pipeline_name,
+      payload, cam_idx, pipeline_name=pipeline_name, sign_ids=sign_ids,
     )
     return frame or ""
 
@@ -609,12 +611,26 @@ def _lookup_cam_keyed_frame(by_cam, cam_num, cam_idx):
   return None
 
 
-def _plc_roi_frame_from_jpeg_by_sign(payload, cam_num):
+def _parse_sign_id_filter(raw):
+  """Normalize ?signs=id1,id2 into a non-empty set, or None."""
+  if raw is None:
+    return None
+  if isinstance(raw, (list, tuple, set)):
+    ids = [str(item).strip() for item in raw if str(item).strip()]
+  else:
+    ids = [part.strip() for part in str(raw).split(",") if part.strip()]
+  return set(ids) if ids else None
+
+
+def _plc_roi_frame_from_jpeg_by_sign(payload, cam_num, sign_ids=None):
   by_sign = _plc_jpeg_by_sign_map(payload)
   if not by_sign:
     return None
+  wanted = _parse_sign_id_filter(sign_ids)
   candidates = []
   for sid, name, sign_cam, color, state in _plc_sign_entries(payload):
+    if wanted is not None and sid not in wanted:
+      continue
     if cam_num is not None and sign_cam != cam_num:
       continue
     frame = by_sign.get(sid)
@@ -627,6 +643,12 @@ def _plc_roi_frame_from_jpeg_by_sign(payload, cam_num):
   if candidates:
     candidates.sort()
     return candidates[0][3]
+  if wanted is not None:
+    for sid in wanted:
+      frame = by_sign.get(sid)
+      if isinstance(frame, str) and frame:
+        return frame
+    return None
   # Lab / no Cam labels: use selected signId frame.
   if cam_num is None:
     sid = payload.get("signId")
@@ -639,8 +661,15 @@ def _plc_roi_frame_from_jpeg_by_sign(payload, cam_num):
   return None
 
 
-def _plc_roi_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
+def _plc_roi_frame_from_payload(payload, cam_idx, *, pipeline_name=None, sign_ids=None):
   """Pick ROI jpeg for a C-chip from jpeg_by_cam / jpeg_by_sign."""
+  wanted = _parse_sign_id_filter(sign_ids)
+  # Checker chips: prefer that checker's jpeg_by_sign ROI only.
+  if wanted is not None:
+    frame = _plc_roi_frame_from_jpeg_by_sign(payload, None, sign_ids=wanted)
+    if frame:
+      return frame
+
   cam_num = _plc_resolve_cam_number(
     payload, cam_idx, pipeline_name=pipeline_name,
   )
@@ -649,30 +678,32 @@ def _plc_roi_frame_from_payload(payload, cam_idx, *, pipeline_name=None):
     frame = _lookup_cam_keyed_frame(by_cam, cam_num, cam_idx)
     if frame:
       return frame
-  if _plc_jpeg_by_sign_map(payload):
-    return _plc_roi_frame_from_jpeg_by_sign(payload, cam_num)
-  return None
+  return _plc_roi_frame_from_jpeg_by_sign(payload, cam_num, sign_ids=wanted)
 
 
 def _lamps_public(lamps):
-  """Drop internal cam index before sending to the UI."""
+  """Drop internal cam/id fields before sending to the UI."""
   for lamp in lamps:
     lamp.pop("cam", None)
+    lamp.pop("id", None)
   return lamps
 
 
-def _lamp_judgments_from_payload(payload, cam_idx=None, *, pipeline_name=None):
-  """PLC-CV /stream lamp judgments from states (+ optional cam filter)."""
+def _lamp_judgments_from_payload(
+  payload, cam_idx=None, *, pipeline_name=None, sign_ids=None,
+):
+  """PLC-CV /stream lamp judgments from states (+ optional cam/sign filter)."""
   states = payload.get("states")
   if not isinstance(states, dict) or not states:
     return None
 
   lamps = []
-  for _sid, name, cam_num, color, state in _plc_sign_entries(payload):
+  for sid, name, cam_num, color, state in _plc_sign_entries(payload):
     if not name and not state:
       continue
     on = _lamp_is_on(state)
     lamps.append({
+      "id": sid,
       "name": name,
       "state": state or ("ON" if on else "OFF"),
       "color": color,
@@ -682,6 +713,11 @@ def _lamp_judgments_from_payload(payload, cam_idx=None, *, pipeline_name=None):
 
   if not lamps:
     return []
+
+  wanted = _parse_sign_id_filter(sign_ids)
+  if wanted is not None:
+    matched = [lamp for lamp in lamps if lamp.get("id") in wanted]
+    return _lamps_public(matched)
 
   # No CamN labels (lab / RND desk): show every sign.
   if all(lamp.get("cam") is None for lamp in lamps):
@@ -699,15 +735,15 @@ def _lamp_judgments_from_payload(payload, cam_idx=None, *, pipeline_name=None):
   return _lamps_public(lamps)
 
 
-def _camera_feed_event(payload, cam_idx, *, pipeline_name=None):
+def _camera_feed_event(payload, cam_idx, *, pipeline_name=None, sign_ids=None):
   frame = _camera_frame_from_payload(
-    payload, cam_idx, pipeline_name=pipeline_name,
+    payload, cam_idx, pipeline_name=pipeline_name, sign_ids=sign_ids,
   )
   if not frame:
     return None
   event = {"jpeg": frame, "fps": payload.get("fps")}
   lamps = _lamp_judgments_from_payload(
-    payload, cam_idx, pipeline_name=pipeline_name,
+    payload, cam_idx, pipeline_name=pipeline_name, sign_ids=sign_ids,
   )
   if lamps is not None:
     event["lamps"] = lamps
@@ -1314,6 +1350,10 @@ def _restore_version_fields(status_map, version_snap):
 
 _DRIFT_METRIC_KEYS = tuple(empty_camera_drift_metrics())
 _PLC_METRIC_KEYS = tuple(empty_plc_tag_metrics())
+_PLC_CV_CHECKER_KEYS = (
+  "plc_cv_checkers", "cameras_now", "cameras_set",
+  "camera_status", "camera_links",
+)
 # Keep row healthy across wipe while systemd / probes re-run.
 _PROBE_RUNTIME_KEYS = (
   "running", "status", "mem_usage", "mem_usage_percent",
@@ -1332,6 +1372,8 @@ def _probe_metric_keys_for(entry):
     return _DRIFT_METRIC_KEYS
   if entry.get("is_kafka") and not _kafka_metrics_incomplete(entry):
     return _PLC_METRIC_KEYS
+  if entry.get("is_plc_cv") and not _plc_cv_checkers_incomplete(entry):
+    return _PLC_CV_CHECKER_KEYS
   return ()
 
 
@@ -1580,6 +1622,17 @@ def _kafka_metrics_incomplete(entry):
   return entry.get("plc_tags_set") is None
 
 
+def _plc_cv_checkers_incomplete(entry):
+  """True when PLC-CV Signs chips were not filled from /checkers."""
+  if not entry.get("plc_cv_checkers") or entry.get("cameras_set") is None:
+    return True
+  try:
+    set_n = int(entry.get("cameras_set"))
+  except (TypeError, ValueError):
+    return True
+  return set_n > 0 and not (entry.get("camera_status") or [])
+
+
 def _drift_metrics_incomplete(entry):
   """True when Camera-Drift metrics/chips are missing or unusable."""
   if entry.get("drift_api_ok") is not True or entry.get("drift_cameras_set") is None:
@@ -1634,6 +1687,41 @@ async def _enrich_kafka_status(ip, host_info, host_result):
     finalize_pipeline_status(entry)
 
 
+async def _enrich_plc_cv_status(ip, host_info, host_result):
+  """Probe sign_monitor /checkers for Signs chips when the edge left them empty."""
+  if not isinstance(host_result, dict):
+    return
+  loop = asyncio.get_event_loop()
+  for item in host_info.get("items") or []:
+    if not item.get("is_plc_cv"):
+      continue
+    name = item.get("name")
+    entry = host_result.get(name) if name else None
+    if not entry or not _plc_cv_checkers_incomplete(entry):
+      continue
+
+    image_cfg = cfg.get(name) or {}
+    port = entry.get("streaming_port")
+    if port is None:
+      port = image_cfg.get("streaming_port")
+    checkers_url = image_cfg.get("plc_cv_checkers_url") or plc_cv_checkers_url_for(
+      image_cfg, host_ip=ip, streaming_port=port,
+    )
+    if not checkers_url:
+      continue
+    try:
+      metrics = await loop.run_in_executor(
+        None,
+        lambda u=checkers_url: fetch_plc_cv_checker_metrics(u, timeout=5.0),
+      )
+      if metrics.get("plc_cv_checkers"):
+        entry.update(metrics)
+    except Exception as exc:
+      print(f"plc-cv checkers probe {ip}: {exc}")
+
+    finalize_pipeline_status(entry)
+
+
 async def _enrich_camera_drift_status(ip, host_info, host_result):
   """Fill drift URL; probe /get_drift only if the edge left metrics empty."""
   if not isinstance(host_result, dict):
@@ -1681,6 +1769,7 @@ async def _fetch_host_status(ip, host_info, read_timeout):
     await _enrich_systemd_running(ip, host_info, host_result, read_timeout)
     await _enrich_camera_drift_status(ip, host_info, host_result)
     await _enrich_kafka_status(ip, host_info, host_result)
+    await _enrich_plc_cv_status(ip, host_info, host_result)
   return host_result
 
 
@@ -2258,6 +2347,7 @@ def camera_feed():
     return "service not found", 404
   if cam_idx < 0:
     return "invalid cam", 400
+  sign_ids = _parse_sign_id_filter(request.args.get("signs"))
 
   if is_kafka_pipeline(cfg=cfg.get(pipeline_name), name=pipeline_name):
     return "kafka services have no camera stream", 404
@@ -2312,7 +2402,10 @@ def camera_feed():
                   continue
                 unresolved_lines = 0
                 event = _camera_feed_event(
-                  payload, cam_idx, pipeline_name=pipeline_name,
+                  payload,
+                  cam_idx,
+                  pipeline_name=pipeline_name,
+                  sign_ids=sign_ids,
                 )
                 if event:
                   got_stream_frame = True

@@ -42,11 +42,13 @@ Pipelines are classified by name / `eg_pipeline_path`. UI **type** badge and fil
 - **PLC**: Kafka PLC (`plc-engine-kafka`) and PLC-CV (`sign_monitor`) share one type label.
   SYS MONITOR chips keep them separate (`PLC-KAFKA`, `PLC-CV-RND`, …).
 - **DRIFT**: Camera-Drift service; SYS MONITOR chip label is `CAM-DRIFT`.
-- Status is `OK` / `WARN` / `ERR` from stream feeds (PLC-CV / EG), `/plc` tags (Kafka), or
-  `/get_drift` + `/api/cameras` (Drift).
+- Status is `OK` / `WARN` / `ERR` from stream feeds (EG), `/stream` + `/checkers` (PLC-CV),
+  `/plc` tags (Kafka), or `/get_drift` + `/api/cameras` (Drift).
+  PLC-CV Signs chips use `http://<streaming_ip>:<streaming_port>/checkers`
+  (`tags` value `error` → err); live ROI still comes from `/stream`.
 
 `plc_status_url` / `drift_service_url` are optional; defaults are built from `server_ip`
-(`22000/plc`, `8083/get_drift`).
+(`22000/plc`, `8083/get_drift`). PLC-CV `/checkers` uses the same host/port as `/stream`.
 
 ## Requirements
 

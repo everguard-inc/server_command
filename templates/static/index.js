@@ -3272,7 +3272,7 @@ function resetCameraDrift(camUid, pipeline, btn) {
 	});
 }
 
-function openCameraLive(pipeline, camIndex, title) {
+function openCameraLive(pipeline, camIndex, title, signIds) {
 	stopCameraLiveStream();
 	const img = $("camera_live_img");
 	const status = $("camera_live_status");
@@ -3285,7 +3285,13 @@ function openCameraLive(pipeline, camIndex, title) {
 	setCameraLiveImageVisible(false);
 	setOverlayVisible($("camera_live_modal"), true);
 
-	const feedUrl = `${cameraFeedBase}?pipeline=${encodeURIComponent(pipeline)}&cam=${camIndex}`;
+	const signs = Array.isArray(signIds)
+		? signIds.map((id) => String(id || "").trim()).filter(Boolean)
+		: [];
+	let feedUrl = `${cameraFeedBase}?pipeline=${encodeURIComponent(pipeline)}&cam=${camIndex}`;
+	if (signs.length) {
+		feedUrl += `&signs=${encodeURIComponent(signs.join(","))}`;
+	}
 	let receivedFrame = false;
 	let lastFps = null;
 	cameraLiveSource = new EventSource(feedUrl);
@@ -3536,16 +3542,23 @@ function usesMetricChipOptions(prefix) {
 	return isLiveCameraChipPrefix(prefix) || prefix === "D" || prefix === "T";
 }
 
+function metricChipLabel(prefix, index, link) {
+	const fallback = `${prefix}${index + 1}`;
+	if (prefix === "T" && link && link.value != null && String(link.value) !== "") {
+		return String(link.value);
+	}
+	if ((prefix === "D" || prefix === "Sign") && link && link.label) {
+		return String(link.label);
+	}
+	if (prefix === "P" && link && link.value != null && String(link.value) !== "") {
+		return String(link.value);
+	}
+	return fallback;
+}
+
 function renderMetricChip({ prefix, index, status, link, liveOptions }) {
 	const fallback = `${prefix}${index + 1}`;
-	// PLC tags: chip text is the state value (true/false/number/error).
-	const label = (prefix === "T" && link && link.value != null && String(link.value) !== "")
-		? String(link.value)
-		: (prefix === "D" && link && link.label)
-			? String(link.label)
-		: (prefix === "P" && link && link.value != null && String(link.value) !== "")
-			? String(link.value)
-		: fallback;
+	const label = metricChipLabel(prefix, index, link);
 	const title = link ? (link.title || link.label || label) : label;
 	const safeTitle = escapeAttr(title);
 	const chipClass = `device-chip chip-${status}${prefix === "T" ? " device-chip--tag" : ""}`;
@@ -3556,12 +3569,18 @@ function renderMetricChip({ prefix, index, status, link, liveOptions }) {
 	) {
 		return `<button type="button" class="device-chip-btn" title="Go to ${safeTitle}" aria-label="Go to ${safeTitle}" data-pipeline="${escapeAttr(link.pipeline)}"><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
 	}
-	if (
-		isLiveCameraChipPrefix(prefix)
-		&& status === "ok" && liveOptions
-		&& liveOptions.pipeline && liveOptions.streamUrl
-	) {
-		return `<button type="button" class="device-chip-btn device-chip-live" title="View live: ${safeTitle}" aria-label="View live ${escapeAttr(fallback)}" data-pipeline="${escapeAttr(liveOptions.pipeline)}" data-cam="${index}" data-title="${safeTitle}"><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
+	const openLive = isLiveCameraChipPrefix(prefix)
+		&& liveOptions
+		&& liveOptions.pipeline
+		&& liveOptions.streamUrl
+		&& (status === "ok" || prefix === "Sign");
+	if (openLive) {
+		const signIds = Array.isArray(link && link.sign_ids) ? link.sign_ids : [];
+		const signAttr = signIds.length
+			? ` data-sign-ids="${escapeAttr(signIds.join(","))}"`
+			: "";
+		const liveTitle = (link && link.label) ? String(link.label) : fallback;
+		return `<button type="button" class="device-chip-btn device-chip-live" title="View live: ${safeTitle}" aria-label="View live ${escapeAttr(liveTitle)}" data-pipeline="${escapeAttr(liveOptions.pipeline)}" data-cam="${index}" data-title="${escapeAttr(liveTitle)}"${signAttr}><span class="${chipClass}">${escapeHtml(label)}</span></button>`;
 	}
 	if (prefix === "T" || (prefix === "D" && link && Array.isArray(link.tags) && link.tags.length)) {
 		const tagsJson = escapeAttr(JSON.stringify(link && link.tags ? link.tags : []));
@@ -5420,10 +5439,15 @@ $("status_body").addEventListener("click", (event) => {
 	const liveBtn = event.target.closest(".device-chip-live");
 	if (liveBtn) {
 		event.preventDefault();
+		const signIds = String(liveBtn.dataset.signIds || "")
+			.split(",")
+			.map((id) => id.trim())
+			.filter(Boolean);
 		openCameraLive(
 			liveBtn.dataset.pipeline,
 			parseInt(liveBtn.dataset.cam, 10),
 			liveBtn.dataset.title || "",
+			signIds,
 		);
 		return;
 	}

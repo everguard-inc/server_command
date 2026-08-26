@@ -39,10 +39,12 @@ from servers_cfg import (
     fetch_plc_tag_metrics,
     empty_camera_drift_metrics,
     fetch_camera_drift_metrics,
+    fetch_plc_cv_checker_metrics,
     finalize_pipeline_status,
     is_sys_monitored_peer,
     normalize_edge_probe,
     plc_status_url_for,
+    plc_cv_checkers_url_for,
     drift_service_url_for,
     repo_path_for_pipeline,
     stream_feed_paths_for,
@@ -2596,8 +2598,10 @@ def _status_entry(name, item, running_names):
         "speaker_now": None,
         "is_rtls": item.get("is_rtls", False),
         "is_kafka": item.get("is_kafka", False),
+        "is_plc_cv": item.get("is_plc_cv", False),
         "is_camera_drift": item.get("is_camera_drift", False),
         "is_sys_monitor": item.get("is_sys_monitor", False),
+        "plc_cv_checkers": False,
         "rtls_config_missing": bool(item.get("rtls_config_missing")),
         "rtls_devices_missing": bool(item.get("rtls_devices_missing")),
         "cameras_now": None,
@@ -2669,6 +2673,30 @@ def _populate_stream_metrics(entry, item, probe_cfg):
     _set_camera_status(entry, item)
 
 
+def _populate_plc_cv_metrics(entry, item, probe_cfg):
+    """PLC-CV: keep /stream health; Signs chips come from GET /checkers."""
+    if item.get("streaming_port"):
+        health_ok, _ = _cached_probe_local_stream(
+            item, probe_cfg["stream_probe_interval_sec"],
+        )
+        if health_ok:
+            entry["stream_health"] = True
+            entry["running"] = True
+
+    port = item.get("streaming_port")
+    checkers_url = (
+        plc_cv_checkers_url_for(item, prefer_localhost=True, streaming_port=port)
+        or plc_cv_checkers_url_for(
+            item, host_ip=item.get("server_ip"), streaming_port=port,
+        )
+    )
+    metrics = fetch_plc_cv_checker_metrics(checkers_url, timeout=PROBE_TIMEOUT)
+    if metrics.get("plc_cv_checkers"):
+        entry.update(metrics)
+    else:
+        _set_camera_status(entry, item)
+
+
 def status_one(item, running_names, version_cache=None, mem_map=None, probe_cfg=None):
     probe_cfg = probe_cfg or normalize_edge_probe(None)
     name = item["name"]
@@ -2686,6 +2714,8 @@ def status_one(item, running_names, version_cache=None, mem_map=None, probe_cfg=
         _populate_kafka_metrics(entry, item)
     elif entry.get("is_camera_drift"):
         _populate_camera_drift_metrics(entry, item)
+    elif entry.get("is_plc_cv"):
+        _populate_plc_cv_metrics(entry, item, probe_cfg)
     elif not item.get("streaming_port"):
         _set_camera_status(entry, item)
     else:

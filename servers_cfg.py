@@ -30,6 +30,7 @@ ALT_STREAM_FEED_PATH = "/video_feed"
 PLC_STREAM_FEED_PATH = "/stream"
 DEFAULT_PLC_STATUS_PORT = 22000
 DEFAULT_PLC_STATUS_PATH = "/plc"
+DEFAULT_PLC_CV_CHECKERS_PATH = "/checkers"
 DEFAULT_DRIFT_SERVICE_PORT = 8083
 DEFAULT_DRIFT_SERVICE_PATH = "/get_drift"
 SERVERS_PATH = join(realpath(dirname(__file__)), "servers.json")
@@ -52,6 +53,7 @@ EDGE_STATUS_KEYS = (
   "qlight_status", "speaker_status", "camera_status",
   "plc_tags_now", "plc_tags_set", "plc_tag_status", "plc_tag_links",
   "plc_tag_groups", "plc_tags_ok",
+  "plc_cv_checkers",
   "drift_status", "drift_cameras_set", "drift_cameras_now",
   "drift_cameras_online",
   "drift_camera_status", "drift_camera_links", "drift_camera_groups",
@@ -308,6 +310,36 @@ def plc_status_url_for(cfg=None, *, host_ip=None, prefer_localhost=False):
   )
 
 
+def plc_cv_checkers_url_for(
+  cfg=None,
+  *,
+  host_ip=None,
+  streaming_port=None,
+  prefer_localhost=False,
+):
+  """URL for PLC-CV sign_monitor checker chips (GET /checkers)."""
+  cfg = cfg or {}
+  explicit = str(cfg.get("plc_cv_checkers_url") or "").strip()
+  if explicit:
+    return explicit.rstrip("/")
+  port = streaming_port if streaming_port is not None else cfg.get("streaming_port")
+  try:
+    port = int(port)
+  except (TypeError, ValueError):
+    return None
+  if prefer_localhost:
+    ip = "127.0.0.1"
+  else:
+    ip = host_ip or cfg.get("streaming_ip") or cfg.get("server_ip") or ""
+  if not ip:
+    return None
+  path = str(cfg.get("plc_cv_checkers_path") or DEFAULT_PLC_CV_CHECKERS_PATH).strip()
+  path = path or DEFAULT_PLC_CV_CHECKERS_PATH
+  if not path.startswith("/"):
+    path = f"/{path}"
+  return f"http://{ip}:{port}{path}".rstrip("/")
+
+
 def _http_get_json(url, timeout):
   req = urllib.request.Request(url, headers={"Accept": "application/json"})
   try:
@@ -327,6 +359,94 @@ _HTTP_JSON_ERRORS = (
   TypeError,
   json.JSONDecodeError,
 )
+
+
+def _plc_cv_first_token(text):
+  parts = str(text or "").strip().split()
+  return parts[0] if parts else ""
+
+
+def _plc_cv_checker_chip_health(raw):
+  """Map /checkers tag value to list chip tone (error string → err)."""
+  text = str(raw or "").strip().lower()
+  if text == "error":
+    return "err"
+  if text == "ok":
+    return "ok"
+  if text in ("warn", "warning"):
+    return "warn"
+  return "unknown"
+
+
+def _plc_cv_chip_label(name, signs=None):
+  """Chip label = first token of checker name, else first sign name.
+
+  \"Cam111 Green2\" / \"Cam111\" → Cam111. Generic checker-N uses first sign.
+  """
+  text = str(name or "").strip()
+  if text and not re.fullmatch(r"checker-\d+", text, re.I):
+    return _plc_cv_first_token(text) or "Sign"
+  for sign in signs or []:
+    if not isinstance(sign, dict):
+      continue
+    token = _plc_cv_first_token(sign.get("name"))
+    if token:
+      return token
+  return _plc_cv_first_token(text) or "Sign"
+
+
+def fetch_plc_cv_checker_metrics(checkers_url, *, timeout=5.0):
+  """Probe sign_monitor GET /checkers → Signs chips (camera_* fields)."""
+  empty = {"plc_cv_checkers": False}
+  if not checkers_url:
+    return empty
+  try:
+    payload = _http_get_json(str(checkers_url).rstrip("/"), timeout)
+  except _HTTP_JSON_ERRORS:
+    return empty
+  if not isinstance(payload, dict):
+    return empty
+
+  tags = payload.get("tags") if isinstance(payload.get("tags"), dict) else {}
+  checkers = [c for c in (payload.get("checkers") or []) if isinstance(c, dict)]
+  if not checkers and tags:
+    checkers = [
+      {"name": key, "status": value, "signs": []}
+      for key, value in tags.items()
+    ]
+
+  statuses = []
+  links = []
+  ok_n = 0
+  for checker in checkers:
+    name = str(checker.get("name") or checker.get("id") or "").strip()
+    if not name:
+      continue
+    checker_id = str(checker.get("id") or "")
+    raw_status = tags.get(name, tags.get(checker_id, checker.get("status")))
+    health = _plc_cv_checker_chip_health(raw_status)
+    if health == "ok":
+      ok_n += 1
+    statuses.append(health)
+
+    signs = [s for s in (checker.get("signs") or []) if isinstance(s, dict)]
+    sign_ids = [str(s["id"]) for s in signs if s.get("id")]
+    chip_label = _plc_cv_chip_label(name, signs)
+    display = str(raw_status or "").strip().lower() or health
+    links.append({
+      "label": chip_label,
+      "title": f"{name}: {display}",
+      "value": chip_label,
+      "sign_ids": sign_ids,
+    })
+
+  return {
+    "plc_cv_checkers": True,
+    "cameras_set": len(links),
+    "cameras_now": ok_n,
+    "camera_status": statuses,
+    "camera_links": links,
+  }
 
 
 _PLC_TAG_META_KEYS = frozenset({

@@ -42,11 +42,15 @@ Everguard 엣지 사이트를 위한 Docker Image Manager입니다. 중앙 **프
 - **PLC**: Kafka PLC(`plc-engine-kafka`)와 PLC-CV(`sign_monitor`)를 타입에서는 하나로 표시.
   SYS MONITOR 칩에서는 `PLC-KAFKA`, `PLC-CV-RND` 등으로 구분.
 - **DRIFT**: Camera-Drift 서비스. SYS MONITOR 칩 라벨은 `CAM-DRIFT`.
-- **PLC-CV / EG 등**: 카메라 스트림이 있으면 feed로 상태를 보고, Kafka는 `/plc` 태그 API,
-  Drift는 `/get_drift`(+ `/api/cameras`)로 상태를 계산합니다 (`OK` / `WARN` / `ERR`).
+- 상태는 `OK` / `WARN` / `ERR`로 표시합니다. EG는 카메라 스트림 feed,
+  PLC-CV는 `/stream` + `/checkers`, Kafka는 `/plc` 태그,
+  Drift는 `/get_drift`(+ `/api/cameras`)를 사용합니다.
+  PLC-CV Signs 칩은 `http://<streaming_ip>:<streaming_port>/checkers`
+  (`tags`의 `error` → err), 라이브 ROI는 `/stream`입니다.
 
 `plc_status_url` / `drift_service_url`은 선택입니다. 없으면 `server_ip`와 기본 포트·경로로
-만듭니다 (`22000/plc`, `8083/get_drift`).
+만듭니다 (`22000/plc`, `8083/get_drift`). PLC-CV `/checkers`는 `/stream`과 같은
+호스트·포트를 씁니다.
 
 ## 요구 사항
 
