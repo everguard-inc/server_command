@@ -1738,6 +1738,13 @@ body.overlay-scroll-lock {
   background: var(--surface-deep);
 }
 
+#camera_live_img {
+  width: 200px;
+  max-width: 200px;
+  height: auto;
+  margin: 0 auto;
+}
+
 .overlay__footer {
   display: flex;
   justify-content: flex-end;
