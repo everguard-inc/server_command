@@ -127,13 +127,16 @@
 
 	<div id="camera_live_modal" class="overlay hidden" aria-hidden="true">
 		<div class="overlay__backdrop"></div>
-		<div class="overlay__dialog" role="dialog" aria-modal="true" aria-labelledby="camera_live_title">
+		<div class="overlay__dialog overlay__dialog--wide" role="dialog" aria-modal="true" aria-labelledby="camera_live_title">
 			<div class="overlay__header">
 				<span id="camera_live_title">Camera</span>
 				<button type="button" class="overlay__close" id="camera_live_close" aria-label="Close">&times;</button>
 			</div>
 			<div class="overlay__body overlay__body--media">
-				<img id="camera_live_img" class="hidden" alt="" />
+				<div id="camera_live_stage" class="camera-live-stage hidden">
+					<img id="camera_live_img" alt="" />
+					<canvas id="camera_live_rois" class="camera-live-rois" aria-hidden="true"></canvas>
+				</div>
 				<div id="camera_live_status" class="overlay__caption">Connecting…</div>
 				<div id="camera_live_lamps" class="camera-live-lamps" hidden></div>
 			</div>

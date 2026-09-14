@@ -449,6 +449,100 @@ def fetch_plc_cv_checker_metrics(checkers_url, *, timeout=5.0):
   }
 
 
+def stream_camera_snapshot(payload):
+  """Extract lightweight camera presence from an eg_pipeline SSE payload.
+
+  Avoids retaining jpeg blobs. Returns None when payload is not a dict.
+  """
+  if not isinstance(payload, dict):
+    return None
+
+  camera_ids = payload.get("camera_ids")
+  if not isinstance(camera_ids, list):
+    camera_ids = None
+
+  index_map = payload.get("index_map")
+  if not isinstance(index_map, list):
+    index_map = None
+
+  jpeg = payload.get("jpeg")
+  jpeg_present = None
+  cameras_now = None
+  if camera_ids is not None:
+    cameras_now = len(camera_ids)
+  elif isinstance(jpeg, list):
+    jpeg_present = [bool(frame) for frame in jpeg]
+    cameras_now = sum(1 for present in jpeg_present if present)
+  elif isinstance(jpeg, str) and jpeg:
+    jpeg_present = [True]
+    cameras_now = 1
+  else:
+    states = payload.get("states")
+    if isinstance(states, dict) and states:
+      cams = set()
+      for value in states.values():
+        label = ""
+        if isinstance(value, (list, tuple)) and value:
+          label = str(value[0] or "")
+        elif isinstance(value, str):
+          label = value
+        match = re.match(r"Cam\s*(\d+)", label, re.I)
+        if match:
+          cams.add(match.group(1))
+      if cams:
+        cameras_now = len(cams)
+
+  config_cameras = (payload.get("config") or {}).get("camera")
+  config_uids = None
+  if isinstance(config_cameras, list):
+    config_uids = [
+      (cam.get("uid") if isinstance(cam, dict) else None)
+      for cam in config_cameras
+    ]
+
+  return {
+    "cameras_now": cameras_now,
+    "camera_ids": camera_ids,
+    "index_map": index_map,
+    "jpeg_present": jpeg_present,
+    "config_uids": config_uids,
+  }
+
+
+def camera_statuses_from_stream(snapshot, camera_links):
+  """Map stream snapshot to per-config-camera ok/err list, or None if unmappable."""
+  if not snapshot or not camera_links:
+    return None
+
+  n = len(camera_links)
+  camera_ids = snapshot.get("camera_ids")
+  config_uids = snapshot.get("config_uids")
+
+  uids = []
+  for idx, link in enumerate(camera_links):
+    uid = None
+    if isinstance(link, dict):
+      uid = link.get("uid")
+    if not uid and isinstance(config_uids, list) and idx < len(config_uids):
+      uid = config_uids[idx]
+    uids.append(uid)
+
+  if isinstance(camera_ids, list) and uids and all(uids):
+    id_set = set(camera_ids)
+    return ["ok" if uid in id_set else "err" for uid in uids]
+
+  index_map = snapshot.get("index_map")
+  if isinstance(index_map, list):
+    active = {idx for idx in index_map if isinstance(idx, int)}
+    return ["ok" if idx in active else "err" for idx in range(n)]
+
+  jpeg_present = snapshot.get("jpeg_present")
+  if isinstance(jpeg_present, list) and len(jpeg_present) == n:
+    return ["ok" if present else "err" for present in jpeg_present]
+
+  return None
+
+
 _PLC_TAG_META_KEYS = frozenset({
   "timestamp",
   "everguard_srvtime",

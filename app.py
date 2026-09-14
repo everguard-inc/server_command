@@ -35,6 +35,7 @@ from servers_cfg import (
     SKIP_STREAM_HOSTS,
     SYS_MONITOR_SERVICE,
     apply_sys_monitor_peer_status,
+    camera_statuses_from_stream,
     empty_plc_tag_metrics,
     fetch_plc_tag_metrics,
     empty_camera_drift_metrics,
@@ -47,6 +48,7 @@ from servers_cfg import (
     plc_cv_checkers_url_for,
     drift_service_url_for,
     repo_path_for_pipeline,
+    stream_camera_snapshot,
     stream_feed_paths_for,
     tcp_reachable,
 )
@@ -304,11 +306,15 @@ def _camera_links_from_cfg(cfg):
         host = _url_hostname(url)
         if not host:
             continue
-        links.append({
+        link = {
             "url": _device_ip_link(url),
             "label": host,
             "title": cam.get("name") or host,
-        })
+        }
+        uid = cam.get("uid")
+        if uid:
+            link["uid"] = uid
+        links.append(link)
     return links
 
 
@@ -526,34 +532,22 @@ def _auth_for(user, password, auth):
     return httpx.BasicAuth(user, password)
 
 
-def _camera_count_from_sse(line):
+def _stream_snapshot_from_sse(line):
+    """Parse one SSE data line into a lightweight camera snapshot, or None."""
     if not line.startswith("data:"):
         return None
     payload = json.loads(line[5:].strip())
-    camera_ids = payload.get("camera_ids")
-    if isinstance(camera_ids, list) and camera_ids:
-        return len(camera_ids)
-    jpeg = payload.get("jpeg")
-    if isinstance(jpeg, list):
-        return len(jpeg)
-    # PLC /stream often sends one jpeg blob plus CamN labels in states.
-    states = payload.get("states")
-    if isinstance(states, dict) and states:
-        cams = set()
-        for value in states.values():
-            label = ""
-            if isinstance(value, (list, tuple)) and value:
-                label = str(value[0] or "")
-            elif isinstance(value, str):
-                label = value
-            match = re.match(r"Cam\s*(\d+)", label, re.I)
-            if match:
-                cams.add(match.group(1))
-        if cams:
-            return len(cams)
-    if isinstance(jpeg, str) and jpeg:
-        return 1
-    return None
+    snap = stream_camera_snapshot(payload)
+    if not snap:
+        return None
+    if (
+        snap.get("cameras_now") is None
+        and snap.get("camera_ids") is None
+        and not snap.get("index_map")
+        and not snap.get("jpeg_present")
+    ):
+        return None
+    return snap
 
 
 def _dedupe_preserve_order(items, skip_falsy=False):
@@ -577,7 +571,11 @@ def _stream_probe_hosts(item):
 
 
 def _probe_stream_at_host(host, port, feed_paths=None):
-    """Probe SSE feed paths. /health is optional (PLC has feed without /health)."""
+    """Probe SSE feed paths. /health is optional (PLC has feed without /health).
+
+    Returns (health_ok, stream_snapshot_or_None). Snapshot has cameras_now and
+    fields needed to map per-camera ok/err without keeping jpeg blobs.
+    """
     base = f"http://{host}:{port}"
     paths = feed_paths or (DEFAULT_STREAM_FEED_PATH, ALT_STREAM_FEED_PATH)
     for path in paths:
@@ -595,9 +593,9 @@ def _probe_stream_at_host(host, port, feed_paths=None):
                             break
                         if not line:
                             continue
-                        count = _camera_count_from_sse(line.strip())
-                        if count is not None:
-                            return True, count
+                        snap = _stream_snapshot_from_sse(line.strip())
+                        if snap is not None:
+                            return True, snap
             return True, None
         except (httpx.HTTPError, json.JSONDecodeError, ValueError, TypeError):
             continue
@@ -615,9 +613,9 @@ def _probe_local_stream(port, hosts=None, feed_paths=None):
     if not port:
         return False, None
     for host in hosts or ["127.0.0.1"]:
-        health_ok, cameras_now = _probe_stream_at_host(host, port, feed_paths)
+        health_ok, snap = _probe_stream_at_host(host, port, feed_paths)
         if health_ok:
-            return True, cameras_now
+            return True, snap
     return False, None
 
 
@@ -825,6 +823,7 @@ def _container_memory_map_cached(interval_sec):
 def _invalidate_probe_caches():
     with _probe_cache_lock:
         _stream_probe_cache.clear()
+        _camera_probe_cache.clear()
         _docker_stats_cache["at"] = 0.0
         _docker_stats_cache["map"] = {}
 
@@ -852,10 +851,39 @@ def _cached_probe_local_stream(item, interval_sec):
         if cached and (now - cached[0]) < interval_sec:
             return cached[1], cached[2]
 
-    health_ok, cameras_now = _probe_local_stream(port, hosts, feed_paths)
+    health_ok, snap = _probe_local_stream(port, hosts, feed_paths)
     with _probe_cache_lock:
-        _stream_probe_cache[key] = (now, health_ok, cameras_now)
-    return health_ok, cameras_now
+        _stream_probe_cache[key] = (now, health_ok, snap)
+    return health_ok, snap
+
+
+def _apply_stream_camera_metrics(entry, item, snap):
+    """Prefer eg_pipeline SSE presence over RTSP TCP probes for C-chip / WARN."""
+    camera_links = item.get("camera_links") or []
+    cameras_now = (snap or {}).get("cameras_now") if snap else None
+    statuses = camera_statuses_from_stream(snap, camera_links) if snap else None
+
+    if statuses is not None:
+        entry["camera_status"] = statuses
+        entry["cameras_now"] = sum(1 for status in statuses if status == "ok")
+        return True
+
+    if cameras_now is not None and not camera_links:
+        entry["cameras_now"] = cameras_now
+        return True
+
+    # Stream is up but cannot map per-camera slots — avoid flaky RTSP TCP.
+    # Align chips to stream count so WARN tracks pipeline reality.
+    if cameras_now is not None and camera_links:
+        total = len(camera_links)
+        ok_n = max(0, min(int(cameras_now), total))
+        entry["cameras_now"] = ok_n
+        entry["camera_status"] = [
+            "ok" if idx < ok_n else "err" for idx in range(total)
+        ]
+        return True
+
+    return False
 
 
 def _matching_camera_drift_container(running_names, mem_map=None):
@@ -1296,6 +1324,7 @@ def service_pipeline(
     if command == "stop":
         if not running:
             return "Already stopped"
+        _invalidate_probe_caches()
         result = _run_systemctl("stop", service_name)
         if result.returncode != 0:
             return _systemctl_fail_message(result)
@@ -1305,6 +1334,7 @@ def service_pipeline(
             )
         return "Succeed"
     if command == "restart":
+        _invalidate_probe_caches()
         if server_id:
             if running or _is_pipeline_container_running(server_id, is_rtls, is_sys_monitor):
                 stop_result = _run_systemctl("stop", service_name)
@@ -2661,16 +2691,31 @@ def _populate_camera_drift_metrics(entry, item):
       entry["url"] = base
 
 
+def _set_camera_chips_idle(entry, item):
+    """Gray out C-chips when stream is down (e.g. restart); do not probe RTSP."""
+    camera_links = item.get("camera_links") or []
+    if camera_links:
+        entry["camera_status"] = ["idle"] * len(camera_links)
+        entry["cameras_now"] = 0
+        return
+    if entry.get("cameras_set"):
+        entry["cameras_now"] = 0
+
+
 def _populate_stream_metrics(entry, item, probe_cfg):
-    health_ok, cameras_now = _cached_probe_local_stream(
+    health_ok, snap = _cached_probe_local_stream(
         item, probe_cfg["stream_probe_interval_sec"],
     )
     if health_ok:
         entry["stream_health"] = True
         entry["running"] = True
-    if cameras_now is not None and not (item.get("camera_links") or []):
-        entry["cameras_now"] = cameras_now
-    _set_camera_status(entry, item)
+        if _apply_stream_camera_metrics(entry, item, snap):
+            return
+        # Stream up but unmappable slots — RTSP TCP only as last resort.
+        _set_camera_status(entry, item)
+        return
+    # Stream unavailable (restart / down): idle chips, not camera-port green.
+    _set_camera_chips_idle(entry, item)
 
 
 def _populate_plc_cv_metrics(entry, item, probe_cfg):

@@ -1183,7 +1183,70 @@ function showPingModal(host, state, detail, openUrl) {
 }
 
 function setCameraLiveImageVisible(visible) {
-	$("camera_live_img").classList.toggle("hidden", !visible);
+	const stage = $("camera_live_stage");
+	const img = $("camera_live_img");
+	if (stage) stage.classList.toggle("hidden", !visible);
+	if (img) img.classList.toggle("hidden", !visible);
+}
+
+function clearCameraLiveRois() {
+	const canvas = $("camera_live_rois");
+	if (!canvas) return;
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return;
+	ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+const ROI_STROKE_COLORS = {
+	RED: "#ef4444",
+	GREEN: "#22c55e",
+	YELLOW: "#eab308",
+	ORANGE: "#f59e0b",
+	AMBER: "#f59e0b",
+	BLUE: "#38bdf8",
+	WHITE: "#f8fafc",
+};
+
+function roiStrokeColor(roi) {
+	const color = String(roi?.color || "").toUpperCase();
+	if (ROI_STROKE_COLORS[color]) return ROI_STROKE_COLORS[color];
+	return roi?.on ? "#f59e0b" : "#94a3b8";
+}
+
+function drawCameraLiveRois(rois) {
+	const img = $("camera_live_img");
+	const canvas = $("camera_live_rois");
+	if (!img || !canvas) return;
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return;
+	const w = img.clientWidth || img.naturalWidth || 0;
+	const h = img.clientHeight || img.naturalHeight || 0;
+	if (w < 2 || h < 2) {
+		clearCameraLiveRois();
+		return;
+	}
+	if (canvas.width !== w || canvas.height !== h) {
+		canvas.width = w;
+		canvas.height = h;
+	}
+	ctx.clearRect(0, 0, w, h);
+	if (!Array.isArray(rois) || !rois.length) return;
+	rois.forEach((roi) => {
+		if (!roi || !roi.on) return;
+		const pts = Array.isArray(roi?.points) ? roi.points : [];
+		if (pts.length < 3) return;
+		ctx.beginPath();
+		pts.forEach((pt, idx) => {
+			const x = Number(pt[0]) * w;
+			const y = Number(pt[1]) * h;
+			if (idx === 0) ctx.moveTo(x, y);
+			else ctx.lineTo(x, y);
+		});
+		ctx.closePath();
+		ctx.strokeStyle = roiStrokeColor(roi);
+		ctx.lineWidth = 2;
+		ctx.stroke();
+	});
 }
 
 function clearCameraLiveLamps() {
@@ -1239,9 +1302,13 @@ function stopCameraLiveStream() {
 		cameraLiveSource = null;
 	}
 	const img = $("camera_live_img");
+	img.onload = null;
 	img.removeAttribute("src");
 	setCameraLiveImageVisible(false);
+	clearCameraLiveRois();
 	clearCameraLiveLamps();
+	const stage = $("camera_live_stage");
+	if (stage) stage.classList.remove("camera-live-stage--native");
 }
 
 function closeCameraLive() {
@@ -3272,6 +3339,29 @@ function resetCameraDrift(camUid, pipeline, btn) {
 	});
 }
 
+function setCameraLiveDialogSize(pipeline) {
+	const dialog = $("camera_live_modal")?.querySelector(".overlay__dialog");
+	const stage = $("camera_live_stage");
+	if (!dialog) return;
+	const isPlcCv = pipelineRuntimeFlags(pipeline).isPlcCv
+		|| /plc-cv|cv-plc|plc_cv/i.test(String(pipeline || ""));
+	// PLC-CV → 480px + native (1:1, shrink only if wider than dialog).
+	// Other camera feeds → wide dialog, fill width.
+	dialog.classList.toggle("overlay__dialog--wide", !isPlcCv);
+	if (stage) stage.classList.toggle("camera-live-stage--native", isPlcCv);
+}
+
+/** Valid FPS label, or null for empty/0 (show "Live" until a real value arrives). */
+function cameraLiveFpsLabel(raw) {
+	if (raw == null) return null;
+	const text = String(raw).trim();
+	if (!text) return null;
+	if (/^rtsp$/i.test(text)) return text;
+	const num = Number(text);
+	if (!Number.isFinite(num) || num <= 0) return null;
+	return text;
+}
+
 function openCameraLive(pipeline, camIndex, title, signIds) {
 	stopCameraLiveStream();
 	const img = $("camera_live_img");
@@ -3282,7 +3372,9 @@ function openCameraLive(pipeline, camIndex, title, signIds) {
 	);
 	status.textContent = "Connecting…";
 	clearCameraLiveLamps();
+	clearCameraLiveRois();
 	setCameraLiveImageVisible(false);
+	setCameraLiveDialogSize(pipeline);
 	setOverlayVisible($("camera_live_modal"), true);
 
 	const signs = Array.isArray(signIds)
@@ -3294,6 +3386,11 @@ function openCameraLive(pipeline, camIndex, title, signIds) {
 	}
 	let receivedFrame = false;
 	let lastFps = null;
+	let lastRois = null;
+	img.onload = function () {
+		// Layout may shrink oversized frames (max-width:100%); redraw ROIs after.
+		requestAnimationFrame(() => drawCameraLiveRois(lastRois));
+	};
 	cameraLiveSource = new EventSource(feedUrl);
 	cameraLiveSource.onmessage = function (event) {
 		let data = {};
@@ -3306,21 +3403,21 @@ function openCameraLive(pipeline, camIndex, title, signIds) {
 			status.textContent = data.error;
 			setCameraLiveImageVisible(false);
 			clearCameraLiveLamps();
+			clearCameraLiveRois();
 			return;
 		}
 		if (data.jpeg) {
 			receivedFrame = true;
+			lastRois = Array.isArray(data.rois) ? data.rois : null;
 			img.src = `data:image/jpeg;base64,${data.jpeg}`;
 			setCameraLiveImageVisible(true);
-			// PLC /stream often sends fps as "" on most frames — keep last value.
-			const fps = data.fps;
-			if (fps != null && String(fps).trim() !== "") {
-				lastFps = fps;
-			}
+			const fpsLabel = cameraLiveFpsLabel(data.fps);
+			if (fpsLabel != null) lastFps = fpsLabel;
 			status.textContent = lastFps != null ? `FPS: ${lastFps}` : "Live";
 			if (Object.prototype.hasOwnProperty.call(data, "lamps")) {
 				renderCameraLiveLamps(data.lamps);
 			}
+			if (img.complete) drawCameraLiveRois(lastRois);
 		} else if (!receivedFrame) {
 			status.textContent = "Waiting for frame…";
 		}

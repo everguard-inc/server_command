@@ -309,8 +309,9 @@ def _camera_rtsp_from_status(pipeline_name, cam_idx):
   url = (link or {}).get("url") or ""
   if url.lower().startswith("rtsp"):
     return url
-  host = (link or {}).get("label")
-  if host:
+  # Chip labels like "Cam111" are not RTSP hosts.
+  host = str((link or {}).get("label") or "").strip()
+  if host and _cam_number_from_text(host) is None and "://" not in host:
     return f"rtsp://{host}:554/"
   return None
 
@@ -534,12 +535,59 @@ def _plc_jpeg_by_cam_map(payload):
   return {}
 
 
+def _plc_sign_cameras_map(payload):
+  """sign_id → camera uid (PLC /stream signCameras)."""
+  for key in ("signCameras", "sign_cameras", "signCameraIds"):
+    raw = payload.get(key)
+    if isinstance(raw, dict) and raw:
+      return raw
+  return {}
+
+
 def _plc_has_per_cam_frames(payload):
   by_sign = _plc_jpeg_by_sign_map(payload)
   if any(isinstance(v, str) and v for v in by_sign.values()):
     return True
   by_cam = _plc_jpeg_by_cam_map(payload)
   return any(isinstance(v, str) and v for v in by_cam.values())
+
+
+def _plc_frame_via_sign_cameras(payload, *, sign_ids=None, cam_num=None):
+  """Resolve jpeg_by_cam frames keyed by camera UUID via signCameras."""
+  by_cam = _plc_jpeg_by_cam_map(payload)
+  if not by_cam:
+    return None
+  sign_cams = _plc_sign_cameras_map(payload)
+  wanted = _parse_sign_id_filter(sign_ids)
+  uids = []
+  for sid, _name, sign_cam, _color, _state in _plc_sign_entries(payload):
+    if wanted is not None and sid not in wanted:
+      continue
+    if cam_num is not None and sign_cam is not None and sign_cam != cam_num:
+      continue
+    uid = sign_cams.get(sid)
+    if uid and uid not in uids:
+      uids.append(uid)
+  if wanted is not None:
+    for sid in wanted:
+      uid = sign_cams.get(sid)
+      if uid and uid not in uids:
+        uids.append(uid)
+  for uid in uids:
+    frame = by_cam.get(uid)
+    if isinstance(frame, str) and frame:
+      return frame
+    frame = by_cam.get(str(uid))
+    if isinstance(frame, str) and frame:
+      return frame
+  # Single-camera desk streams often key jpeg_by_cam only by UUID.
+  if wanted is not None or cam_num is not None:
+    frames = [v for v in by_cam.values() if isinstance(v, str) and v]
+    if len(frames) == 1:
+      unique = _plc_unique_cam_numbers(payload)
+      if not unique or cam_num is None or cam_num in unique:
+        return frames[0]
+  return None
 
 
 def _plc_special_slot(payload, cam_idx, *, pipeline_name=None):
@@ -669,6 +717,9 @@ def _plc_roi_frame_from_payload(payload, cam_idx, *, pipeline_name=None, sign_id
     frame = _plc_roi_frame_from_jpeg_by_sign(payload, None, sign_ids=wanted)
     if frame:
       return frame
+    frame = _plc_frame_via_sign_cameras(payload, sign_ids=wanted)
+    if frame:
+      return frame
 
   cam_num = _plc_resolve_cam_number(
     payload, cam_idx, pipeline_name=pipeline_name,
@@ -676,6 +727,11 @@ def _plc_roi_frame_from_payload(payload, cam_idx, *, pipeline_name=None, sign_id
   by_cam = _plc_jpeg_by_cam_map(payload)
   if by_cam:
     frame = _lookup_cam_keyed_frame(by_cam, cam_num, cam_idx)
+    if frame:
+      return frame
+    frame = _plc_frame_via_sign_cameras(
+      payload, sign_ids=wanted, cam_num=cam_num,
+    )
     if frame:
       return frame
   return _plc_roi_frame_from_jpeg_by_sign(payload, cam_num, sign_ids=wanted)
@@ -735,6 +791,46 @@ def _lamp_judgments_from_payload(
   return _lamps_public(lamps)
 
 
+def _plc_rois_for_event(payload, cam_idx, *, pipeline_name=None, sign_ids=None):
+  """Normalized ROI polygons for the C-chip's signs (PLC /stream rois)."""
+  raw = payload.get("rois")
+  if not isinstance(raw, dict) or not raw:
+    return None
+  wanted = _parse_sign_id_filter(sign_ids)
+  cam_num = _plc_resolve_cam_number(
+    payload, cam_idx, pipeline_name=pipeline_name,
+  )
+  out = []
+  for sid, name, sign_cam, color, state in _plc_sign_entries(payload):
+    if wanted is not None and sid not in wanted:
+      continue
+    if wanted is None and cam_num is not None and sign_cam != cam_num:
+      continue
+    verts = raw.get(sid)
+    if not isinstance(verts, list) or len(verts) < 3:
+      continue
+    points = []
+    for pt in verts:
+      if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+        continue
+      try:
+        points.append([float(pt[0]), float(pt[1])])
+      except (TypeError, ValueError):
+        continue
+    if len(points) < 3:
+      continue
+    if not _lamp_is_on(state):
+      continue
+    out.append({
+      "id": sid,
+      "name": name,
+      "color": color or "",
+      "on": True,
+      "points": points,
+    })
+  return out or None
+
+
 def _camera_feed_event(payload, cam_idx, *, pipeline_name=None, sign_ids=None):
   frame = _camera_frame_from_payload(
     payload, cam_idx, pipeline_name=pipeline_name, sign_ids=sign_ids,
@@ -747,6 +843,11 @@ def _camera_feed_event(payload, cam_idx, *, pipeline_name=None, sign_ids=None):
   )
   if lamps is not None:
     event["lamps"] = lamps
+  rois = _plc_rois_for_event(
+    payload, cam_idx, pipeline_name=pipeline_name, sign_ids=sign_ids,
+  )
+  if rois:
+    event["rois"] = rois
   return event
 
 

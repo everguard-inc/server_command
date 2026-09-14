@@ -1723,9 +1723,34 @@ body.overlay-scroll-lock {
 }
 
 .overlay__body--media {
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+.camera-live-stage {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto;
+  line-height: 0;
+  background: var(--surface-deep);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.camera-live-stage.hidden {
+  display: none;
+}
+
+/* Prefer intrinsic size; shrink only when wider than the dialog. */
+.camera-live-stage--native {
+  width: fit-content;
+  max-width: 100%;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .overlay__body--media img {
@@ -1739,10 +1764,29 @@ body.overlay-scroll-lock {
 }
 
 #camera_live_img {
-  width: 200px;
-  max-width: 200px;
+  width: auto;
+  max-width: 100%;
   height: auto;
-  margin: 0 auto;
+  margin: 0;
+}
+
+.camera-live-stage:not(.camera-live-stage--native) #camera_live_img {
+  width: 100%;
+}
+
+.camera-live-stage--native #camera_live_img {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: calc(100vh - 180px);
+}
+
+.camera-live-rois {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .overlay__footer {
