@@ -1727,7 +1727,10 @@ function resetDriftPairLoading() {
 
 function isDriftCameraTag(tag) {
 	const value = String((tag && tag.value) || "").trim().toLowerCase();
-	return value === "drift" || (tag && tag.health === "err" && value !== "ok");
+	if (value === "hold" || value === "deferred" || value === "pending" || value === "보류") {
+		return false;
+	}
+	return value === "drift" || (tag && tag.health === "err" && value !== "ok" && value !== "off");
 }
 
 function isOfflineCameraTag(tag) {
@@ -3161,6 +3164,15 @@ function renderPlcTagValue(tag) {
 	} else if (tag.health === "err" || lower === "error" || lower === "drift") {
 		tone = "err";
 		if (lower === "drift") display = "DRIFT";
+	} else if (
+		tag.health === "warn"
+		|| lower === "hold"
+		|| lower === "deferred"
+		|| lower === "pending"
+		|| lower === "보류"
+	) {
+		tone = "warn";
+		display = "HOLD";
 	} else if (lower === "off" || lower === "offline") {
 		tone = "idle";
 		display = "OFF";
@@ -3182,9 +3194,15 @@ function ipv4SortKeyFromText(text) {
 }
 
 function compareDriftCameraTags(a, b) {
-	const aDrift = tagValueLower(a) === "drift" ? 0 : 1;
-	const bDrift = tagValueLower(b) === "drift" ? 0 : 1;
-	if (aDrift !== bDrift) return aDrift - bDrift;
+	const rank = (tag) => {
+		const v = tagValueLower(tag);
+		if (v === "drift") return 0;
+		if (v === "hold" || v === "deferred" || v === "pending" || v === "보류") return 1;
+		return 2;
+	};
+	const aRank = rank(a);
+	const bRank = rank(b);
+	if (aRank !== bRank) return aRank - bRank;
 	const aKey = ipv4SortKeyFromText(a?.name);
 	const bKey = ipv4SortKeyFromText(b?.name);
 	for (let i = 0; i < aKey.length; i += 1) {

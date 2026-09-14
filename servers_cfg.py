@@ -640,12 +640,17 @@ def _ipv4_sort_key(text):
 
 
 def _drift_tag_sort_key(tag):
-  """DRIFT first; otherwise numeric IP ascending."""
+  """DRIFT first, then HOLD (보류), otherwise numeric IP ascending."""
   value = str((tag or {}).get("value") or "").strip().lower()
-  drifted = 0 if value == "drift" else 1
+  if value == "drift":
+    rank = 0
+  elif value in ("hold", "deferred", "pending", "보류"):
+    rank = 1
+  else:
+    rank = 2
   name = str((tag or {}).get("name") or "")
   found, ip_parts, label = _ipv4_sort_key(name)
-  return (drifted, found, ip_parts, label.lower())
+  return (rank, found, ip_parts, label.lower())
 
 
 def _drift_area_key(cam):
@@ -666,21 +671,35 @@ def _is_camera_online(cam):
   return str((cam or {}).get("status") or "").strip().lower() == "online"
 
 
-def _drift_tag_fields(is_drift, is_online):
-  """Return (value, health, title_state, area_chip_state). OFF never warns chips."""
+def _drift_tag_fields(is_drift, is_online, eval_status=None):
+  """Return (value, health, title_state, area_chip_state).
+
+  DRIFT → red (err). HOLD/deferred/pending (보류) → yellow (warn).
+  OFF never warns chips.
+  """
   if is_drift:
     return "DRIFT", "err", "Drifted", "err"
+  status = str(eval_status or "").strip().lower()
+  if status in ("deferred", "pending", "hold"):
+    return "HOLD", "warn", "Hold", "warn"
   if not is_online:
     return "OFF", "idle", "Offline", "ok"
   return "OK", "ok", "OK", "ok"
 
 
-def _drift_area_chip_health(drifted, total):
-  if drifted <= 0:
-    return "ok"
-  if total and drifted >= total:
+def _drift_area_chip_health(drifted, held, total):
+  """Any drift → red; else any hold (보류) → yellow; else ok."""
+  if drifted > 0:
     return "err"
-  return "warn"
+  if held > 0:
+    return "warn"
+  return "ok"
+
+
+def _drift_eval_is_hold(eval_status):
+  return str(eval_status or "").strip().lower() in (
+    "deferred", "pending", "hold",
+  )
 
 
 def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
@@ -738,9 +757,11 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
       continue
     is_drift = cid in drifted_ids or bool(cam.get("isDrift"))
     is_online = _is_camera_online(cam)
+    eval_status = cam.get("eval_status")
+    is_hold = (not is_drift) and _drift_eval_is_hold(eval_status)
     name = str(cam.get("display_name") or cam.get("name") or cid).strip()
     tag_value, tag_health, title_state, chip_state = _drift_tag_fields(
-      is_drift, is_online,
+      is_drift, is_online, eval_status,
     )
     tag = {
       "name": name,
@@ -749,10 +770,14 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
       "id": cid,
     }
     top = _drift_area_key(cam)
-    area = areas.setdefault(top, {"now": 0, "set": 0, "tags": []})
+    area = areas.setdefault(
+      top, {"now": 0, "hold": 0, "set": 0, "tags": []},
+    )
     area["set"] += 1
     if is_drift:
       area["now"] += 1
+    elif is_hold:
+      area["hold"] += 1
     area["tags"].append(tag)
     flat_links.append({
       "label": _drift_camera_short_label(cam),
@@ -785,11 +810,17 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     area = areas[area_name]
     area["tags"].sort(key=_drift_tag_sort_key)
     area_now = area["now"]
+    area_hold = area["hold"]
     area_set = area["set"]
-    chip_status.append(_drift_area_chip_health(area_now, area_set))
+    chip_status.append(
+      _drift_area_chip_health(area_now, area_hold, area_set),
+    )
     chip_links.append({
       "label": area_name,
-      "title": f"{area_name}: {area_now} drifted / {area_set} cameras",
+      "title": (
+        f"{area_name}: {area_now} drifted"
+        f" / {area_hold} hold / {area_set} cameras"
+      ),
       "url": f"{root}/get_drift",
       "value": area_name,
       "location": "Drift",
@@ -1271,8 +1302,14 @@ def finalize_pipeline_status(entry):
       return entry
     drift_count = entry.get("drift_cameras_now") or 0
     drift_status = str(entry.get("drift_status") or "").upper()
+    hold_count = sum(
+      1 for status in (entry.get("drift_camera_status") or [])
+      if status == "warn"
+    )
     entry["status"] = (
-      "WARN" if drift_count > 0 or drift_status not in ("", "OK") else "OK"
+      "WARN"
+      if drift_count > 0 or hold_count > 0 or drift_status not in ("", "OK")
+      else "OK"
     )
     return entry
 
