@@ -640,14 +640,16 @@ def _ipv4_sort_key(text):
 
 
 def _drift_tag_sort_key(tag):
-  """DRIFT first, then HOLD (보류), otherwise numeric IP ascending."""
+  """DRIFT → BLUR → HOLD → others; then numeric IP ascending."""
   value = str((tag or {}).get("value") or "").strip().lower()
   if value == "drift":
     rank = 0
-  elif value in ("hold", "deferred", "pending", "보류"):
+  elif value in ("blur", "focus", "lost_focus"):
     rank = 1
-  else:
+  elif value in ("hold", "deferred", "보류"):
     rank = 2
+  else:
+    rank = 3
   name = str((tag or {}).get("name") or "")
   found, ip_parts, label = _ipv4_sort_key(name)
   return (rank, found, ip_parts, label.lower())
@@ -671,35 +673,52 @@ def _is_camera_online(cam):
   return str((cam or {}).get("status") or "").strip().lower() == "online"
 
 
-def _drift_tag_fields(is_drift, is_online, eval_status=None):
+def _drift_flag_true(val):
+  if val is True:
+    return True
+  if val is False or val is None:
+    return False
+  return str(val).strip().lower() in ("1", "true", "yes")
+
+
+def _drift_id_set(raw):
+  if not isinstance(raw, list):
+    return set()
+  return {str(cid).strip() for cid in raw if str(cid).strip()}
+
+
+def _drift_tag_fields(is_drift, is_blur, is_online, eval_status=None):
   """Return (value, health, title_state, area_chip_state).
 
-  DRIFT → red (err). HOLD/deferred/pending (보류) → yellow (warn).
-  OFF never warns chips.
+  DRIFT (abnormal) → red. BLUR (blur_cameras / lost focus) → yellow.
+  Deferred HOLD → info (blue). Pending stays OK/OFF.
   """
   if is_drift:
     return "DRIFT", "err", "Drifted", "err"
+  if is_blur:
+    return "BLUR", "warn", "Blur", "warn"
   status = str(eval_status or "").strip().lower()
-  if status in ("deferred", "pending", "hold"):
-    return "HOLD", "warn", "Hold", "warn"
+  if status in ("deferred", "hold"):
+    return "HOLD", "info", "Hold", "info"
   if not is_online:
     return "OFF", "idle", "Offline", "ok"
   return "OK", "ok", "OK", "ok"
 
 
-def _drift_area_chip_health(drifted, held, total):
-  """Any drift → red; else any hold (보류) → yellow; else ok."""
+def _drift_area_chip_health(drifted, blurred, held, total):
+  """Drift → red; blur → yellow; deferred hold → info; else ok."""
   if drifted > 0:
     return "err"
-  if held > 0:
+  if blurred > 0:
     return "warn"
+  if held > 0:
+    return "info"
   return "ok"
 
 
 def _drift_eval_is_hold(eval_status):
-  return str(eval_status or "").strip().lower() in (
-    "deferred", "pending", "hold",
-  )
+  # Only deferred/hold = 보류. pending = waiting for first compare pair.
+  return str(eval_status or "").strip().lower() in ("deferred", "hold")
 
 
 def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
@@ -738,12 +757,11 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     return empty
 
   abnormal = drift_payload.get("abnormal_cameras") or []
-  if not isinstance(abnormal, list):
-    abnormal = []
-  drifted_ids = {str(cid).strip() for cid in abnormal if str(cid).strip()}
+  drifted_ids = _drift_id_set(abnormal)
+  blur_ids = _drift_id_set(drift_payload.get("blur_cameras"))
   for cam in cameras:
     cid = str(cam.get("id") or "").strip()
-    if cid and cam.get("isDrift"):
+    if cid and _drift_flag_true(cam.get("isDrift")):
       drifted_ids.add(cid)
 
   preferred_chip_order = ("RND", "LBC", "PC2")
@@ -755,13 +773,16 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     cid = str(cam.get("id") or "").strip()
     if not cid:
       continue
-    is_drift = cid in drifted_ids or bool(cam.get("isDrift"))
+    is_drift = cid in drifted_ids
+    is_blur = (not is_drift) and cid in blur_ids
     is_online = _is_camera_online(cam)
     eval_status = cam.get("eval_status")
-    is_hold = (not is_drift) and _drift_eval_is_hold(eval_status)
+    is_hold = (
+      (not is_drift) and (not is_blur) and _drift_eval_is_hold(eval_status)
+    )
     name = str(cam.get("display_name") or cam.get("name") or cid).strip()
     tag_value, tag_health, title_state, chip_state = _drift_tag_fields(
-      is_drift, is_online, eval_status,
+      is_drift, is_blur, is_online, eval_status,
     )
     tag = {
       "name": name,
@@ -771,11 +792,13 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     }
     top = _drift_area_key(cam)
     area = areas.setdefault(
-      top, {"now": 0, "hold": 0, "set": 0, "tags": []},
+      top, {"now": 0, "blur": 0, "hold": 0, "set": 0, "tags": []},
     )
     area["set"] += 1
     if is_drift:
       area["now"] += 1
+    elif is_blur:
+      area["blur"] += 1
     elif is_hold:
       area["hold"] += 1
     area["tags"].append(tag)
@@ -788,7 +811,7 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     })
     flat_statuses.append(chip_state)
 
-  # Empty /api/cameras: surface drifted IDs from /get_drift only.
+  # Empty /api/cameras: surface drifted/blurred IDs from /get_drift only.
   if not cameras:
     for cid in sorted(drifted_ids):
       flat_links.append({
@@ -799,6 +822,15 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
         "url": root,
       })
       flat_statuses.append("err")
+    for cid in sorted(blur_ids - drifted_ids):
+      flat_links.append({
+        "label": _drift_camera_short_label({"id": cid}),
+        "title": f"Blur camera: {cid}",
+        "value": cid,
+        "id": cid,
+        "url": root,
+      })
+      flat_statuses.append("warn")
 
   chip_status = []
   chip_links = []
@@ -810,16 +842,17 @@ def fetch_camera_drift_metrics(base_url, *, timeout=10.0):
     area = areas[area_name]
     area["tags"].sort(key=_drift_tag_sort_key)
     area_now = area["now"]
+    area_blur = area["blur"]
     area_hold = area["hold"]
     area_set = area["set"]
     chip_status.append(
-      _drift_area_chip_health(area_now, area_hold, area_set),
+      _drift_area_chip_health(area_now, area_blur, area_hold, area_set),
     )
     chip_links.append({
       "label": area_name,
       "title": (
         f"{area_name}: {area_now} drifted"
-        f" / {area_hold} hold / {area_set} cameras"
+        f" / {area_blur} blur / {area_hold} hold / {area_set} cameras"
       ),
       "url": f"{root}/get_drift",
       "value": area_name,
@@ -1302,13 +1335,14 @@ def finalize_pipeline_status(entry):
       return entry
     drift_count = entry.get("drift_cameras_now") or 0
     drift_status = str(entry.get("drift_status") or "").upper()
-    hold_count = sum(
+    # HOLD (info) is deferred eval — do not raise service WARN.
+    attention = sum(
       1 for status in (entry.get("drift_camera_status") or [])
-      if status == "warn"
+      if status in ("err", "warn")
     )
     entry["status"] = (
       "WARN"
-      if drift_count > 0 or hold_count > 0 or drift_status not in ("", "OK")
+      if drift_count > 0 or attention > 0 or drift_status not in ("", "OK")
       else "OK"
     )
     return entry

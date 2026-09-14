@@ -8,6 +8,12 @@ DEFAULT_GIT_VERSION_TIMEOUT = 12
 # Prefer these when current checkout has no usable upstream on origin.
 _DEFAULT_REMOTE_BRANCH_FALLBACKS = ("main", "master")
 
+# Bare clones used to resolve commit dates when only a remote URL is available.
+_VERSION_CACHE_ROOT = os.environ.get(
+  "SERVER_COMMAND_VERSION_CACHE",
+  os.path.join(os.path.expanduser("~"), ".cache", "server_command", "git_versions"),
+)
+
 
 def is_git_repo_dir(path):
   return bool(path and os.path.isdir(os.path.join(path, ".git")))
@@ -137,6 +143,73 @@ def git_commit_date(repo_path, ref, *, timeout=None, env=None, git_cmd=None):
   return text[:16] if text else None
 
 
+def _repo_name_from_remote_url(remote_url):
+  repo_basename = str(remote_url or "").rstrip("/")
+  if repo_basename.endswith(".git"):
+    repo_basename = repo_basename[:-4]
+  return os.path.basename(repo_basename) or "repo"
+
+
+def _version_cache_bare_path(remote_url):
+  name = _repo_name_from_remote_url(remote_url)
+  safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in name)
+  return os.path.join(_VERSION_CACHE_ROOT, f"{safe}.git")
+
+
+def git_commit_date_from_remote(
+  remote_url,
+  full_sha,
+  *,
+  timeout=DEFAULT_GIT_VERSION_TIMEOUT,
+  env=None,
+):
+  """Resolve commit date for a SHA when no local checkout exists.
+
+  Uses a persistent bare cache under ~/.cache/server_command/git_versions and
+  shallow-fetches the object (same credentials as ls-remote).
+  """
+  if not remote_url or not full_sha:
+    return None
+  bare = _version_cache_bare_path(remote_url)
+  try:
+    os.makedirs(_VERSION_CACHE_ROOT, exist_ok=True)
+  except OSError:
+    return None
+
+  run_env = {**(env or os.environ), "GIT_TERMINAL_PROMPT": "0"}
+  if not os.path.isdir(bare):
+    init = subprocess.run(
+      ["git", "init", "--bare", bare],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      text=True,
+      timeout=timeout,
+      env=run_env,
+    )
+    if init.returncode != 0:
+      return None
+
+  # Already fetched?
+  date = git_commit_date(bare, full_sha, timeout=timeout, env=run_env)
+  if date:
+    return date
+
+  fetch = subprocess.run(
+    [
+      "git", "-C", bare, "fetch", "--depth=1", "--quiet",
+      remote_url, full_sha,
+    ],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    timeout=timeout,
+    env=run_env,
+  )
+  if fetch.returncode != 0:
+    return None
+  return git_commit_date(bare, full_sha, timeout=timeout, env=run_env)
+
+
 def read_local_repo_versions(
   repo_path,
   *,
@@ -206,19 +279,18 @@ def read_repo_latest(repo_path, *, git_cmd=None, remote_url=None, timeout=DEFAUL
   if not remote_url:
     return None, None
   preferred = None
-  # Python 3.8 has no str.removesuffix
-  repo_basename = str(remote_url).rstrip("/")
-  if repo_basename.endswith(".git"):
-    repo_basename = repo_basename[:-4]
-  repo_name = os.path.basename(repo_basename)
+  repo_name = _repo_name_from_remote_url(remote_url)
   if repo_name == "forklift_proximity":
     preferred = ("forklift_proximity", "main", "master")
-  _full_sha, latest = git_ls_remote_url(
+  full_sha, latest = git_ls_remote_url(
     remote_url, timeout=timeout, preferred_branches=preferred,
   )
   if not latest:
     return None, None
-  return latest, None
+  latest_date = git_commit_date_from_remote(
+    remote_url, full_sha, timeout=timeout,
+  )
+  return latest, latest_date
 
 
 def parse_ls_remote_heads(text, preferred_branches=None):

@@ -9,6 +9,7 @@
   --accent: #60a5fa;
   --ok: #4ade80;
   --warn: #fbbf24;
+  --info: #38bdf8;
   --idle: #64748b;
   --err: #f87171;
   --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
@@ -23,11 +24,13 @@
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --surface-ok: rgba(74, 222, 128, 0.15);
   --surface-warn: rgba(251, 191, 36, 0.15);
+  --surface-info: rgba(56, 189, 248, 0.15);
   --surface-err: rgba(248, 113, 113, 0.15);
   --surface-idle: rgba(100, 116, 139, 0.15);
   --surface-muted: rgba(148, 163, 184, 0.12);
   --border-ok: rgba(74, 222, 128, 0.35);
   --border-warn: rgba(251, 191, 36, 0.3);
+  --border-info: rgba(56, 189, 248, 0.35);
   --border-err: rgba(248, 113, 113, 0.35);
   --border-idle: rgba(100, 116, 139, 0.3);
   --border-muted: rgba(148, 163, 184, 0.22);
@@ -51,6 +54,7 @@
   --accent-update: #c4b5fd;
   --ok-deep: #16a34a;
   --warn-deep: #d97706;
+  --info-deep: #0284c7;
   --err-deep: #dc2626;
   --text-2xs: 11px;
   --text-xs: 12px;
@@ -893,9 +897,38 @@ body.overlay-scroll-lock {
   font-weight: 700;
 }
 
+.metric-nums--drift {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: flex-start;
+  gap: 2px 0;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.2;
+  min-width: 0;
+}
+
+.metric-nums--drift strong {
+  font-size: 0.85rem;
+  margin-right: 3px;
+}
+
+.metric-drift-part.err { color: var(--err); }
+.metric-drift-part.warn { color: var(--warn); }
+.metric-drift-part.info { color: var(--info); }
+.metric-drift-part.idle { color: var(--muted); }
+
 .metric-sep {
   margin: 0;
   color: var(--text-dim);
+}
+
+.metric-sep--dot {
+  margin: 0 5px;
+  color: var(--muted);
+  opacity: 0.65;
 }
 
 .metric-bar {
@@ -919,6 +952,7 @@ body.overlay-scroll-lock {
 
 .metric-fill.ok { background: linear-gradient(90deg, var(--ok), var(--ok-deep)); }
 .metric-fill.warn { background: linear-gradient(90deg, var(--warn), var(--warn-deep)); }
+.metric-fill.info { background: linear-gradient(90deg, var(--info), var(--info-deep)); }
 .metric-fill.err { background: linear-gradient(90deg, var(--err), var(--err-deep)); }
 .metric-fill.idle { background: var(--text-dim); }
 
@@ -1018,6 +1052,12 @@ body.overlay-scroll-lock {
   background: var(--surface-warn);
   border-color: var(--border-warn);
   color: var(--warn);
+}
+
+.device-chip.chip-info {
+  background: var(--surface-info);
+  border-color: var(--border-info);
+  color: var(--info);
 }
 
 .device-chip.chip-err {

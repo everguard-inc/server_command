@@ -1727,7 +1727,13 @@ function resetDriftPairLoading() {
 
 function isDriftCameraTag(tag) {
 	const value = String((tag && tag.value) || "").trim().toLowerCase();
-	if (value === "hold" || value === "deferred" || value === "pending" || value === "보류") {
+	if (
+		value === "hold"
+		|| value === "deferred"
+		|| value === "보류"
+		|| value === "blur"
+		|| value === "focus"
+	) {
 		return false;
 	}
 	return value === "drift" || (tag && tag.health === "err" && value !== "ok" && value !== "off");
@@ -3166,12 +3172,19 @@ function renderPlcTagValue(tag) {
 		if (lower === "drift") display = "DRIFT";
 	} else if (
 		tag.health === "warn"
-		|| lower === "hold"
-		|| lower === "deferred"
-		|| lower === "pending"
-		|| lower === "보류"
+		|| lower === "blur"
+		|| lower === "focus"
+		|| lower === "lost_focus"
 	) {
 		tone = "warn";
+		display = "BLUR";
+	} else if (
+		tag.health === "info"
+		|| lower === "hold"
+		|| lower === "deferred"
+		|| lower === "보류"
+	) {
+		tone = "info";
 		display = "HOLD";
 	} else if (lower === "off" || lower === "offline") {
 		tone = "idle";
@@ -3197,8 +3210,9 @@ function compareDriftCameraTags(a, b) {
 	const rank = (tag) => {
 		const v = tagValueLower(tag);
 		if (v === "drift") return 0;
-		if (v === "hold" || v === "deferred" || v === "pending" || v === "보류") return 1;
-		return 2;
+		if (v === "blur" || v === "focus" || v === "lost_focus") return 1;
+		if (v === "hold" || v === "deferred" || v === "보류") return 2;
+		return 3;
 	};
 	const aRank = rank(a);
 	const bRank = rank(b);
@@ -3238,12 +3252,18 @@ function openPlcTagModal({ title, url, tags, meta, pipeline }) {
 	const trueN = countTagsByValue(list, (v) => v === "true");
 	const falseN = countTagsByValue(list, (v) => v === "false");
 	const driftN = countTagsByValue(list, (v) => v === "drift");
+	const blurN = countTagsByValue(
+		list, (v) => v === "blur" || v === "focus" || v === "lost_focus",
+	);
+	const holdN = countTagsByValue(
+		list, (v) => v === "hold" || v === "deferred" || v === "보류",
+	);
 	const offN = countTagsByValue(list, (v) => v === "off" || v === "offline");
 	const okN = countTagsByValue(list, (v) => v === "ok");
 	const errN = list.filter((t) => t.health === "err" || tagValueLower(t) === "error").length;
-	const otherN = list.length - trueN - falseN - driftN - offN - okN - errN;
+	const otherN = list.length - trueN - falseN - driftN - blurN - holdN - offN - okN - errN;
 
-	const isDriftModal = driftN > 0 || offN > 0 || okN > 0;
+	const isDriftModal = driftN > 0 || blurN > 0 || holdN > 0 || offN > 0 || okN > 0;
 	if (isDriftModal) {
 		list = [...list].sort(compareDriftCameraTags);
 	}
@@ -3258,7 +3278,14 @@ function openPlcTagModal({ title, url, tags, meta, pipeline }) {
 	};
 	$("plc_tag_modal_title").textContent = plcTagModalState.title;
 	const parts = isDriftModal
-		? [`${list.length} cameras`, `${driftN} DRIFT`, `${offN} OFF`, `${okN} OK`]
+		? [
+			`${list.length} cameras`,
+			`${driftN} DRIFT`,
+			`${blurN} BLUR`,
+			`${holdN} HOLD`,
+			`${offN} OFF`,
+			`${okN} OK`,
+		]
 		: [`${list.length} tags`, `${trueN} true`, `${falseN} false`];
 	if (otherN > 0) parts.push(`${otherN} other`);
 	if (!isDriftModal && errN > 0) parts.push(`${errN} error`);
@@ -3738,20 +3765,22 @@ function deviceChips(prefix, statuses, links, liveOptions) {
 	return `<div class="device-chips">${chips}</div>`;
 }
 
-/** Stacked bar from chip tones: OK green / WARN yellow / ERR red / OFF gray. */
+/** Stacked bar from chip tones: OK green / WARN yellow / INFO blue / ERR red / OFF gray. */
 function metricBarSegmentsHtml(chipStatuses) {
 	const list = Array.isArray(chipStatuses) ? chipStatuses : [];
 	if (!list.length) return "";
-	const counts = { ok: 0, warn: 0, err: 0, idle: 0 };
+	const counts = { ok: 0, warn: 0, info: 0, err: 0, idle: 0 };
 	for (const status of list) {
 		if (status === "ok") counts.ok += 1;
 		else if (status === "err") counts.err += 1;
 		else if (status === "warn" || status === "unknown") counts.warn += 1;
+		else if (status === "info") counts.info += 1;
 		else counts.idle += 1;
 	}
 	const total = list.length;
 	const order = [
 		["ok", counts.ok],
+		["info", counts.info],
 		["warn", counts.warn],
 		["err", counts.err],
 		["idle", counts.idle],
@@ -3789,6 +3818,83 @@ function metricBlock(label, now, set, running, chipPrefix, chipStatuses, links, 
 	</div>`;
 }
 
+function driftIssueCountsFromTags(links) {
+	const counts = { drift: 0, blur: 0, hold: 0, off: 0 };
+	for (const link of links || []) {
+		for (const tag of link.tags || []) {
+			const v = tagValueLower(tag);
+			if (v === "drift") counts.drift += 1;
+			else if (v === "blur" || v === "focus" || v === "lost_focus") counts.blur += 1;
+			else if (v === "hold" || v === "deferred" || v === "보류") counts.hold += 1;
+			else if (v === "off" || v === "offline") counts.off += 1;
+		}
+	}
+	return counts;
+}
+
+function driftIssueCountsFromStatuses(statuses) {
+	const counts = { drift: 0, blur: 0, hold: 0, off: 0 };
+	for (const status of statuses || []) {
+		if (status === "err") counts.drift += 1;
+		else if (status === "warn" || status === "unknown") counts.blur += 1;
+		else if (status === "info") counts.hold += 1;
+		else if (status === "idle") counts.off += 1;
+	}
+	return counts;
+}
+
+function driftMetricPartHtml(n, label, tone) {
+	const cls = n > 0 ? tone : "idle";
+	return `<span class="metric-drift-part ${cls}"><strong>${n}</strong> ${label}</span>`;
+}
+
+function driftMetricNumsHtml(counts) {
+	return [
+		driftMetricPartHtml(counts.drift || 0, "DRIFT", "err"),
+		`<span class="metric-sep metric-sep--dot">·</span>`,
+		driftMetricPartHtml(counts.blur || 0, "BLUR", "warn"),
+		`<span class="metric-sep metric-sep--dot">·</span>`,
+		driftMetricPartHtml(counts.hold || 0, "HOLD", "info"),
+	].join("");
+}
+
+function driftMetricBlock({
+	total, online, counts, running, statuses, links, liveOptions,
+}) {
+	const off = counts.off != null && counts.off > 0
+		? counts.off
+		: (total != null && online != null ? Math.max(0, total - online) : null);
+	const titleParts = [];
+	if (total != null) titleParts.push(`${total} cameras`);
+	if (online != null) titleParts.push(`${online} online`);
+	if (off != null) titleParts.push(`${off} off`);
+	const title = titleParts.join(" · ");
+	const tone = !running
+		? "idle"
+		: (counts.drift > 0
+			? "err"
+			: (counts.blur > 0 ? "warn" : (counts.hold > 0 ? "info" : "ok")));
+	const chips = statuses && statuses.length
+		? deviceChips("D", statuses, links || [], liveOptions)
+		: "";
+	const segments = statuses && statuses.length
+		? metricBarSegmentsHtml(statuses)
+		: "";
+	const barInner = segments
+		|| `<div class="metric-fill ${tone}" style="width:100%"></div>`;
+	const barClass = segments ? "metric-bar metric-bar--stacked" : "metric-bar";
+	const onlineLabel = online != null ? String(online) : (running ? "?" : "—");
+	const totalLabel = total != null ? String(total) : "?";
+	return `<div class="metric-block" title="${escapeAttr(title)}">
+		<div class="metric-head">
+			<span class="metric-nums metric-nums--drift">${driftMetricNumsHtml(counts)}</span>
+			<span class="metric-nums"><strong>${escapeHtml(onlineLabel)}</strong><span class="metric-sep">/</span>${escapeHtml(totalLabel)}</span>
+		</div>
+		<div class="${barClass}" aria-hidden="true">${barInner}</div>
+		${chips}
+	</div>`;
+}
+
 function rtlsDeviceMetric(entry, label, prefix, nowKey, setKey, statusKey, linksKey) {
 	const set = entry[setKey];
 	if (set == null) return "";
@@ -3812,23 +3918,32 @@ function formatRtlsMetricCell(entry) {
 }
 
 function formatCameraDriftMetricCell(entry, name) {
-	// Head: TOTAL: {total}     {drifted}/{online}
+	// Head: {n} DRIFT · {n} BLUR · {n} HOLD     {online}/{total}
 	const running = !!entry.running;
 	const liveOptions = { pipeline: name || entry.pipeline || "" };
-	const renderDriftBlock = (now, total, online, statuses, links) => {
-		const tone = !running ? "idle" : (now > 0 ? "warn" : "ok");
-		const right = online != null ? online : total;
-		return metricBlock(
-			total != null ? `TOTAL: ${total}` : "TOTAL",
-			now,
-			right,
-			running,
-			"D",
-			statuses,
-			links || [],
-			liveOptions,
-			tone,
+	const renderDriftBlock = (total, online, statuses, links) => {
+		const tagCounts = driftIssueCountsFromTags(links);
+		const hasCamTags = (links || []).some(
+			(link) => Array.isArray(link.tags) && link.tags.length > 0,
 		);
+		const statusCounts = driftIssueCountsFromStatuses(statuses);
+		const counts = hasCamTags
+			? tagCounts
+			: {
+				drift: statusCounts.drift || Number(entry.drift_cameras_now) || 0,
+				blur: statusCounts.blur || 0,
+				hold: statusCounts.hold || 0,
+				off: statusCounts.off || 0,
+			};
+		return driftMetricBlock({
+			total,
+			online,
+			counts,
+			running,
+			statuses,
+			links: links || [],
+			liveOptions,
+		});
 	};
 
 	const groups = entry.drift_camera_groups;
@@ -3840,9 +3955,7 @@ function formatCameraDriftMetricCell(entry, name) {
 			const online = group.online != null
 				? group.online
 				: entry.drift_cameras_online;
-			return renderDriftBlock(
-				group.now, group.set, online, statuses, group.links,
-			);
+			return renderDriftBlock(group.set, online, statuses, group.links);
 		}).join("");
 		return `<div class="metric-grid metric-grid--plc">${blocks}</div>`;
 	}
@@ -3861,7 +3974,6 @@ function formatCameraDriftMetricCell(entry, name) {
 			: entry.drift_camera_status.map(() => "idle"))
 		: [];
 	return renderDriftBlock(
-		now,
 		total,
 		entry.drift_cameras_online,
 		statuses,
@@ -3907,6 +4019,7 @@ function worstPlcChipTone(statuses, running) {
 	const list = statuses || [];
 	if (list.some((s) => s === "err")) return "err";
 	if (list.some((s) => s === "warn" || s === "unknown")) return "warn";
+	if (list.some((s) => s === "info")) return "info";
 	if (list.length) return "ok";
 	return "idle";
 }
