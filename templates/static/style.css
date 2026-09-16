@@ -1170,13 +1170,6 @@ body.overlay-scroll-lock {
   white-space: nowrap;
 }
 
-.plc-tag-row-end {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
 .drift-reset-btn {
   border-color: rgba(255, 160, 120, 0.45);
   background: rgba(220, 100, 60, 0.22);

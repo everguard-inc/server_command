@@ -1594,18 +1594,41 @@ def _git_resolve_pull_branch(repo, label):
     )
 
 
-def _git_sync_to_origin_with_stash(repo, label, branch, *, log_prefix=None, reset_notice=None):
-    prefix = log_prefix or label
-    stashed = False
-    if not _git_working_tree_clean(repo):
-        print(f"{prefix}: stashing local changes before sync")
-        stashed = _git_stash_local_changes(repo, label)
+def _git_sync_to_origin(repo, label, branch, *, reset_notice=None):
+    """Discard local dirt, then hard-reset to origin/<branch>."""
+    _git_discard_local_changes(repo, label)
     if reset_notice:
         print(reset_notice)
     _git_reset_to_origin(repo, label, branch)
-    if stashed:
-        print(f"{prefix}: restoring stashed local changes")
-        _git_stash_pop(repo, label)
+
+
+def _git_checkout_ref(repo, label, git_ref):
+    """Fetch and hard-reset to a branch, tag, or commit SHA."""
+    ref = (git_ref or "").strip()
+    if not ref:
+        raise RuntimeError(f"{label}: empty git ref")
+
+    fetch_label = f"{label}: git fetch origin {ref}"
+    fetch = _git_run(repo, ["fetch", "origin", "--prune", "--tags"])
+    if fetch.returncode != 0:
+        _raise_git_failure(f"{label}: git fetch origin --tags", fetch)
+
+    targeted = _git_run(repo, ["fetch", "origin", ref, "--depth=1"])
+    if targeted.returncode != 0:
+        # Tags/commits may already be present after --tags fetch; keep going.
+        print(f"{fetch_label}: targeted fetch skipped ({_git_error_summary(targeted) or 'exit '+str(targeted.returncode)})")
+
+    resolved = _git_resolve_fetch_ref(repo, ref)
+    if not resolved:
+        raise RuntimeError(f"{label}: git ref not found after fetch: {ref}")
+
+    # Pinning a ref: discard dirty/local stash instead of restoring over the target.
+    _git_discard_local_changes(repo, label)
+
+    reset = _git_run(repo, ["reset", "--hard", resolved])
+    if reset.returncode != 0:
+        _raise_git_failure(f"{label}: git reset --hard {resolved}", reset)
+    print(f"{label}: synced to {ref} ({resolved})")
 
 
 def _git_pull_no_upstream(repo, label, detail):
@@ -1614,9 +1637,7 @@ def _git_pull_no_upstream(repo, label, detail):
         return False
 
     branch = _git_resolve_pull_branch(repo, label)
-    _git_sync_to_origin_with_stash(
-        repo, label, branch, log_prefix=f"{label}: git pull",
-    )
+    _git_sync_to_origin(repo, label, branch)
     return True
 
 
@@ -1847,41 +1868,38 @@ def _git_reset_to_origin(repo, label, branch):
     print(f"{label}: synced to {remote_ref}")
 
 
-def _git_stash_local_changes(repo, label):
-    stash = _git_run(repo, ["stash", "push", "-u", "-m", "server_command update"])
-    if stash.returncode != 0:
-        raise RuntimeError(
-            f"{label}: git stash failed: {_git_error_summary(stash) or stash.returncode}",
-        )
-    if "No local changes to save" in (stash.stdout or "") + (stash.stderr or ""):
-        return False
-    return True
-
-
-def _git_has_merge_conflicts(repo):
-    result = _git_run(repo, ["ls-files", "-u"])
-    return bool((result.stdout or "").strip())
-
-
-def _git_raise_stash_merge_conflict(label):
-    raise RuntimeError(
-        f"{label}: git stash pop left merge conflicts "
-        f"(local changes conflict with upstream). "
-        f"Stash preserved; resolve manually, then retry.",
-    )
-
-
-def _git_stash_pop(repo, label):
-    pop = _git_run(repo, ["stash", "pop"])
-    if pop.returncode == 0 and not _git_has_merge_conflicts(repo):
+def _git_drop_update_stashes(repo, label):
+    """Drop leftover stashes created by previous server_command updates."""
+    listed = _git_run(repo, ["stash", "list"])
+    if listed.returncode != 0:
         return
-    if _git_has_merge_conflicts(repo):
-        _git_run(repo, ["reset", "--hard"])
-        _git_raise_stash_merge_conflict(label)
-    detail = _git_error_summary(pop) or pop.returncode
-    raise RuntimeError(
-        f"{label}: git stash pop failed (local changes preserved in stash): {detail}",
-    )
+    lines = [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
+    # Drop high indices first so remaining numbers stay valid.
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        if "server_command update" not in line:
+            continue
+        drop = _git_run(repo, ["stash", "drop", f"stash@{{{idx}}}"])
+        if drop.returncode == 0:
+            print(f"{label}: dropped leftover update stash stash@{{{idx}}}")
+        else:
+            detail = _git_error_summary(drop) or drop.returncode
+            print(f"{label}: stash drop stash@{{{idx}}} warning: {detail}")
+
+
+def _git_discard_local_changes(repo, label):
+    """Throw away dirty worktree / leftover update stashes before syncing a ref."""
+    _git_drop_update_stashes(repo, label)
+    if _git_working_tree_clean(repo):
+        return
+    print(f"{label}: discarding local changes before update sync")
+    reset = _git_run(repo, ["reset", "--hard"])
+    if reset.returncode != 0:
+        _raise_git_failure(f"{label}: git reset --hard", reset)
+    clean = _git_run(repo, ["clean", "-fd"])
+    if clean.returncode != 0:
+        detail = _git_error_summary(clean) or clean.returncode
+        print(f"{label}: git clean -fd warning: {detail}")
 
 
 def _git_resolve_fetch_ref(repo, git_ref):
@@ -1898,41 +1916,6 @@ def _git_resolve_fetch_ref(repo, git_ref):
     return None
 
 
-def _git_checkout_ref(repo, label, git_ref):
-    """Fetch and hard-reset to a branch, tag, or commit SHA."""
-    ref = (git_ref or "").strip()
-    if not ref:
-        raise RuntimeError(f"{label}: empty git ref")
-
-    fetch_label = f"{label}: git fetch origin {ref}"
-    fetch = _git_run(repo, ["fetch", "origin", "--prune", "--tags"])
-    if fetch.returncode != 0:
-        _raise_git_failure(f"{label}: git fetch origin --tags", fetch)
-
-    targeted = _git_run(repo, ["fetch", "origin", ref, "--depth=1"])
-    if targeted.returncode != 0:
-        # Tags/commits may already be present after --tags fetch; keep going.
-        print(f"{fetch_label}: targeted fetch skipped ({_git_error_summary(targeted) or 'exit '+str(targeted.returncode)})")
-
-    resolved = _git_resolve_fetch_ref(repo, ref)
-    if not resolved:
-        raise RuntimeError(f"{label}: git ref not found after fetch: {ref}")
-
-    stashed = False
-    if not _git_working_tree_clean(repo):
-        print(f"{label}: stashing local changes before checkout {ref}")
-        stashed = _git_stash_local_changes(repo, label)
-
-    reset = _git_run(repo, ["reset", "--hard", resolved])
-    if reset.returncode != 0:
-        _raise_git_failure(f"{label}: git reset --hard {resolved}", reset)
-    print(f"{label}: synced to {ref} ({resolved})")
-
-    if stashed:
-        print(f"{label}: restoring stashed local changes")
-        _git_stash_pop(repo, label)
-
-
 def _git_pull_inner(repo, label):
     pull_label = f"{label}: git pull"
     pull = _git_run(repo, ["pull"])
@@ -1945,11 +1928,10 @@ def _git_pull_inner(repo, label):
     if _git_pull_recoverable_result(pull):
         branch = _git_current_branch(repo)
         try:
-            _git_sync_to_origin_with_stash(
+            _git_sync_to_origin(
                 repo,
                 label,
                 branch,
-                log_prefix=pull_label,
                 reset_notice=(
                     f"{pull_label} failed; resetting to origin/{branch} "
                     "(recoverable sync error)"
@@ -1963,7 +1945,10 @@ def _git_pull_inner(repo, label):
             ) from exc
 
     if not _git_working_tree_clean(repo):
-        detail = f"{detail}\nhint: commit or stash local changes, then retry update"
+        detail = (
+            f"{detail}\n"
+            "hint: local changes block pull; Update discards them on recoverable sync"
+        )
     raise RuntimeError(f"{pull_label} failed (exit {pull.returncode}): {detail}")
 
 
@@ -2012,10 +1997,15 @@ def _git_submodule_reset_hard_all(repo):
 
 def _git_submodule_raise_stash_conflict(repo, label):
     _git_submodule_reset_hard_all(repo)
-    raise RuntimeError(
-        f"{label}: submodule stash pop left merge conflicts "
-        f"(local compat changes conflict with upstream). "
-        f"Stash preserved; resolve eg_common manually, then retry.",
+    # Drop leftover submodule stashes from this update; keep synced tree.
+    _git_submodule_run_shell(
+        repo,
+        "if git stash list | grep -q 'server_command update'; then "
+        "git stash drop; fi",
+    )
+    print(
+        f"{label}: discarded submodule stashed local changes after merge conflict "
+        "(keeping synced upstream tree)",
     )
 
 
@@ -2028,6 +2018,7 @@ def _git_submodule_pop_all(repo, label):
         detail = _cmd_detail(result) or (result.stderr or "").strip()
         if _git_submodule_has_merge_conflicts(repo):
             _git_submodule_raise_stash_conflict(repo, label)
+            return
         raise RuntimeError(
             f"{label}: submodule stash pop failed (exit {result.returncode}): {detail}"
         )
@@ -2463,9 +2454,13 @@ def update_pipeline(command):
                 _build_sys_monitor(sys_monitor_path, sys_monitor_service, git_ref=sys_git_ref)
                 sys_build_ok = True
             except Exception as exc:
+                failed_label = "system_monitor: build failed"
+                msg = str(exc)
+                if "git " in msg.lower() or "stash" in msg.lower():
+                    failed_label = "system_monitor: git sync failed"
                 _append_update_error(
                     errors, sys_monitor_service, exc,
-                    failed_label="system_monitor: build failed",
+                    failed_label=failed_label,
                     summary=f"system_monitor: {exc}",
                 )
 

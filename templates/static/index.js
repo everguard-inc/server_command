@@ -918,10 +918,14 @@ function pipelineUpdateEntry(name, serverStatus) {
 	const { step: serviceStepState, label: serviceLabel } = parseServiceStep(serviceStep);
 
 	if (serviceStepState === "failed") {
+		const err = hostUpdateErrorForService(serverStatus.error, service, name)
+			|| serverStatus.error
+			|| serviceLabel
+			|| "Update failed";
 		return finalizeUpdateEntry(base, {
 			ok: false,
-			response: serviceLabel,
-			error: serviceLabel || "Update failed",
+			response: err,
+			error: err,
 		});
 	}
 
@@ -1113,10 +1117,35 @@ function deviceHost(link) {
 	}
 }
 
+/** Browser-open URL for a ping target. Never use RTSP ports (Chrome ERR_UNSAFE_PORT). */
 function deviceOpenUrl(link, host) {
-	if (link && link.url) return link.url;
-	if (host) return `http://${host}`;
+	if (link && link.url) return browserSafeHttpUrl(link.url);
+	if (host) return browserSafeHttpUrl(`http://${host}`);
 	return "";
+}
+
+function browserSafeHttpUrl(raw) {
+	const text = String(raw || "").trim();
+	if (!text) return "";
+	try {
+		const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(text) ? text : `http://${text}`;
+		const u = new URL(withScheme);
+		const proto = (u.protocol || "").replace(":", "").toLowerCase();
+		if (proto === "rtsp") return `http://${u.hostname}`;
+		const port = u.port
+			? Number(u.port)
+			: (proto === "https" ? 443 : 80);
+		// RTSP ports are not valid for http(s) in Chrome (ERR_UNSAFE_PORT).
+		if (port === 554 || port === 8554) return `http://${u.hostname}`;
+		if (proto === "http" || proto === "https") return u.toString();
+		return `http://${u.hostname}${u.port ? `:${u.port}` : ""}`;
+	} catch (e) {
+		const m = text.match(/^(?:https?:\/\/)?([^/:]+)(?::(\d+))?/i);
+		if (!m) return "";
+		const port = m[2] ? Number(m[2]) : null;
+		if (port === 554 || port === 8554) return `http://${m[1]}`;
+		return port && port !== 80 ? `http://${m[1]}:${port}` : `http://${m[1]}`;
+	}
 }
 
 function pingDevice(host, event, openUrl) {
