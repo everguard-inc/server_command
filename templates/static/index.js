@@ -1421,6 +1421,7 @@ const DRIFT_I18N = {
 		evalDeferredIllum: "Evaluation deferred · no illumination-similar reference",
 		evalDeferredWarmup: "Evaluation deferred · waiting for a reliable compare pair",
 		evalDeferredGlobalShift: "Evaluation deferred · global shift seen; awaiting consecutive confirm",
+		evalDeferredBlurConfirm: "Evaluation deferred · blur/fog seen; awaiting consecutive confirm",
 	},
 	ko: {
 		overlayCaption: "설명",
@@ -1463,6 +1464,7 @@ const DRIFT_I18N = {
 		evalDeferredIllum: "평가 보류 · 조도 유사 기준 없음",
 		evalDeferredWarmup: "평가 보류 · 신뢰할 비교 페어 대기 중",
 		evalDeferredGlobalShift: "평가 보류 · 전역 이동 감지, 연속 확인 대기 중",
+		evalDeferredBlurConfirm: "평가 보류 · 뿌연/초점 흐림 감지, 연속 확인 대기 중",
 	},
 };
 
@@ -1470,6 +1472,11 @@ const DRIFT_I18N = {
 const DRIFT_EVAL_REASON_MATCHERS = [
 	{ key: "evalDeferredIllum", code: /illumination_(mismatch|unknown)/i, text: /illumination/i },
 	{ key: "evalDeferredWarmup", code: /persistent_warmup|warmup/i, text: /warmup|reliable compare/i },
+	{
+		key: "evalDeferredBlurConfirm",
+		code: /awaiting_blur|simple_awaiting_blur/i,
+		text: /awaiting\s*blur|blur\/fog seen/i,
+	},
 	{
 		key: "evalDeferredGlobalShift",
 		code: /global_shift|consecutive_confirm|awaiting_confirm/i,
@@ -1490,7 +1497,9 @@ function isDriftEvalDeferred(meta) {
 		|| skip === "illumination_mismatch"
 		|| skip === "illumination_unknown"
 		|| skip === "persistent_warmup"
-		|| /evaluation deferred|global\s*shift|consecutive\s*confirm/i.test(reason);
+		|| skip === "simple_awaiting_blur"
+		|| skip === "simple_blur"
+		|| /evaluation deferred|global\s*shift|consecutive\s*confirm|awaiting\s*blur|blur\/fog seen/i.test(reason);
 }
 
 function driftEvalStatusBanner(meta) {
