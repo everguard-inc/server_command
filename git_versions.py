@@ -8,6 +8,13 @@ DEFAULT_GIT_VERSION_TIMEOUT = 12
 # Prefer these when current checkout has no usable upstream on origin.
 _DEFAULT_REMOTE_BRANCH_FALLBACKS = ("main", "master")
 
+# Local dir name -> preferred remote branches when Latest is resolved via URL
+# (central host has no checkout). Keep checkout-specific tips ahead of main.
+_PREFERRED_BRANCHES_BY_DIR = {
+  "forklift_proximity": ("forklift_proximity", "main", "master"),
+  "eg_pipeline_park_dist": ("seah_parking_distance", "main", "master"),
+}
+
 # Bare clones used to resolve commit dates when only a remote URL is available.
 _VERSION_CACHE_ROOT = os.environ.get(
   "SERVER_COMMAND_VERSION_CACHE",
@@ -98,13 +105,21 @@ def preferred_remote_branches(repo_path, *, git_cmd=None, timeout=None):
   add(git_upstream_branch(repo_path, git_cmd=git_cmd, timeout=timeout))
   add(git_current_branch(repo_path, git_cmd=git_cmd, timeout=timeout))
 
-  repo_name = os.path.basename(os.path.realpath(repo_path or ""))
-  if repo_name == "forklift_proximity":
-    add("forklift_proximity")
+  repo_name = os.path.basename(os.path.realpath(repo_path or "") if repo_path else "")
+  if not repo_name:
+    repo_name = os.path.basename(str(repo_path or "").rstrip("/"))
+  for name in _PREFERRED_BRANCHES_BY_DIR.get(repo_name, ()):
+    add(name)
 
   for name in _DEFAULT_REMOTE_BRANCH_FALLBACKS:
     add(name)
   return ordered
+
+
+def preferred_branches_for_repo_path(repo_path):
+  """Preferred remote branches for a pipeline path (even without a local checkout)."""
+  name = os.path.basename(str(repo_path or "").rstrip("/"))
+  return _PREFERRED_BRANCHES_BY_DIR.get(name)
 
 
 def git_ls_remote_origin(repo_path, *, git_cmd=None, timeout=DEFAULT_GIT_VERSION_TIMEOUT, env=None):
@@ -278,10 +293,10 @@ def read_repo_latest(repo_path, *, git_cmd=None, remote_url=None, timeout=DEFAUL
 
   if not remote_url:
     return None, None
-  preferred = None
-  repo_name = _repo_name_from_remote_url(remote_url)
-  if repo_name == "forklift_proximity":
-    preferred = ("forklift_proximity", "main", "master")
+  preferred = preferred_branches_for_repo_path(repo_path)
+  if not preferred:
+    repo_name = _repo_name_from_remote_url(remote_url)
+    preferred = _PREFERRED_BRANCHES_BY_DIR.get(repo_name)
   full_sha, latest = git_ls_remote_url(
     remote_url, timeout=timeout, preferred_branches=preferred,
   )

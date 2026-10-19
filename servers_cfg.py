@@ -227,11 +227,22 @@ def repo_path_for_pipeline(name=None, cfg=None, *, item=None):
 
 GITHUB_ORG = "everguard-inc"
 
+# Local checkout dir name -> GitHub repo name when they differ.
+_GITHUB_REPO_ALIASES = {
+  "eg_pipeline_park_dist": "eg_pipeline",
+}
 
-def repo_name_from_path(repo_path):
+
+def repo_dir_name(repo_path):
   if not repo_path:
     return ""
   return str(repo_path).rstrip("/").split("/")[-1]
+
+
+def repo_name_from_path(repo_path):
+  """GitHub repository name for a local pipeline path."""
+  name = repo_dir_name(repo_path)
+  return _GITHUB_REPO_ALIASES.get(name, name)
 
 
 def pipeline_git_url(name=None, cfg=None, repo_path=None):
