@@ -71,7 +71,7 @@ STREAM_SSE_TIMEOUT = 8
 CAMERA_PROBE_TIMEOUT = 2.0
 CAMERA_PROBE_CACHE_SEC = 15
 SPEAKER_STATUS_PATH = "media.cgi?msubmenu=speakerstatus&action=view"
-PROBE_SSE_MAX_LINES = 10
+PROBE_SSE_MAX_LINES = 20
 QLIGHT_TYPE_MARKERS = ("qlight", "patlite")
 SPEAKER_TYPE_MARKERS = ("simpleurlalarm", "simplerestalarm")
 
@@ -550,6 +550,21 @@ def _stream_snapshot_from_sse(line):
     return snap
 
 
+def _snap_has_live_cameras(snap):
+    """True when snapshot shows at least one live camera/frame (skip empty warmup)."""
+    if not snap:
+        return False
+    if snap.get("camera_ids"):
+        return True
+    if snap.get("index_map"):
+        return True
+    jpeg_present = snap.get("jpeg_present")
+    if isinstance(jpeg_present, list) and any(jpeg_present):
+        return True
+    now = snap.get("cameras_now")
+    return isinstance(now, int) and now > 0
+
+
 def _dedupe_preserve_order(items, skip_falsy=False):
     seen = set()
     for item in items:
@@ -575,6 +590,9 @@ def _probe_stream_at_host(host, port, feed_paths=None):
 
     Returns (health_ok, stream_snapshot_or_None). Snapshot has cameras_now and
     fields needed to map per-camera ok/err without keeping jpeg blobs.
+
+    Cobble/EG feeds often emit empty jpeg frames for a few SSE events after
+    connect; keep reading until a live frame appears (or line budget ends).
     """
     base = f"http://{host}:{port}"
     paths = feed_paths or (DEFAULT_STREAM_FEED_PATH, ALT_STREAM_FEED_PATH)
@@ -588,14 +606,25 @@ def _probe_stream_at_host(host, port, feed_paths=None):
                 ) as resp:
                     if resp.status_code != 200:
                         continue
+                    best = None
+                    saw_sse = False
                     for idx, line in enumerate(resp.iter_lines()):
                         if idx >= PROBE_SSE_MAX_LINES:
                             break
                         if not line:
                             continue
                         snap = _stream_snapshot_from_sse(line.strip())
-                        if snap is not None:
+                        if snap is None:
+                            continue
+                        saw_sse = True
+                        if _snap_has_live_cameras(snap):
                             return True, snap
+                        if best is None:
+                            best = snap
+                        elif (snap.get("cameras_now") or 0) > (best.get("cameras_now") or 0):
+                            best = snap
+                    if saw_sse:
+                        return True, best
             return True, None
         except (httpx.HTTPError, json.JSONDecodeError, ValueError, TypeError):
             continue
@@ -858,7 +887,11 @@ def _cached_probe_local_stream(item, interval_sec):
 
 
 def _apply_stream_camera_metrics(entry, item, snap):
-    """Prefer eg_pipeline SSE presence over RTSP TCP probes for C-chip / WARN."""
+    """Prefer SSE presence when it maps 1:1 to config cameras.
+
+    When jpeg slot count != configured camera count (common on cobble: 3 live
+    frames vs 4 config cams), return False so RTSP TCP fills per-chip status.
+    """
     camera_links = item.get("camera_links") or []
     cameras_now = (snap or {}).get("cameras_now") if snap else None
     statuses = camera_statuses_from_stream(snap, camera_links) if snap else None
@@ -872,17 +905,7 @@ def _apply_stream_camera_metrics(entry, item, snap):
         entry["cameras_now"] = cameras_now
         return True
 
-    # Stream is up but cannot map per-camera slots — avoid flaky RTSP TCP.
-    # Align chips to stream count so WARN tracks pipeline reality.
-    if cameras_now is not None and camera_links:
-        total = len(camera_links)
-        ok_n = max(0, min(int(cameras_now), total))
-        entry["cameras_now"] = ok_n
-        entry["camera_status"] = [
-            "ok" if idx < ok_n else "err" for idx in range(total)
-        ]
-        return True
-
+    # Unmappable stream slots — let caller probe RTSP per camera link.
     return False
 
 
