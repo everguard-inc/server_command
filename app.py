@@ -88,6 +88,10 @@ _GIT_PULL_RECOVERABLE = (
     "cannot lock ref",
     "not possible to fast-forward",
     "non-fast-forward",
+    # Dirty worktree: Update intentionally discards local edits and resets to origin.
+    "would be overwritten by merge",
+    "please commit your changes or stash them",
+    "commit your changes or stash them before you merge",
 )
 
 _GIT_PULL_NO_UPSTREAM = (
