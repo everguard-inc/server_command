@@ -1539,9 +1539,9 @@ def _central_git_cmd(repo_path, *args, timeout=None):
 
 
 def _read_central_repo_latest(repo_path, *, name=None, image_cfg=None):
-  remote_url = None
-  if not is_git_repo_dir(repo_path):
-    remote_url = pipeline_git_url(name=name, cfg=image_cfg, repo_path=repo_path)
+  # Always resolve Latest from GitHub ls-remote. Local checkouts go stale and
+  # eg_pipeline (etc.) may not exist on the proxy host.
+  remote_url = pipeline_git_url(name=name, cfg=image_cfg, repo_path=repo_path)
   return read_repo_latest(
     repo_path,
     git_cmd=_central_git_cmd,

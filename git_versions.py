@@ -271,40 +271,41 @@ def read_tracking_latest(repo_path, *, git_cmd=None, timeout=DEFAULT_GIT_VERSION
 
 
 def read_repo_latest(repo_path, *, git_cmd=None, remote_url=None, timeout=DEFAULT_GIT_VERSION_TIMEOUT):
-  """Latest remote version for a local repo or HTTPS remote URL.
+  """Latest remote tip via ls-remote (never stale local origin/* alone).
 
-  Prefers already-fetched origin/* tips (no network), then ls-remote.
+  Prefer an explicit remote_url (GitHub HTTPS) when provided. Fall back to
+  `git ls-remote origin` on a local checkout only if the URL path fails or is
+  omitted. Local tracking refs alone are not used — they go stale without fetch.
   """
-  if is_git_repo_dir(repo_path):
-    latest, latest_date = read_tracking_latest(
-      repo_path, git_cmd=git_cmd, timeout=timeout,
+  preferred = preferred_branches_for_repo_path(repo_path)
+  if not preferred and is_git_repo_dir(repo_path):
+    preferred = tuple(
+      preferred_remote_branches(repo_path, git_cmd=git_cmd, timeout=timeout)
+    ) or None
+  if not preferred and remote_url:
+    preferred = _PREFERRED_BRANCHES_BY_DIR.get(_repo_name_from_remote_url(remote_url))
+
+  if remote_url:
+    full_sha, latest = git_ls_remote_url(
+      remote_url, timeout=timeout, preferred_branches=preferred,
     )
     if latest:
+      latest_date = git_commit_date_from_remote(
+        remote_url, full_sha, timeout=timeout,
+      )
       return latest, latest_date
-    full_sha, latest = git_ls_remote_origin(repo_path, git_cmd=git_cmd, timeout=timeout)
-    if not full_sha:
-      return None, None
-    latest_date = git_commit_date(repo_path, full_sha, timeout=timeout, git_cmd=git_cmd)
-    if not latest_date:
-      run = _git_runner(git_cmd, timeout=timeout)
-      run(repo_path, "fetch", "origin", full_sha, "--depth=1", "--quiet", timeout=timeout)
-      latest_date = git_commit_date(repo_path, full_sha, timeout=timeout, git_cmd=git_cmd)
-    return latest, latest_date
 
-  if not remote_url:
+  if not is_git_repo_dir(repo_path):
     return None, None
-  preferred = preferred_branches_for_repo_path(repo_path)
-  if not preferred:
-    repo_name = _repo_name_from_remote_url(remote_url)
-    preferred = _PREFERRED_BRANCHES_BY_DIR.get(repo_name)
-  full_sha, latest = git_ls_remote_url(
-    remote_url, timeout=timeout, preferred_branches=preferred,
-  )
-  if not latest:
+
+  full_sha, latest = git_ls_remote_origin(repo_path, git_cmd=git_cmd, timeout=timeout)
+  if not full_sha:
     return None, None
-  latest_date = git_commit_date_from_remote(
-    remote_url, full_sha, timeout=timeout,
-  )
+  latest_date = git_commit_date(repo_path, full_sha, timeout=timeout, git_cmd=git_cmd)
+  if not latest_date:
+    run = _git_runner(git_cmd, timeout=timeout)
+    run(repo_path, "fetch", "origin", full_sha, "--depth=1", "--quiet", timeout=timeout)
+    latest_date = git_commit_date(repo_path, full_sha, timeout=timeout, git_cmd=git_cmd)
   return latest, latest_date
 
 
