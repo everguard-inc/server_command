@@ -46,6 +46,8 @@ DEFAULT_REPO_PATH = os.path.join(os.path.expanduser("~"), "server_command")
 GITHUB_TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".eg", "github_token")
 GIT_CREDENTIALS_FILE = os.path.join(os.path.expanduser("~"), ".git-credentials")
 # Keep .git so --local updates edge HEAD / UI Current to match this host.
+# .gitignore is applied via rsync --filter=':- .gitignore'; keep a few
+# explicit excludes as a safety net (and to protect servers.json from --delete).
 LOCAL_SYNC_EXCLUDES = ("__pycache__", "*.pyc", "nohup.out", "servers.json")
 _ENV_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -237,9 +239,14 @@ class SshRunner:
   def _rsync_cmd(self, host, local_dir, remote_dir):
     transport = "ssh " + " ".join(ssh_opts(self.connect_timeout))
     excludes = [item for pattern in LOCAL_SYNC_EXCLUDES for item in ("--exclude", pattern)]
+    # Per-dir .gitignore (same idea as git): skip ignored local files on --local.
+    gitignore_filter = ["--filter=:- .gitignore"]
     src = local_dir.rstrip("/") + "/"
     dest = f"{self.user}@{host}:{remote_dir.rstrip('/')}/"
-    return ["rsync", "-az", "--delete", "-e", transport, *excludes, src, dest]
+    return [
+      "rsync", "-az", "--delete", "-e", transport,
+      *gitignore_filter, *excludes, src, dest,
+    ]
 
   def run(self, host, cmd, *, label=None):
     cmd, env = self._wrap(cmd)
