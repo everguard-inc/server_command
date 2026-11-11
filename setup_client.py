@@ -3,8 +3,8 @@
 
   python3 setup_client.py
 
-Installs git credentials, pip dependencies, systemd unit, passwordless systemctl,
-and restarts server_command_client.service.
+Installs git credentials, edge Python deps (apt first, pip fallback), systemd unit,
+passwordless systemctl, and restarts server_command_client.service.
 
 If ~/.git-credentials is invalid (e.g. left from another user), it is removed and
 setup prompts for fresh credentials.
@@ -31,6 +31,8 @@ REQUIREMENTS = os.path.join(REPO, "requirements.txt")
 SERVICE_PATH = f"/etc/systemd/system/{SERVICE_UNIT}"
 SITE_ID_FILE = os.path.join(".eg", "site_id")
 DEFAULT_REPO_URL = "https://github.com/everguard-inc/server_command.git"
+# Edge app.py needs flask + httpx; prefer distro packages over pip (PEP 668).
+EDGE_APT_PACKAGES = ("python3-flask", "python3-httpx")
 
 
 def is_root():
@@ -101,6 +103,23 @@ def pip_executable():
 
 def python_executable():
     return shutil.which("python3") or sys.executable
+
+
+def _externally_managed_python():
+    """True on PEP 668 distros (Debian/Ubuntu) that block system-wide pip."""
+    try:
+        import sysconfig
+        return os.path.isfile(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))
+    except Exception:
+        return False
+
+
+def _pip_env(base=None):
+    """Allow edge deps install on externally-managed system Python."""
+    env = dict(base or os.environ)
+    if _externally_managed_python():
+        env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+    return env
 
 
 def git_store_cmd(repo, *args, creds=None):
@@ -305,39 +324,68 @@ def _resolve_pip():
     return pip
 
 
+def _verify_edge_imports(*, label=""):
+    py = python_executable()
+    cmd = f"{shlex.quote(py)} -c 'import flask, httpx'"
+    if run_show(cmd, shell=True) != 0:
+        print(f"{label}missing flask/httpx imports", file=sys.stderr)
+        return 1
+    if run_show("flask --version", shell=True) != 0:
+        print(f"warning: {label}flask --version failed", file=sys.stderr)
+    return 0
+
+
 def _run_pip_steps(steps, *, env=None, flask_label=""):
     for step in steps:
         if run_show(step, shell=True, env=env) != 0:
             print(f"failed: {step}", file=sys.stderr)
             return 1
-    if run_show("flask --version", shell=True, env=env) != 0:
-        print(f"warning: {flask_label}flask --version failed", file=sys.stderr)
-    return 0
+    return _verify_edge_imports(label=flask_label)
 
 
-def install_dependencies_root():
+def install_dependencies_apt():
+    """Install edge deps from apt. Returns 0 when flask+httpx import OK."""
+    if not shutil.which("apt-get"):
+        print("apt-get not found; skip apt deps", file=sys.stderr)
+        return 1
+    if _verify_edge_imports(label="pre-apt ") == 0:
+        print("edge deps already present (flask, httpx)")
+        return 0
+
+    pkgs = " ".join(shlex.quote(pkg) for pkg in EDGE_APT_PACKAGES)
+    print(f"installing apt packages: {' '.join(EDGE_APT_PACKAGES)}")
+    # Best-effort update; install may still succeed with cached indexes.
+    run_show("apt-get update -qq", shell=True)
+    if run_show(
+        f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkgs}",
+        shell=True,
+    ) != 0:
+        print("apt install failed", file=sys.stderr)
+        return 1
+    return _verify_edge_imports(label="apt ")
+
+
+def install_dependencies_pip():
     pip = _resolve_pip()
     if not pip:
         return 1
     req = shlex.quote(REQUIREMENTS)
+    print("falling back to pip for edge deps")
     return _run_pip_steps(
         [
             f"{shlex.quote(pip)} install --upgrade pip",
             f"{shlex.quote(pip)} install -r {req} --upgrade --ignore-installed --no-cache-dir",
         ],
-        flask_label="sudo ",
+        env=_pip_env(),
+        flask_label="pip ",
     )
 
 
-def install_dependencies_user():
-    pip = _resolve_pip()
-    if not pip:
-        return 1
-    req = shlex.quote(REQUIREMENTS)
-    return _run_pip_steps(
-        [f"{shlex.quote(pip)} install -r {req} --upgrade --force-reinstall --no-cache-dir"],
-        env=git_env(),
-    )
+def install_dependencies_root():
+    """Prefer apt (no pip); fall back to pip on older/missing distro packages."""
+    if install_dependencies_apt() == 0:
+        return 0
+    return install_dependencies_pip()
 
 
 def install_systemd_service(site_id, container_dir):
@@ -600,10 +648,7 @@ def main():
             return code
 
     if not args.skip_deps:
-        print("installing Python dependencies (user)")
-        code = install_dependencies_user()
-        if code != 0:
-            return code
+        print("installing Python dependencies (apt first, pip fallback)")
         code = sudo_self("--deps-root")
         if code != 0:
             return code

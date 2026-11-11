@@ -2056,7 +2056,9 @@ def _git_submodule_pop_all(repo, label):
 def _git_submodule_update_inner(repo, label):
     _git_submodule_stash_all(repo, label)
     _run_login_shell(
-        _git_shell_command(repo, ["submodule", "update", "--recursive"]),
+        _git_shell_command(
+            repo, ["submodule", "update", "--init", "--recursive"],
+        ),
         f"{label}: submodule update",
     )
     _git_submodule_pop_all(repo, label)
