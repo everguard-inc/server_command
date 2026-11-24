@@ -1422,6 +1422,7 @@ const DRIFT_I18N = {
 		evalDeferredWarmup: "Evaluation deferred · waiting for a reliable compare pair",
 		evalDeferredGlobalShift: "Evaluation deferred · global shift seen; awaiting consecutive confirm",
 		evalDeferredBlurConfirm: "Evaluation deferred · blur/fog seen; awaiting consecutive confirm",
+		evalUndeterminableBlur: "Undeterminable · image is too blurry/foggy for drift judgment",
 	},
 	ko: {
 		overlayCaption: "설명",
@@ -1465,6 +1466,7 @@ const DRIFT_I18N = {
 		evalDeferredWarmup: "평가 보류 · 신뢰할 비교 페어 대기 중",
 		evalDeferredGlobalShift: "평가 보류 · 전역 이동 감지, 연속 확인 대기 중",
 		evalDeferredBlurConfirm: "평가 보류 · 뿌연/초점 흐림 감지, 연속 확인 대기 중",
+		evalUndeterminableBlur: "판정 불가 · 영상이 뿌옇거나 초점이 흐려 드리프트 판정을 할 수 없습니다",
 	},
 };
 
@@ -1476,6 +1478,13 @@ const DRIFT_EVAL_REASON_MATCHERS = [
 		key: "evalDeferredBlurConfirm",
 		code: /awaiting_blur|simple_awaiting_blur/i,
 		text: /awaiting\s*blur|blur\/fog seen/i,
+	},
+	{
+		// Confirmed focus-out (not 1/N HOLD). Must stay above generic deferred.
+		// Match English reason codes/text only; KO copy lives in DRIFT_I18N.
+		key: "evalUndeterminableBlur",
+		code: /^simple_blur$/i,
+		text: /undeterminable|too blurry|blurry[_ ]|large_shift_weak_structure|blurry frame/i,
 	},
 	{
 		key: "evalDeferredGlobalShift",
