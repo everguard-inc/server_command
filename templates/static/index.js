@@ -1409,6 +1409,9 @@ const DRIFT_I18N = {
 			`Pinpoints ${total} (manual ${manual}, active ${active})`
 		),
 		gateMatchCount: (n) => `Gate matches ${n}`,
+		globalShiftOverlay: (method) => (
+			`Global shift (${method || "ECC/phase"}) · not pin matches`
+		),
 		pinpointAddFailed: "Failed to add pinpoint",
 		pinpointAddTimeout: "Timed out adding pinpoint",
 		pinpointUndoFailed: "Failed to undo last pinpoint",
@@ -1421,6 +1424,7 @@ const DRIFT_I18N = {
 		evalDeferredIllum: "Evaluation deferred · no illumination-similar reference",
 		evalDeferredWarmup: "Evaluation deferred · waiting for a reliable compare pair",
 		evalDeferredGlobalShift: "Evaluation deferred · global shift seen; awaiting consecutive confirm",
+		evalDeferredPinUncorroborated: "Evaluation deferred · global shift not confirmed by pinpoints",
 		evalDeferredBlurConfirm: "Evaluation deferred · blur/fog seen; awaiting consecutive confirm",
 		evalUndeterminableBlur: "Undeterminable · image is too blurry/foggy for drift judgment",
 	},
@@ -1453,6 +1457,9 @@ const DRIFT_I18N = {
 			`핀포인트 ${total} (수동 ${manual}, 활성 ${active})`
 		),
 		gateMatchCount: (n) => `유효 매칭 ${n}`,
+		globalShiftOverlay: (method) => (
+			`전역 이동 (${method || "ECC/phase"}) · 핀 매칭 아님`
+		),
 		pinpointAddFailed: "핀포인트 추가에 실패했습니다",
 		pinpointAddTimeout: "핀포인트 추가 시간이 초과되었습니다",
 		pinpointUndoFailed: "마지막 핀포인트 취소에 실패했습니다",
@@ -1465,6 +1472,7 @@ const DRIFT_I18N = {
 		evalDeferredIllum: "평가 보류 · 조도 유사 기준 없음",
 		evalDeferredWarmup: "평가 보류 · 신뢰할 비교 페어 대기 중",
 		evalDeferredGlobalShift: "평가 보류 · 전역 이동 감지, 연속 확인 대기 중",
+		evalDeferredPinUncorroborated: "평가 보류 · 전역 이동이 핀포인트로 확인되지 않음",
 		evalDeferredBlurConfirm: "평가 보류 · 뿌연/초점 흐림 감지, 연속 확인 대기 중",
 		evalUndeterminableBlur: "판정 불가 · 영상이 뿌옇거나 초점이 흐려 드리프트 판정을 할 수 없습니다",
 	},
@@ -1485,6 +1493,11 @@ const DRIFT_EVAL_REASON_MATCHERS = [
 		key: "evalUndeterminableBlur",
 		code: /^simple_blur$/i,
 		text: /undeterminable|too blurry|blurry[_ ]|large_shift_weak_structure|blurry frame/i,
+	},
+	{
+		key: "evalDeferredPinUncorroborated",
+		code: /^pin_uncorroborated$/i,
+		text: /without pin corroboration|not corroborated by pinpoint/i,
 	},
 	{
 		key: "evalDeferredGlobalShift",
@@ -1508,7 +1521,8 @@ function isDriftEvalDeferred(meta) {
 		|| skip === "persistent_warmup"
 		|| skip === "simple_awaiting_blur"
 		|| skip === "simple_blur"
-		|| /evaluation deferred|global\s*shift|consecutive\s*confirm|awaiting\s*blur|blur\/fog seen/i.test(reason);
+		|| skip === "pin_uncorroborated"
+		|| /evaluation deferred|global\s*shift|consecutive\s*confirm|awaiting\s*blur|blur\/fog seen|pin corroboration/i.test(reason);
 }
 
 function driftEvalStatusBanner(meta) {
@@ -2349,13 +2363,20 @@ function updateDriftAnchorBar() {
 	const editing = Boolean(driftImagesState && driftImagesState.anchorEdit);
 	const showManualActions = hasRef && editing && manual > 0;
 	if (countEl) {
-		// Simple drift: alarm uses gate matches; auto persistent pins are View-only.
+		// Simple drift: gate matches = pin inliers only. Synthetic center arrow
+		// is a View-only global-shift overlay (not "valid matches").
 		const meta = driftImagesState && driftImagesState.meta;
+		const source = String((meta && meta.match_points_source) || "").toLowerCase();
+		const isSynthetic = source === "synthetic_center" || source === "synthetic";
 		const gateN = Number(
-			(meta && (meta.match_points_count
-				|| (meta.match_points && meta.match_points.length))) || 0,
+			(meta && meta.match_points_count != null)
+				? meta.match_points_count
+				: ((meta && meta.match_points && meta.match_points.length) || 0),
 		);
-		if (hasRef && isDriftImagesJudgmentMode() && !editing && gateN > 0) {
+		const method = String((meta && (meta.simple_drift_method || meta.method)) || "ECC/phase");
+		if (hasRef && isDriftImagesJudgmentMode() && !editing && isSynthetic) {
+			countEl.textContent = driftT("globalShiftOverlay", method);
+		} else if (hasRef && isDriftImagesJudgmentMode() && !editing && gateN > 0 && !isSynthetic) {
 			countEl.textContent = driftT("gateMatchCount", gateN);
 		} else if (hasRef && points.length) {
 			countEl.textContent = driftT("pinpointCount", points.length, manual, active);
@@ -2879,7 +2900,15 @@ function renderDriftRawMetrics(meta) {
 		meta.delta_y_display != null ? meta.delta_y_display : meta.delta_y,
 	);
 	const thr = formatDriftMetricValue(meta.threshold);
-	const matchCount = Number(meta.match_points_count || (meta.match_points && meta.match_points.length) || 0);
+	const matchSource = String(meta.match_points_source || "").toLowerCase();
+	const isSyntheticMatch = matchSource === "synthetic_center" || matchSource === "synthetic";
+	const matchCount = isSyntheticMatch
+		? 0
+		: Number(
+			meta.match_points_count != null
+				? meta.match_points_count
+				: ((meta.match_points && meta.match_points.length) || 0),
+		);
 	const bits = [
 		`<span>${escapeHtml(driftT("distance"))} <strong>${escapeHtml(dist)}px</strong></span>`,
 		`<span>${escapeHtml(driftT("threshold"))} <strong>${escapeHtml(thr)}px</strong></span>`,
