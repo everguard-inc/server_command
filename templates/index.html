@@ -82,7 +82,9 @@
 			<div class="sticky-toolbar__top">
 				<div class="page-title-block">
 					<h1 class="page-title">Service &amp; Server Manager</h1>
-					<p class="meta page-title-meta">Last update: <span id="lst_update">-</span></p>
+					<div class="page-title-meta" id="proxy_git_versions" aria-live="polite">
+						<span class="proxy-git-versions__empty">—</span>
+					</div>
 				</div>
 				<div class="view-controls-bar">
 					{{ pipeline_view_controls() }}
@@ -102,6 +104,7 @@
 						</button>
 						<h2 class="card-section-title">Service Status</h2>
 					</div>
+					<p class="meta status-last-update">Last update: <span id="lst_update">-</span></p>
 				</div>
 			</div>
 			<div class="card-collapsible-panel" id="section_pipeline_status_panel">

@@ -257,11 +257,45 @@ body.overlay-scroll-lock {
   font-weight: 500;
 }
 
+.status-last-update {
+  margin: 0;
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 0.82rem;
+  color: var(--muted);
+  white-space: nowrap;
+  text-align: right;
+}
+
 .card-grid-4 {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--grid-gap);
   align-items: stretch;
+}
+
+.proxy-git-versions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.proxy-git-versions__line {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.proxy-git-versions__sep {
+  color: var(--muted);
+  margin: 0 2px;
+  font-weight: 600;
+}
+
+.proxy-git-versions__empty {
+  color: var(--muted);
 }
 
 .sticky-toolbar {
@@ -2293,6 +2327,11 @@ body.overlay-scroll-lock {
 
   .view-controls-bar {
     min-width: 100%;
+  }
+
+  .status-last-update {
+    margin-left: 0;
+    text-align: left;
   }
 
   .card-grid-4 {

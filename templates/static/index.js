@@ -3682,7 +3682,7 @@ function updateServerIp(name, event) {
 	});
 }
 
-function formatVersionRow(entry) {
+function formatVersionRow(entry, { title = "Git revision: current on edge / latest from central" } = {}) {
 	if (!entry) return "";
 	const current = entry.version_current;
 	const latest = entry.version_latest;
@@ -3693,7 +3693,7 @@ function formatVersionRow(entry) {
 	}
 	const upToDate = Boolean(current && latest && current === latest);
 	const curClass = upToDate ? "version-tag--ok" : (current && latest ? "version-tag--warn" : "");
-	return `<div class="version-row" title="Git revision: current on edge / latest from central">
+	return `<div class="version-row" title="${escapeHtml(title)}">
 		<span class="version-label">Current:</span>
 		<span class="version-tag ${curClass}">${escapeHtml(current || "?")}</span>
 		<span class="version-date">${escapeHtml(currentDate)}</span>
@@ -3701,6 +3701,126 @@ function formatVersionRow(entry) {
 		<span class="version-tag">${escapeHtml(latest || "?")}</span>
 		<span class="version-date">${escapeHtml(latestDate)}</span>
 	</div>`;
+}
+
+function formatProxyVersionLine(entry) {
+	if (!entry) return "";
+	const current = entry.version_current;
+	const latest = entry.version_latest;
+	const currentDate = entry.version_current_date || "";
+	const latestDate = entry.version_latest_date || "";
+	if (!current && !latest && !currentDate && !latestDate) {
+		return `<span class="proxy-git-versions__empty">—</span>`;
+	}
+	const upToDate = Boolean(current && latest && current === latest);
+	const curClass = upToDate ? "version-tag--ok" : (current && latest ? "version-tag--warn" : "");
+	const curDate = currentDate
+		? ` <span class="version-date">${escapeHtml(currentDate)}</span>`
+		: "";
+	const latDate = latestDate
+		? ` <span class="version-date">${escapeHtml(latestDate)}</span>`
+		: "";
+	return `<span class="proxy-git-versions__line" title="server_command git: Current on this proxy / Latest from origin">
+		<span class="version-label">Current:</span>
+		<span class="version-tag ${curClass}">${escapeHtml(current || "?")}</span>${curDate}
+		<span class="proxy-git-versions__sep">/</span>
+		<span class="version-label">Latest:</span>
+		<span class="version-tag">${escapeHtml(latest || "?")}</span>${latDate}
+	</span>`;
+}
+
+function renderProxyGitVersions(entry) {
+	const el = $("proxy_git_versions");
+	if (!el) return;
+	if (!entry || (!entry.version_current && !entry.version_latest
+		&& !entry.version_current_date && !entry.version_latest_date)) {
+		el.innerHTML = `<span class="proxy-git-versions__empty">—</span>`;
+		return;
+	}
+	el.className = "page-title-meta proxy-git-versions";
+	el.innerHTML = formatProxyVersionLine(entry);
+}
+
+function versionEntryKey(entry) {
+	return [
+		entry.version_current || "",
+		entry.version_latest || "",
+		entry.version_current_date || "",
+		entry.version_latest_date || "",
+	].join("|");
+}
+
+function collectFilteredVersionGroups(resp) {
+	const names = filteredPipelineNames(viewState);
+	const groups = new Map();
+	let serviceCount = 0;
+	for (const name of names) {
+		const entry = resp && resp[name];
+		if (!entry) continue;
+		const current = entry.version_current || "";
+		const latest = entry.version_latest || "";
+		const currentDate = entry.version_current_date || "";
+		const latestDate = entry.version_latest_date || "";
+		if (!current && !latest && !currentDate && !latestDate) continue;
+		serviceCount += 1;
+		const key = versionEntryKey(entry);
+		let group = groups.get(key);
+		if (!group) {
+			group = {
+				version_current: current || null,
+				version_latest: latest || null,
+				version_current_date: currentDate,
+				version_latest_date: latestDate,
+				labels: new Set(),
+				count: 0,
+				behind: Boolean(current && latest && current !== latest),
+			};
+			groups.set(key, group);
+		}
+		group.count += 1;
+		group.labels.add(pipelineKindMeta(name).label || pipelineKindKey(name));
+	}
+	return {
+		serviceCount,
+		groups: [...groups.values()].sort((a, b) => b.count - a.count),
+	};
+}
+
+function formatViewGitVersionLabel(group) {
+	const labels = [...group.labels].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+	if (!labels.length) return `${group.count}`;
+	const shown = labels.slice(0, 3).join(" · ");
+	const extra = labels.length > 3 ? ` +${labels.length - 3}` : "";
+	return `${shown}${extra}`;
+}
+
+function renderViewGitVersions(resp) {
+	const el = $("view_git_versions");
+	if (!el) return;
+	const data = resp || lastPipelines;
+	if (!data) {
+		el.innerHTML = `<span class="view-git-versions__empty">Git: —</span>`;
+		return;
+	}
+	const { serviceCount, groups } = collectFilteredVersionGroups(data);
+	if (!serviceCount || !groups.length) {
+		el.innerHTML = `<span class="view-git-versions__empty">Git: —</span>`;
+		return;
+	}
+	const behind = groups.filter((group) => group.behind).length;
+	if (groups.length > 4) {
+		el.innerHTML = `<span class="view-git-versions__summary" title="Distinct Current/Latest pairs in the current Group/Server/Type filter">Git: ${serviceCount} services · ${groups.length} versions${behind ? ` · ${behind} behind` : ""}</span>`;
+		return;
+	}
+	el.innerHTML = groups.map((group) => {
+		const label = groups.length === 1 && group.labels.size <= 1
+			? "Git"
+			: formatViewGitVersionLabel(group);
+		return `<div class="view-git-versions__item">
+			<span class="view-git-versions__label">${escapeHtml(label)}</span>
+			${formatVersionRow(group)}
+		</div>`;
+	}).join("");
 }
 
 function formatServerNameCell(name) {
@@ -4615,6 +4735,7 @@ function refreshServerStatus(resp) {
 	lastPipelines = resp;
 	renderTable(resp);
 	updateSummary(resp);
+	renderViewGitVersions(resp);
 }
 
 // --- Status API ---
@@ -4633,6 +4754,7 @@ function fetchStatus(force) {
 			const total = meta.total || pipelineOrder.length;
 			const collecting = isStatusCollecting(meta, force);
 
+			renderProxyGitVersions(meta.server_command);
 			if (collecting) {
 				updateLastUpdateDisplay(meta, force);
 				setTotalProgress(done, total, true);
@@ -4777,8 +4899,10 @@ function refreshViewSection() {
 	if (lastPipelines) {
 		renderTable(lastPipelines);
 		updateSummary(lastPipelines);
+		renderViewGitVersions(lastPipelines);
 	} else {
 		showLoadingTable();
+		renderViewGitVersions(null);
 	}
 	renderTargetGroups(new Set(getSelectedTargets()));
 	renderServerGroups(new Set(getSelectedServers()));
@@ -5853,6 +5977,7 @@ bindViewControls();
 bindStickyOffset();
 restoreCardSections();
 refreshViewSelects();
+renderViewGitVersions(null);
 renderTargetGroups();
 renderServerGroups();
 fetchUpdateStatus();

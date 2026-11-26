@@ -21,6 +21,7 @@ from git_versions import (
   DEFAULT_GIT_VERSION_TIMEOUT,
   git_run,
   is_git_repo_dir,
+  read_local_repo_versions,
   read_repo_latest,
 )
 from pipeline_ip import resolve_server_ip, resolve_sys_monitor_ip
@@ -94,7 +95,9 @@ _VERSION_KEYS = (
   "version_latest", "version_latest_date",
 )
 _central_latest_cache = {}
+_proxy_version_cache = (0.0, None)  # (fetched_at, payload)
 CENTRAL_VERSION_TTL_SEC = 300
+PROXY_REPO_PATH = realpath(dirname(__file__))
 HOST_STATUS_READ_TIMEOUT = 15
 HOST_STATUS_RETRY_READ_TIMEOUT = 10
 HOST_STATUS_CONNECT_TIMEOUT = 5
@@ -1957,6 +1960,31 @@ def _is_collect_complete(status_map):
   return bool(status_map) and len(status_map) >= len(cfg) and _done_count(status_map) >= len(cfg)
 
 
+def _proxy_git_versions():
+  """Current/Latest for this proxy checkout (cached; used in UI title meta)."""
+  global _proxy_version_cache
+  now = time.time()
+  fetched_at, cached = _proxy_version_cache
+  if cached is not None and (now - fetched_at) < CENTRAL_VERSION_TTL_SEC:
+    return cached
+  current = current_date = latest = latest_date = None
+  try:
+    current, current_date, latest, latest_date = read_local_repo_versions(
+      PROXY_REPO_PATH,
+      timeout=DEFAULT_GIT_VERSION_TIMEOUT,
+    )
+  except Exception:
+    pass
+  payload = {
+    "version_current": current,
+    "version_current_date": current_date or "",
+    "version_latest": latest,
+    "version_latest_date": latest_date or "",
+  }
+  _proxy_version_cache = (now, payload)
+  return payload
+
+
 def status_payload():
   pipelines = img_n_status if img_n_status else preview_from_cfg()
   complete = _is_collect_complete(img_n_status)
@@ -1970,6 +1998,7 @@ def status_payload():
     "updated_at": _status_updated_at,
     "ok_count": _ok_count(pipelines),
     "total": len(cfg),
+    "server_command": _proxy_git_versions(),
   }
 
 
